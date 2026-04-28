@@ -1,0 +1,146 @@
+data:
+  # 数据集名称，当前支持 cifar10 / cifar100
+  data_name: cifar10
+
+  # 原始数据下载或读取目录
+  data_path: ./data
+
+  # DataLoader 的 batch size
+  batch_size: 128
+
+  # Dirichlet 划分后，每个客户端至少要有多少条训练样本
+  min_datasize: 32
+
+  # Dirichlet 分布参数，越小表示客户端间数据越不均匀；
+  # 官方 train 会全部按这个参数划分给各客户端
+  alpha: 0.1
+
+  # 全局随机种子，控制数据划分和训练可复现性
+  seed: 1
+
+  # 索引划分协议文件名；
+  # 当前协议只保存 client_train_indices 和 global_test_indices
+  partition_meta_name: partition_meta.pt
+
+  # 划分统计信息文件名；
+  # official test 由 server 持有，训练结束后只在 global_test 上评估一次
+  partition_stats_name: partition_stats.json
+
+  # DataLoader 的子进程数量，0 表示主进程加载
+  num_workers: 0
+
+  # 是否为 DataLoader 开启 pinned memory，加速 CPU->GPU 拷贝
+  pin_memory: false
+
+model:
+  # 模型类型：
+  # hybrid_switch_transformer = CNN stem + Transformer
+  # switch_transformer = patch embedding + Transformer
+  # resnet20_switch_transformer = ResNet-20 backbone + Transformer
+  # resnet32_switch_transformer = ResNet-32 backbone + Transformer
+  model_type: hybrid_switch_transformer
+
+  # 标准 switch_transformer 的显式 patch 大小；
+  # 为 null 时会回退到兼容逻辑，根据 token_grid_size 推导
+  # 该字段只对 switch_transformer 生效
+  patch_size: null
+
+  # 每个 Switch FFN 中的专家数量
+  num_experts: 4
+
+  # Transformer / MLP 中使用的 dropout 比例
+  dropout: 0.1
+
+  # 优化器学习率
+  learning_rate: 0.0005
+
+  # token / hidden 的嵌入维度
+  embed_dim: 128
+
+  # 多头注意力的头数
+  num_heads: 4
+
+  # FFN 隐藏层扩张倍数，hidden_dim = embed_dim * mlp_ratio
+  mlp_ratio: 4.0
+
+  # Transformer block 总层数
+  depth: 4
+
+  # depth 的别名；如果不是 null，会优先使用它覆盖 depth
+  num_layers: null
+
+  # 哪些层使用 MoE/Switch FFN，字符串形式，例如 "1,3"
+  moe_layers: "1,3"
+
+  # 每个 token 选择的专家数量，当前项目实际按 top-1 使用
+  top_k: 1
+
+  # router auxiliary loss 的权重系数
+  router_aux_loss_coef: 0.01
+
+  # router z-loss 的权重系数
+  router_z_loss_coef: 0.001
+
+  # 训练时 router 输入抖动噪声强度
+  router_jitter_noise: 0.0
+
+  # expert capacity 系数，用于控制每个 expert 一轮可接收多少 token
+  capacity_factor: 1.25
+
+  # 每个 expert 的最小 capacity
+  min_capacity: 4
+
+  # token 超过 expert capacity 时是否丢弃
+  drop_tokens: true
+
+  # Hybrid 模型 CNN stem 的通道数；标准 switch_transformer 不使用该字段
+  stem_channels: 64
+
+  # token 网格边长：
+  # 对 Hybrid 表示 token pooling 后的网格边长；
+  # 对标准 Switch 在 patch_size 为 null 时可用于推导 patch 大小
+  token_grid_size: 8
+
+  # 是否使用 cls token 做分类；false 时用 token mean pooling
+  use_cls_token: false
+
+train:
+  # 联邦学习中的客户端数量
+  num_clients: 20
+
+  # 服务端通信轮数，也就是全局训练轮数
+  server_epochs: 50
+
+  # 每轮中每个客户端本地训练的 epoch 数
+  client_epochs: 1
+
+  # 训练设备，例如 cpu 或 cuda
+  device: cuda
+
+  # 实验输出根目录；最终会派生出 save/{run_name}/data|model|result
+  save_root: save
+
+  # 实验名称。新实验只需要改这个字段，例如 exp7
+  run_name: default
+
+  # 是否允许复用已有且非空的输出目录；false 可防止误覆盖
+  allow_overwrite: false
+
+  # 聚合方法：
+  # - fedavg: 全模型按客户端样本数做 FedAvg
+  # - expert_fedavg: shared/router 按样本数 FedAvg，expert 按 expert usage/token usage 加权
+  # - fedwolf_fisher_only: shared/router FedAvg，expert 按 Fisher raw score s 加权
+  # - fedwolf: 完整 FedWoLF，包含 Fisher evidence、WoLF-IMQ 状态更新和 gamma 插值
+  agg_method: expert_fedavg
+
+  # FedWoLF 数值稳定项；用于 Fisher 权重归一化、观测噪声分母等，防止除零
+  fedwolf_eps: 1e-8
+
+  # FedWoLF expert 可信度状态的过程噪声 q；越大表示跨轮状态允许更快漂移
+  fedwolf_process_noise_q: 0.01
+
+  # FedWoLF 观测噪声基础强度 sigma_e^2；R = sigma_e2 / (s + eps)
+  fedwolf_sigma_e2: 1.0
+
+  # WoLF-IMQ 鲁棒权重尺度 c；越小越容易对残差大的 evidence 降权
+  fedwolf_imq_c: 1.0

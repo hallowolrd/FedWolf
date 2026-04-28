@@ -1,0 +1,300 @@
+import os
+
+import torch
+from torch.utils.data import DataLoader, Subset
+from torchvision import transforms
+from torchvision.datasets import CIFAR10, CIFAR100
+
+
+EXPECTED_PROTOCOL = "client_train_global_test_index_partition"
+EXPECTED_VERSION = 2
+
+
+def get_cifar_stats(data_name):
+    """根据数据集名字，返回：
+    1. 数据集类 CIFAR10 或 CIFAR100
+    2. 归一化均值 mean
+    3. 归一化标准差 std
+    4. 类别数 num_classes"""
+
+    data_dict = {
+        "cifar10": (
+            CIFAR10,
+            (0.4914, 0.4822, 0.4465),
+            (0.2470, 0.2435, 0.2616),
+            10,
+        ),
+        "cifar100": (
+            CIFAR100,
+            (0.5071, 0.4867, 0.4408),
+            (0.2675, 0.2565, 0.2761),
+            100,
+        ),
+    }
+    if data_name not in data_dict:
+        raise ValueError(f"Unsupported dataset: {data_name}")
+    return data_dict[data_name]
+
+
+def build_transforms(data_name):
+    """构造图像预处理流程：
+    - client_train:使用数据增强
+    - eval(global_test)：使用确定性预处理，不做增强"""
+
+    _, mean, std, _ = get_cifar_stats(data_name)
+    train_transform = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std),
+    ])
+    eval_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std),
+    ])
+    return train_transform, eval_transform
+
+
+def load_partition_meta(args):
+    """ 从磁盘加载 partition_meta.pt。
+    这个文件是上一段 data.py 划分数据后保存的元信息文件。 """
+
+    meta_path = os.path.join(args.data_save_path, args.partition_meta_name)
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError(
+            f"Missing partition metadata: {meta_path}. "
+            "Update config.yaml if needed, then run "
+            "`python -m data.data --config <path/to/config.yaml>` before training."
+        )
+
+    meta = torch.load(meta_path, weights_only=False)
+    validate_partition_meta(meta, args)
+    return meta
+
+
+def validate_partition_meta(meta, args):
+    """检查当前加载的 partition_meta.pt 是否和当前配置一致。
+    目的：防止你改了 yaml 配置，却还在用旧的 partition_meta.pt。"""
+
+    validate_partition_structure(meta, args)
+
+    checks = [
+        ("protocol", meta.get("protocol"), EXPECTED_PROTOCOL, "str"),
+        ("version", meta.get("version"), EXPECTED_VERSION, "int"),
+        ("dataset", meta.get("dataset"), args.data_name, "str"),
+        ("num_clients", meta.get("num_clients"), args.num_clients, "int"),
+        ("alpha", meta.get("alpha"), args.alpha, "float"),
+        ("seed", meta.get("seed"), args.seed, "int"),
+        ("min_datasize", meta.get("min_datasize"), args.min_datasize, "int"),
+        ("data_path", meta.get("data_path"), args.data_path, "path"),
+    ]
+
+    for field, actual, expected, value_type in checks:
+        if not metadata_value_matches(actual, expected, value_type):
+            raise_partition_mismatch(field, actual, expected)
+
+
+def validate_partition_structure(meta, args):
+    """ 检查 partition_meta 的结构是否完整。
+    这里主要检查：
+    - 有没有 splits
+    - splits 里关键字段齐不齐
+    - client_train_indices 的键是不是完整"""
+
+    splits = meta.get("splits")
+    if not isinstance(splits, dict):
+        raise ValueError(
+            "partition_meta is incomplete: missing a valid `splits` dictionary. "
+            "Please regenerate partition_meta.pt and partition_stats.json."
+        )
+
+    required_split_keys = {
+        "client_train_indices",
+        "global_test_indices",
+    }
+    missing = required_split_keys - set(splits.keys())
+    if missing:
+        raise ValueError(
+            f"partition_meta is incomplete: missing split keys {sorted(missing)}. "
+            "Please regenerate partition_meta.pt and partition_stats.json."
+        )
+
+    if not isinstance(splits["client_train_indices"], dict):
+        raise ValueError(
+            "`splits['client_train_indices']` must be a dict. "
+            "Please regenerate partition_meta.pt and partition_stats.json."
+        )
+
+    expected_client_keys = {str(i) for i in range(1, args.num_clients + 1)}
+    actual_client_keys = set(splits["client_train_indices"].keys())
+    if actual_client_keys != expected_client_keys:
+        raise ValueError(
+            "partition_meta has incomplete client_train_indices keys: "
+            f"expected {sorted(expected_client_keys)}, found {sorted(actual_client_keys)}. "
+            "Please regenerate partition_meta.pt and partition_stats.json."
+        )
+
+    for client_id, indices in splits["client_train_indices"].items():
+        if not isinstance(indices, (list, tuple)):
+            raise ValueError(
+                f"`splits['client_train_indices']['{client_id}']` must be a list or tuple. "
+                "Please regenerate partition_meta.pt and partition_stats.json."
+            )
+
+    for key in ["global_test_indices"]:
+        if not isinstance(splits[key], (list, tuple)):
+            raise ValueError(
+                f"`splits['{key}']` must be a list or tuple. "
+                "Please regenerate partition_meta.pt and partition_stats.json."
+            )
+
+
+def metadata_value_matches(actual, expected, value_type):
+    """ 比较 meta 中读到的值 actual 和当前期望值 expected 是否匹配。
+    不同类型采用不同比较方式。 """
+
+    if actual is None:
+        return False
+    if value_type == "float":
+        return abs(float(actual) - float(expected)) <= 1e-12
+    if value_type == "int":
+        return int(actual) == int(expected)
+    if value_type == "path":
+        return os.path.abspath(os.path.normpath(str(actual))) == os.path.abspath(os.path.normpath(str(expected)))
+    return actual == expected
+
+
+def raise_partition_mismatch(field, actual, expected):
+    """ 当 partition_meta 中某个字段和当前配置不一致时，抛出统一格式的报错。 """
+
+    raise ValueError(
+        f"partition_meta mismatch for `{field}`: found {actual!r}, expected {expected!r}. "
+        "Please update config.yaml and re-run "
+        "`python -m data.data --config <path/to/config.yaml>` "
+        "to regenerate partition_meta.pt."
+    )
+
+
+def build_raw_cifar_dataset(args, train, transform):
+    """ 构造原始 CIFAR 数据集对象。
+    注意：
+    这里只是加载“完整官方数据集”，
+    后面再通过 Subset + 索引切出某个 split。 """
+
+    dataset_cls, _, _, _ = get_cifar_stats(args.data_name)
+    try:
+        return dataset_cls(
+            root=args.data_path,
+            train=train,
+            download=False,
+            transform=transform,
+        )
+    except FileNotFoundError as e:
+        raise FileNotFoundError(
+            f"Could not load raw CIFAR data from `{args.data_path}` with download=False. "
+            "This project uses index-based partition metadata, so training still requires "
+            "the original CIFAR files. Please make sure the raw dataset exists under data_path, "
+            "or re-run: `python -m data.data --config <path/to/config.yaml>` "
+            "to download the dataset and regenerate partition files."
+        ) from e
+    except RuntimeError as e:
+        error_text = str(e).lower()
+        missing_keywords = ["not found", "dataset not found", "no such file", "download"]
+        corrupt_keywords = ["corrupt", "corrupted", "truncate", "truncated", "invalid", "pickle", "unpickling"]
+
+        if any(keyword in error_text for keyword in missing_keywords):
+            raise FileNotFoundError(
+                f"Could not load raw CIFAR data from `{args.data_path}` with download=False. "
+                "This project uses index-based partition metadata, so training still requires "
+                "the original CIFAR files. Please make sure the raw dataset exists under data_path, "
+                "or re-run: `python -m data.data --config <path/to/config.yaml>` "
+                "to download the dataset and regenerate partition files."
+            ) from e
+
+        if any(keyword in error_text for keyword in corrupt_keywords):
+            raise RuntimeError(
+                f"Raw CIFAR files were found under `{args.data_path}`, but loading failed and "
+                "the dataset may be corrupted or incomplete. This project uses index-based "
+                "partition metadata, so training still requires the original CIFAR files. "
+                "Please check the dataset files or re-run: "
+                "`python -m data.data --config <path/to/config.yaml>` "
+                "to re-download and regenerate partition files."
+            ) from e
+
+        raise RuntimeError(
+            f"Failed to load raw CIFAR data from `{args.data_path}` with download=False. "
+            "This project uses index-based partition metadata, so training still requires "
+            "the original CIFAR files. Please check data_path or re-run: "
+            "`python -m data.data --config <path/to/config.yaml>` "
+            "to regenerate partition files after ensuring the dataset can be read."
+        ) from e
+    except Exception as e:
+        raise RuntimeError(
+            f"Unexpected error while loading raw CIFAR data from `{args.data_path}` with download=False. "
+            "This project uses index-based partition metadata, so training still requires "
+            "the original CIFAR files. Please check data_path or re-run: "
+            "`python -m data.data --config <path/to/config.yaml>`."
+        ) from e
+
+
+def build_index_dataset(args, split, client_id=None, meta=None):
+    """ 根据 split 类型，构造一个“按索引切好”的数据集 Subset。"""
+
+    meta = meta or load_partition_meta(args)
+    train_transform, eval_transform = build_transforms(args.data_name)
+    splits = meta["splits"]
+
+    if split == "client_train":
+        if client_id is None:
+            raise ValueError("client_id is required for client_train split")
+        indices = splits["client_train_indices"][str(client_id)]
+        dataset = build_raw_cifar_dataset(args, train=True, transform=train_transform)
+    elif split == "global_test":
+        indices = splits["global_test_indices"]
+        dataset = build_raw_cifar_dataset(args, train=False, transform=eval_transform)
+    else:
+        raise ValueError(f"Unknown split: {split}")
+
+    return Subset(dataset, indices)
+
+
+def build_client_train_loader(args, client_id, meta=None):
+    """ 构造某个客户端的训练 DataLoader。 """
+
+    dataset = build_index_dataset(
+        args=args,
+        split="client_train",
+        client_id=client_id,
+        meta=meta,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory,
+    )
+
+
+def build_global_eval_loader(args, split, meta=None):
+    """ 构造全局测试 DataLoader。 """
+
+    if split != "global_test":
+        raise ValueError("split must be global_test")
+
+    dataset = build_index_dataset(args=args, split=split, meta=meta)
+    return DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory,
+    )
+
+
+def get_client_train_size(args, client_id, meta=None):
+    """ 获取某个客户端训练集的样本数量。
+    这个函数不真正构造 Dataset,只是直接看 meta 里的索引长度。 """
+
+    meta = meta or load_partition_meta(args)
+    return len(meta["splits"]["client_train_indices"][str(client_id)])
