@@ -276,6 +276,27 @@ def build_client_train_loader(args, client_id, meta=None):
     )
 
 
+def build_client_evidence_loader(args, client_id, meta=None):
+    """构造某个客户端用于 Fisher evidence 的确定性 DataLoader。"""
+
+    meta = meta or load_partition_meta(args)
+    _, eval_transform = build_transforms(args.data_name)
+    indices = meta["splits"]["client_train_indices"][str(client_id)]
+    dataset = build_raw_cifar_dataset(
+        args=args,
+        train=True,
+        transform=eval_transform,
+    )
+    dataset = Subset(dataset, indices)
+    return DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory,
+    )
+
+
 def build_global_eval_loader(args, split, meta=None):
     """ 构造全局测试 DataLoader。 """
 

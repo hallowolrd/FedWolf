@@ -87,7 +87,7 @@ python train.py --config configs/test1/config.yaml
 
 1. 从 `server.pth` 同步当前全局模型。
 2. 在本地 `client_train` 上训练。
-3. 训练后额外做一次 evidence pass。
+3. 训练后额外做一次 evidence pass；默认使用 deterministic evidence loader，并以 eval-mode forward 关闭训练态随机行为。
 4. 对每层每个 expert 参数块累计梯度平方，得到 Fisher raw score `s`。
 5. 计算 `z = log(1+s)`。
 6. 将 `expert_fisher_score_by_layer` 和 `expert_fisher_log_score_by_layer` 随 `client_stats` 返回给 server。
@@ -118,6 +118,14 @@ FedWoLF 参数放在 `config.yaml` 的 `train` section：
 
 - `agg_method`
   - 可选：`fedavg`、`expert_fedavg`、`fedwolf_fisher_only`、`fedwolf`
+- `fedwolf_evidence_loader_mode`
+  - 可选：`deterministic`、`train_loader`
+  - 默认 `deterministic`：使用同一份客户端 `client_train_indices`，但采用 `ToTensor + Normalize` 的确定性 transform，不做 `RandomCrop` / `RandomHorizontalFlip`，并且 `shuffle=False`
+  - `train_loader`：复用训练 loader，包含训练增强和 shuffle，主要用于消融
+- `fedwolf_evidence_model_mode`
+  - 可选：`eval`、`train`
+  - 默认 `eval`：关闭 Dropout / BN 更新等训练态随机行为，但仍保留 autograd 梯度计算
+  - `train`：使用训练模式计算 evidence，更贴近训练态但随机性更强
 - `fedwolf_eps`
   - 数值稳定项，用于 Fisher 权重归一化和观测噪声分母，默认 `1e-8`
 - `fedwolf_process_noise_q`
@@ -322,6 +330,8 @@ FedWoLF 日志中可观察：
 ## 注意事项
 
 - expert Fisher evidence 会在每个客户端训练后额外做一次 forward/backward，训练开销会增加。
+- 默认 evidence pass 是 deterministic loader + eval-mode forward；这里的 eval-mode evidence 不是 inference / `no_grad`，而是在关闭训练态随机行为后仍然计算梯度的 Fisher evidence。
+- evidence pass 不使用 `torch.no_grad()`，不执行 `optimizer.step()`，不会更新模型参数；结束后会恢复进入 evidence 前的 `model.training` 状态。
 - 某些 expert 的 Fisher score 可能为 0；此时该 expert 保留旧 global 参数。
 - `mu/P` 当前只存在内存中；断点续训如果只恢复 `server.pth`，filter state 会丢失。
 - `gamma = sigmoid(mu)` 可能过早饱和；可优先调 `fedwolf_process_noise_q`、`fedwolf_sigma_e2`、`fedwolf_imq_c`。

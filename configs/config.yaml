@@ -133,6 +133,16 @@ train:
   # - fedwolf: 完整 FedWoLF，包含 Fisher evidence、WoLF-IMQ 状态更新和 gamma 插值
   agg_method: expert_fedavg
 
+  # FedWoLF expert Fisher evidence 使用的数据加载模式：
+  # - deterministic: 使用确定性 transform，不做随机增强，不 shuffle
+  # - train_loader: 复用训练 loader，包含随机增强和 shuffle，用于消融
+  fedwolf_evidence_loader_mode: deterministic
+
+  # FedWoLF expert Fisher evidence 的模型模式：
+  # - eval: 关闭 Dropout/BN 更新等训练态随机行为，但仍保留梯度计算
+  # - train: 使用训练模式计算 evidence，更贴近训练态但随机性更强
+  fedwolf_evidence_model_mode: eval
+
   # FedWoLF 数值稳定项；用于 Fisher 权重归一化、观测噪声分母等，防止除零
   fedwolf_eps: 1e-8
 

@@ -3,7 +3,7 @@ import torch.optim as optim
 from types import SimpleNamespace
 from torch import nn
 
-from data.loader import build_client_train_loader
+from data.loader import build_client_evidence_loader, build_client_train_loader
 from fl.expert_evidence import compute_expert_fisher_evidence
 from model import build_model_from_args
 from utils.utils import record_result
@@ -44,6 +44,7 @@ class Client:
         self.batch_size = self.args.batch_size
         self.partition_meta = partition_meta
         self.train_loader = None
+        self.evidence_loader = None
         # 加载当前客户端的训练索引，并动态封装成 DataLoader。
         self.get_dataloader()
 
@@ -53,6 +54,17 @@ class Client:
 
     def should_compute_fisher_evidence(self):
         return getattr(self.args, "agg_method", None) in FISHER_EVIDENCE_AGG_METHODS
+
+    def get_fisher_data_loader(self):
+        evidence_loader_mode = getattr(self.args, "fedwolf_evidence_loader_mode", "deterministic")
+        if evidence_loader_mode == "deterministic":
+            return self.evidence_loader
+        if evidence_loader_mode == "train_loader":
+            return self.train_loader
+        raise ValueError(
+            "fedwolf_evidence_loader_mode must be either 'deterministic' or "
+            f"'train_loader', got {evidence_loader_mode!r}."
+        )
 
     def save_client_model(self):
         """ 本地训练结束后，把当前客户端模型保存回原来的路径。 """
@@ -69,6 +81,11 @@ class Client:
         验证集和测试集由服务端统一评估。 """
     
         self.train_loader = build_client_train_loader(
+            args=self.args,
+            client_id=self.client_id,
+            meta=self.partition_meta,
+        )
+        self.evidence_loader = build_client_evidence_loader(
             args=self.args,
             client_id=self.client_id,
             meta=self.partition_meta,
@@ -246,14 +263,23 @@ class Client:
         fisher_diagnostics = None
 
         if self.should_compute_fisher_evidence():
+            evidence_loader_mode = getattr(self.args, "fedwolf_evidence_loader_mode", "deterministic")
+            evidence_model_mode = getattr(self.args, "fedwolf_evidence_model_mode", "eval")
+            fisher_data_loader = self.get_fisher_data_loader()
+            self.logger.info(
+                f"--client: {self.client_id} "
+                f"--fedwolf_evidence_loader_mode : {evidence_loader_mode} "
+                f"--fedwolf_evidence_model_mode : {evidence_model_mode}"
+            )
             fisher_score_by_layer, fisher_log_score_by_layer, fisher_diagnostics = compute_expert_fisher_evidence(
                 model=self.model,
-                data_loader=self.train_loader,
+                data_loader=fisher_data_loader,
                 criterion=self.criterion,
                 device=self.device,
                 num_experts=self.args.num_experts,
                 get_auxiliary_losses=self.get_auxiliary_losses,
                 return_diagnostics=True,
+                model_mode=evidence_model_mode,
             )
             fisher_score_log = {
                 layer_id: [f"{float(v):.12e}" for v in scores.tolist()]

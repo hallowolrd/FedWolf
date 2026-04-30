@@ -130,6 +130,7 @@ def compute_expert_fisher_evidence(
     num_experts,
     get_auxiliary_losses=None,
     return_diagnostics=False,
+    model_mode="eval",
 ):
     """Compute per-sample empirical diagonal Fisher scalar evidence for experts.
 
@@ -139,6 +140,9 @@ def compute_expert_fisher_evidence(
     This pass only reads gradients from the trained local model. It does not
     update parameters or optimizer state.
     """
+
+    if model_mode not in {"eval", "train"}:
+        raise ValueError(f"model_mode must be either 'eval' or 'train', got {model_mode!r}.")
 
     expert_entries, param_counts, matched_param_names = _collect_expert_parameter_entries(
         model=model,
@@ -164,6 +168,7 @@ def compute_expert_fisher_evidence(
         "num_batches": 0,
         "fisher_estimator": "per_sample_empirical_diagonal_fisher",
         "normalization": "param_count_times_total_samples",
+        "model_mode": model_mode,
         "auxiliary_loss_used_for_fisher": False,
         "auxiliary_loss_note": (
             "Skipped batch-level auxiliary losses for per-sample Fisher because they are not "
@@ -188,59 +193,65 @@ def compute_expert_fisher_evidence(
     }
 
     was_training = model.training
-    model.eval()
+    if model_mode == "eval":
+        model.eval()
+    else:
+        model.train()
     num_batches = 0
     total_samples = 0
 
-    for inputs, labels in data_loader:
-        inputs = inputs.to(device)
-        labels = labels.to(device)
+    try:
+        for inputs, labels in data_loader:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
 
-        model.zero_grad(set_to_none=True)
-        result = model(inputs)
-        outputs = result["logits"] if isinstance(result, dict) else result
-
-        per_sample_losses = _compute_per_sample_supervised_losses(criterion, outputs, labels)
-        batch_size = labels.size(0)
-        num_batches += 1
-        total_samples += batch_size
-
-        # Important:
-        # We intentionally compute grad(loss_i)^2 for each sample and then average.
-        # This is different from grad(mean_i loss_i)^2, which underestimates Fisher
-        # because gradients from different samples can cancel before squaring.
-        for sample_idx in range(batch_size):
             model.zero_grad(set_to_none=True)
-            retain_graph = sample_idx < batch_size - 1
-            per_sample_losses[sample_idx].backward(retain_graph=retain_graph)
+            result = model(inputs)
+            outputs = result["logits"] if isinstance(result, dict) else result
 
-            for layer_id, experts in expert_entries.items():
-                for expert_id, entries in experts.items():
-                    grad_square_sum = 0.0
-                    has_grad_param_count = 0
-                    none_grad_param_count = 0
-                    for _, param in entries:
-                        if param.grad is not None:
-                            grad_square_sum += float(param.grad.detach().pow(2).sum().cpu())
-                            has_grad_param_count += 1
-                        else:
-                            none_grad_param_count += 1
+            per_sample_losses = _compute_per_sample_supervised_losses(criterion, outputs, labels)
+            batch_size = labels.size(0)
+            num_batches += 1
+            total_samples += batch_size
 
-                    if has_grad_param_count > 0:
-                        samples_with_grad[layer_id][expert_id] += 1
-                    score_sums[layer_id][expert_id] += grad_square_sum
+            # Important:
+            # We intentionally compute grad(loss_i)^2 for each sample and then average.
+            # This is different from grad(mean_i loss_i)^2, which underestimates Fisher
+            # because gradients from different samples can cancel before squaring.
+            for sample_idx in range(batch_size):
+                model.zero_grad(set_to_none=True)
+                retain_graph = sample_idx < batch_size - 1
+                per_sample_losses[sample_idx].backward(retain_graph=retain_graph)
 
-        diagnostics["batch_grad_status"].append(
-            {
-                "batch_index": num_batches,
-                "batch_size": int(batch_size),
-                "sample_count": int(batch_size),
-            }
-        )
+                for layer_id, experts in expert_entries.items():
+                    for expert_id, entries in experts.items():
+                        grad_square_sum = 0.0
+                        has_grad_param_count = 0
+                        none_grad_param_count = 0
+                        for _, param in entries:
+                            if param.grad is not None:
+                                grad_square_sum += float(param.grad.detach().pow(2).sum().cpu())
+                                has_grad_param_count += 1
+                            else:
+                                none_grad_param_count += 1
 
-    model.zero_grad(set_to_none=True)
-    if was_training:
-        model.train()
+                        if has_grad_param_count > 0:
+                            samples_with_grad[layer_id][expert_id] += 1
+                        score_sums[layer_id][expert_id] += grad_square_sum
+
+            diagnostics["batch_grad_status"].append(
+                {
+                    "batch_index": num_batches,
+                    "batch_size": int(batch_size),
+                    "sample_count": int(batch_size),
+                }
+            )
+    finally:
+        model.zero_grad(set_to_none=True)
+        if was_training:
+            model.train()
+        else:
+            model.eval()
 
     diagnostics["total_samples"] = int(total_samples)
     diagnostics["num_batches"] = int(num_batches)
