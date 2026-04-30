@@ -126,6 +126,17 @@ FedWoLF 参数放在 `config.yaml` 的 `train` section：
   - 可选：`eval`、`train`
   - 默认 `eval`：关闭 Dropout / BN 更新等训练态随机行为，但仍保留 autograd 梯度计算
   - `train`：使用训练模式计算 evidence，更贴近训练态但随机性更强
+- `fedwolf_fisher_score_mode`
+  - 可选：`mean_diag`、`mean_diag_active`、`trace_per_sample`、`trace_per_active_sample`、`trace_raw`
+  - 默认 `mean_diag`，保持旧行为并与 PDF 定义对齐：`s = 1/d_k * trace(F_diag) = grad_square_sum / (param_count * total_samples)`
+  - `mean_diag_active`：`grad_square_sum / (param_count * num_samples_with_grad)`
+  - `trace_per_sample`：`grad_square_sum / total_samples`
+  - `trace_per_active_sample`：`grad_square_sum / num_samples_with_grad`
+  - `trace_raw`：直接使用 `grad_square_sum`，仅用于诊断或消融
+  - 如果 `mean_diag` 让 `s` 过小、`R` 过大、`mu/gamma` 几乎不动，优先尝试 `trace_per_active_sample`，其次尝试 `trace_per_sample`
+- `fedwolf_fisher_debug_batches`
+  - 默认 `0`，不记录逐 batch 的 `batch_grad_status`
+  - 设置为正整数 `N` 时，只记录前 `N` 个 evidence batch 的简要诊断
 - `fedwolf_eps`
   - 数值稳定项，用于 Fisher 权重归一化和观测噪声分母，默认 `1e-8`
 - `fedwolf_process_noise_q`
@@ -332,6 +343,8 @@ FedWoLF 日志中可观察：
 - expert Fisher evidence 会在每个客户端训练后额外做一次 forward/backward，训练开销会增加。
 - 默认 evidence pass 是 deterministic loader + eval-mode forward；这里的 eval-mode evidence 不是 inference / `no_grad`，而是在关闭训练态随机行为后仍然计算梯度的 Fisher evidence。
 - evidence pass 不使用 `torch.no_grad()`，不执行 `optimizer.step()`，不会更新模型参数；结束后会恢复进入 evidence 前的 `model.training` 状态。
+- Fisher score mode 只改变客户端上传的 scalar `s` 的尺度，不改变 server-side FedWoLF 的 `R`、IMQ、`mu/P`、`gamma` 或 expert 插值公式。
+- 如果日志里 `mean_s` 只有 `1e-12` 到 `1e-9`、`mean_R` 达到 `1e7` 以上、`mean_kalman_gain` 接近 0、`mu` 长期接近 0 或 `gamma` 长期接近 0.5，可以做 score mode 尺度消融。`trace_per_active_sample` 对 top-1 MoE 通常更适合作为优先消融，因为每个 expert 只在部分样本上被路由激活。
 - 某些 expert 的 Fisher score 可能为 0；此时该 expert 保留旧 global 参数。
 - `mu/P` 当前只存在内存中；断点续训如果只恢复 `server.pth`，filter state 会丢失。
 - `gamma = sigmoid(mu)` 可能过早饱和；可优先调 `fedwolf_process_noise_q`、`fedwolf_sigma_e2`、`fedwolf_imq_c`。

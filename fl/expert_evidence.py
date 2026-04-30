@@ -1,5 +1,38 @@
+import math
+
 import torch
 import torch.nn.functional as F
+
+FISHER_SCORE_MODE_ALIASES = {
+    "mean_diag": "mean_diag",
+    "mean_param_total_sample": "mean_diag",
+    "mean_param_batch": "mean_diag",
+    "mean_diag_active": "mean_diag_active",
+    "trace_per_sample": "trace_per_sample",
+    "sum_per_sample": "trace_per_sample",
+    "sum_per_batch": "trace_per_sample",
+    "trace_per_active_sample": "trace_per_active_sample",
+    "sum_per_active_sample": "trace_per_active_sample",
+    "sum_per_active_batch": "trace_per_active_sample",
+    "trace_raw": "trace_raw",
+    "sum_raw": "trace_raw",
+}
+
+FISHER_SCORE_MODES = (
+    "mean_diag",
+    "mean_diag_active",
+    "trace_per_sample",
+    "trace_per_active_sample",
+    "trace_raw",
+)
+
+FISHER_SCORE_NORMALIZATION = {
+    "mean_diag": "param_count_times_total_samples",
+    "mean_diag_active": "param_count_times_active_samples",
+    "trace_per_sample": "total_samples",
+    "trace_per_active_sample": "active_samples",
+    "trace_raw": "raw_grad_square_sum",
+}
 
 
 def parse_expert_param_ref(name):
@@ -68,6 +101,59 @@ def _scientific_list(values):
     return [f"{float(value):.12e}" for value in values]
 
 
+def canonicalize_fisher_score_mode(score_mode):
+    raw_mode = "mean_diag" if score_mode is None else str(score_mode).strip().lower()
+    canonical_mode = FISHER_SCORE_MODE_ALIASES.get(raw_mode)
+    if canonical_mode is None:
+        supported = ", ".join(sorted(FISHER_SCORE_MODE_ALIASES))
+        raise ValueError(
+            f"fedwolf_fisher_score_mode must be one of: {supported}. "
+            f"Got {score_mode!r}."
+        )
+    return canonical_mode
+
+
+def compute_fisher_scalar_from_sums(
+    grad_square_sum,
+    param_count,
+    total_samples,
+    num_samples_with_grad,
+    mode,
+):
+    grad_square_sum = float(grad_square_sum)
+    param_count = int(param_count)
+    total_samples = int(total_samples)
+    num_samples_with_grad = int(num_samples_with_grad)
+
+    if not math.isfinite(grad_square_sum) or grad_square_sum <= 0.0:
+        return 0.0
+
+    if mode == "mean_diag":
+        if param_count <= 0 or total_samples <= 0:
+            return 0.0
+        value = grad_square_sum / float(param_count * total_samples)
+    elif mode == "mean_diag_active":
+        if param_count <= 0 or num_samples_with_grad <= 0:
+            return 0.0
+        value = grad_square_sum / float(param_count * num_samples_with_grad)
+    elif mode == "trace_per_sample":
+        if total_samples <= 0:
+            return 0.0
+        value = grad_square_sum / float(total_samples)
+    elif mode == "trace_per_active_sample":
+        if num_samples_with_grad <= 0:
+            return 0.0
+        value = grad_square_sum / float(num_samples_with_grad)
+    elif mode == "trace_raw":
+        value = grad_square_sum
+    else:
+        raise ValueError(f"Unknown canonical Fisher score mode: {mode!r}.")
+
+    if not math.isfinite(value) or value <= 0.0:
+        return 0.0
+    return float(value)
+
+
 def _reduce_loss_to_per_sample(per_element_losses, batch_size):
     if not torch.is_tensor(per_element_losses):
         raise TypeError("Per-sample Fisher requires a tensor loss output.")
@@ -131,6 +217,8 @@ def compute_expert_fisher_evidence(
     get_auxiliary_losses=None,
     return_diagnostics=False,
     model_mode="eval",
+    score_mode="mean_diag",
+    debug_batches=0,
 ):
     """Compute per-sample empirical diagonal Fisher scalar evidence for experts.
 
@@ -143,6 +231,9 @@ def compute_expert_fisher_evidence(
 
     if model_mode not in {"eval", "train"}:
         raise ValueError(f"model_mode must be either 'eval' or 'train', got {model_mode!r}.")
+
+    canonical_score_mode = canonicalize_fisher_score_mode(score_mode)
+    debug_batches = max(int(debug_batches), 0)
 
     expert_entries, param_counts, matched_param_names = _collect_expert_parameter_entries(
         model=model,
@@ -167,14 +258,22 @@ def compute_expert_fisher_evidence(
         "total_samples": 0,
         "num_batches": 0,
         "fisher_estimator": "per_sample_empirical_diagonal_fisher",
-        "normalization": "param_count_times_total_samples",
+        "fisher_score_mode": canonical_score_mode,
+        "fisher_score_mode_raw": score_mode,
+        "normalization": FISHER_SCORE_NORMALIZATION[canonical_score_mode],
         "model_mode": model_mode,
+        "debug_batches": int(debug_batches),
         "auxiliary_loss_used_for_fisher": False,
         "auxiliary_loss_note": (
             "Skipped batch-level auxiliary losses for per-sample Fisher because they are not "
             "per-sample losses."
         ),
         "zero_score_reason": None,
+        "score_mean_diag_by_layer": {},
+        "score_mean_diag_active_by_layer": {},
+        "score_trace_per_sample_by_layer": {},
+        "score_trace_per_active_sample_by_layer": {},
+        "score_trace_raw_by_layer": {},
     }
 
     if not expert_entries:
@@ -239,13 +338,14 @@ def compute_expert_fisher_evidence(
                             samples_with_grad[layer_id][expert_id] += 1
                         score_sums[layer_id][expert_id] += grad_square_sum
 
-            diagnostics["batch_grad_status"].append(
-                {
-                    "batch_index": num_batches,
-                    "batch_size": int(batch_size),
-                    "sample_count": int(batch_size),
-                }
-            )
+            if num_batches <= debug_batches:
+                diagnostics["batch_grad_status"].append(
+                    {
+                        "batch_index": num_batches,
+                        "batch_size": int(batch_size),
+                        "sample_count": int(batch_size),
+                    }
+                )
     finally:
         model.zero_grad(set_to_none=True)
         if was_training:
@@ -256,16 +356,27 @@ def compute_expert_fisher_evidence(
     diagnostics["total_samples"] = int(total_samples)
     diagnostics["num_batches"] = int(num_batches)
 
-    denominator_samples = max(total_samples, 1)
     score_by_layer = {}
     log_score_by_layer = {}
 
     for layer_id, scores in score_sums.items():
+        mode_scores_by_layer = {
+            mode: torch.zeros(num_experts, dtype=torch.float64)
+            for mode in FISHER_SCORE_MODES
+        }
         layer_scores = torch.zeros(num_experts, dtype=torch.float64)
         for expert_id in range(num_experts):
             param_count = param_counts.get((layer_id, expert_id), 0)
-            if param_count > 0:
-                layer_scores[expert_id] = scores[expert_id] / (param_count * denominator_samples)
+            num_samples_with_grad = int(samples_with_grad[layer_id][expert_id].item())
+            for mode in FISHER_SCORE_MODES:
+                mode_scores_by_layer[mode][expert_id] = compute_fisher_scalar_from_sums(
+                    grad_square_sum=scores[expert_id].item(),
+                    param_count=param_count,
+                    total_samples=total_samples,
+                    num_samples_with_grad=num_samples_with_grad,
+                    mode=mode,
+                )
+            layer_scores[expert_id] = mode_scores_by_layer[canonical_score_mode][expert_id]
 
         layer_scores = torch.nan_to_num(layer_scores, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
         score_by_layer[str(layer_id)] = layer_scores.cpu()
@@ -279,6 +390,21 @@ def compute_expert_fisher_evidence(
             int(value) for value in samples_with_grad[layer_id].tolist()
         ]
         diagnostics["score_scientific_by_layer"][str(layer_id)] = _scientific_list(layer_scores.tolist())
+        diagnostics["score_mean_diag_by_layer"][str(layer_id)] = _scientific_list(
+            mode_scores_by_layer["mean_diag"].tolist()
+        )
+        diagnostics["score_mean_diag_active_by_layer"][str(layer_id)] = _scientific_list(
+            mode_scores_by_layer["mean_diag_active"].tolist()
+        )
+        diagnostics["score_trace_per_sample_by_layer"][str(layer_id)] = _scientific_list(
+            mode_scores_by_layer["trace_per_sample"].tolist()
+        )
+        diagnostics["score_trace_per_active_sample_by_layer"][str(layer_id)] = _scientific_list(
+            mode_scores_by_layer["trace_per_active_sample"].tolist()
+        )
+        diagnostics["score_trace_raw_by_layer"][str(layer_id)] = _scientific_list(
+            mode_scores_by_layer["trace_raw"].tolist()
+        )
 
     all_scores = [
         float(value)

@@ -265,11 +265,14 @@ class Client:
         if self.should_compute_fisher_evidence():
             evidence_loader_mode = getattr(self.args, "fedwolf_evidence_loader_mode", "deterministic")
             evidence_model_mode = getattr(self.args, "fedwolf_evidence_model_mode", "eval")
+            fisher_score_mode = getattr(self.args, "fedwolf_fisher_score_mode", "mean_diag")
+            fisher_debug_batches = getattr(self.args, "fedwolf_fisher_debug_batches", 0)
             fisher_data_loader = self.get_fisher_data_loader()
             self.logger.info(
                 f"--client: {self.client_id} "
                 f"--fedwolf_evidence_loader_mode : {evidence_loader_mode} "
-                f"--fedwolf_evidence_model_mode : {evidence_model_mode}"
+                f"--fedwolf_evidence_model_mode : {evidence_model_mode} "
+                f"--fedwolf_fisher_score_mode : {fisher_score_mode}"
             )
             fisher_score_by_layer, fisher_log_score_by_layer, fisher_diagnostics = compute_expert_fisher_evidence(
                 model=self.model,
@@ -280,6 +283,8 @@ class Client:
                 get_auxiliary_losses=self.get_auxiliary_losses,
                 return_diagnostics=True,
                 model_mode=evidence_model_mode,
+                score_mode=fisher_score_mode,
+                debug_batches=fisher_debug_batches,
             )
             fisher_score_log = {
                 layer_id: [f"{float(v):.12e}" for v in scores.tolist()]

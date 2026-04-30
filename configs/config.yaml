@@ -143,6 +143,19 @@ train:
   # - train: 使用训练模式计算 evidence，更贴近训练态但随机性更强
   fedwolf_evidence_model_mode: eval
 
+  # FedWoLF/Fisher evidence 标量压缩方式：
+  # - mean_diag: 旧逻辑/PDF 对齐，grad_square_sum / (param_count * total_samples)
+  # - mean_diag_active: 只在该 expert 有梯度的样本上做 mean diagonal
+  # - trace_per_sample: 不除以参数量，只按 total_samples 平均
+  # - trace_per_active_sample: 不除以参数量，只按该 expert 有梯度的样本数平均
+  # - trace_raw: 不做平均，直接使用 grad_square_sum，仅用于消融
+  fedwolf_fisher_score_mode: mean_diag
+
+  # Fisher evidence 逐 batch 诊断记录数量：
+  # - 0: 不记录逐 batch 诊断，只保留 summary
+  # - N>0: 只记录前 N 个 batch
+  fedwolf_fisher_debug_batches: 0
+
   # FedWoLF 数值稳定项；用于 Fisher 权重归一化、观测噪声分母等，防止除零
   fedwolf_eps: 1e-8
 
