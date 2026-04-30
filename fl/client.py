@@ -8,6 +8,9 @@ from fl.expert_evidence import compute_expert_fisher_evidence
 from model import build_model_from_args
 from utils.utils import record_result
 
+FISHER_EVIDENCE_AGG_METHODS = {"fedwolf", "fedwolf_fisher_only"}
+
+
 class Client:
     """ Client 表示联邦学习中的一个客户端。
     每个客户端：
@@ -47,6 +50,9 @@ class Client:
         self.logger = logger
         self.router_aux_loss_coef = self.args.router_aux_loss_coef
         self.router_z_loss_coef = self.args.router_z_loss_coef
+
+    def should_compute_fisher_evidence(self):
+        return getattr(self.args, "agg_method", None) in FISHER_EVIDENCE_AGG_METHODS
 
     def save_client_model(self):
         """ 本地训练结束后，把当前客户端模型保存回原来的路径。 """
@@ -235,32 +241,42 @@ class Client:
             }
             record_result(record_dic=record_dic, args=self.args)
 
-        fisher_score_by_layer, fisher_log_score_by_layer, fisher_diagnostics = compute_expert_fisher_evidence(
-            model=self.model,
-            data_loader=self.train_loader,
-            criterion=self.criterion,
-            device=self.device,
-            num_experts=self.args.num_experts,
-            get_auxiliary_losses=self.get_auxiliary_losses,
-            return_diagnostics=True,
-        )
-        fisher_score_log = {
-            layer_id: [f"{float(v):.12e}" for v in scores.tolist()]
-            for layer_id, scores in fisher_score_by_layer.items()
-        }
-        fisher_log_score_log = {
-            layer_id: [f"{float(v):.12e}" for v in scores.tolist()]
-            for layer_id, scores in fisher_log_score_by_layer.items()
-        }
-        self.logger.info(
-            f"--client: {self.client_id} "
-            f"--expert_fisher_score_by_layer : {fisher_score_log} "
-            f"--expert_fisher_log_score_by_layer : {fisher_log_score_log}"
-        )
-        self.logger.info(
-            f"--client: {self.client_id} "
-            f"--expert_fisher_diagnostics : {fisher_diagnostics}"
-        )
+        fisher_score_by_layer = {}
+        fisher_log_score_by_layer = {}
+        fisher_diagnostics = None
+
+        if self.should_compute_fisher_evidence():
+            fisher_score_by_layer, fisher_log_score_by_layer, fisher_diagnostics = compute_expert_fisher_evidence(
+                model=self.model,
+                data_loader=self.train_loader,
+                criterion=self.criterion,
+                device=self.device,
+                num_experts=self.args.num_experts,
+                get_auxiliary_losses=self.get_auxiliary_losses,
+                return_diagnostics=True,
+            )
+            fisher_score_log = {
+                layer_id: [f"{float(v):.12e}" for v in scores.tolist()]
+                for layer_id, scores in fisher_score_by_layer.items()
+            }
+            fisher_log_score_log = {
+                layer_id: [f"{float(v):.12e}" for v in scores.tolist()]
+                for layer_id, scores in fisher_log_score_by_layer.items()
+            }
+            self.logger.info(
+                f"--client: {self.client_id} "
+                f"--expert_fisher_score_by_layer : {fisher_score_log} "
+                f"--expert_fisher_log_score_by_layer : {fisher_log_score_log}"
+            )
+            self.logger.info(
+                f"--client: {self.client_id} "
+                f"--expert_fisher_diagnostics : {fisher_diagnostics}"
+            )
+        else:
+            self.logger.info(
+                f"--client: {self.client_id} "
+                f"--skip_expert_fisher_evidence : agg_method={getattr(self.args, 'agg_method', None)}"
+            )
 
         self.save_client_model()
         layer_stats_cpu = {
