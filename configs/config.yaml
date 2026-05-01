@@ -156,6 +156,11 @@ train:
   # - N>0: 只记录前 N 个 batch
   fedwolf_fisher_debug_batches: 0
 
+  # 是否打印完整 Fisher diagnostics：
+  # - false: 正式实验默认，只打印精简 summary，不打印完整 diagnostics
+  # - true: 调试模式，打印完整 diagnostics，包括 batch_grad_status 等字段
+  fedwolf_fisher_debug: false
+
   # FedWoLF 数值稳定项；用于 Fisher 权重归一化、观测噪声分母等，防止除零
   fedwolf_eps: 1e-8
 

@@ -47,7 +47,7 @@ python train.py
 手动指定其他配置：
 
 ```bash
-python train.py --config configs/test1/config.yaml
+CUDA_VISIBLE_DEVICES=1 python train.py --config configs/test1/config.yaml
 ```
 
 输出目录由 `config.yaml` 的 `train.save_root` 和 `train.run_name` 自动派生：

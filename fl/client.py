@@ -66,6 +66,37 @@ class Client:
             f"'train_loader', got {evidence_loader_mode!r}."
         )
 
+    def summarize_fisher_diagnostics(self, diagnostics):
+        if diagnostics is None:
+            return None
+
+        summary_keys = [
+            "matched_param_name_count",
+            "total_samples",
+            "num_batches",
+            "fisher_estimator",
+            "fisher_score_mode",
+            "fisher_score_mode_raw",
+            "normalization",
+            "model_mode",
+            "debug_batches",
+            "auxiliary_loss_used_for_fisher",
+            "zero_score_reason",
+            "num_samples_with_grad_by_layer",
+            "score_scientific_by_layer",
+            "score_mean_diag_by_layer",
+            "score_mean_diag_active_by_layer",
+            "score_trace_per_sample_by_layer",
+            "score_trace_per_active_sample_by_layer",
+            "score_trace_raw_by_layer",
+            "param_count_by_layer",
+        ]
+        return {
+            key: diagnostics.get(key)
+            for key in summary_keys
+            if key in diagnostics
+        }
+
     def save_client_model(self):
         """ 本地训练结束后，把当前客户端模型保存回原来的路径。 """
         cpu_state_dict = {
@@ -299,10 +330,17 @@ class Client:
                 f"--expert_fisher_score_by_layer : {fisher_score_log} "
                 f"--expert_fisher_log_score_by_layer : {fisher_log_score_log}"
             )
+            fisher_debug = bool(getattr(self.args, "fedwolf_fisher_debug", False))
+            fisher_diagnostics_summary = self.summarize_fisher_diagnostics(fisher_diagnostics)
             self.logger.info(
                 f"--client: {self.client_id} "
-                f"--expert_fisher_diagnostics : {fisher_diagnostics}"
+                f"--expert_fisher_diagnostics_summary : {fisher_diagnostics_summary}"
             )
+            if fisher_debug:
+                self.logger.info(
+                    f"--client: {self.client_id} "
+                    f"--expert_fisher_diagnostics_full : {fisher_diagnostics}"
+                )
         else:
             self.logger.info(
                 f"--client: {self.client_id} "
