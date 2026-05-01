@@ -263,6 +263,9 @@ def compute_expert_fisher_evidence(
         "normalization": FISHER_SCORE_NORMALIZATION[canonical_score_mode],
         "model_mode": model_mode,
         "debug_batches": int(debug_batches),
+        # Expert Fisher evidence 只基于逐样本 supervised CE loss。
+        # router 辅助损失是 batch-level 标量，不是逐样本 loss，加入这里会重复计入。
+        "fisher_loss_source": "supervised_cross_entropy_only",
         "auxiliary_loss_used_for_fisher": False,
         "auxiliary_loss_note": (
             "Skipped batch-level auxiliary losses for per-sample Fisher because they are not "

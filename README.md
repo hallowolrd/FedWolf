@@ -145,8 +145,14 @@ FedWoLF 参数放在 `config.yaml` 的 `train` section：
   - 观测噪声基础强度，`R = sigma_e2 / (s + eps)`，默认 `1.0`
 - `fedwolf_imq_c`
   - WoLF-IMQ 鲁棒权重尺度，越小越容易对残差大的 evidence 降权，默认 `1.0`
+- `fedwolf_gamma_temperature`
+  - gamma 温度系数 `tau`，默认 `1.0`
+  - 原始映射是 `gamma = sigmoid(mu)`；工程温度校准版是 `gamma = sigmoid(mu / tau)`
+  - `tau=1.0` 时退化为旧行为，较小的 `tau` 会让 gamma 更容易离开 `0.5`
+  - 该温度只影响 `mu -> gamma -> expert_new = (1-gamma) * old_global + gamma * theta_bar`
+  - 它不影响 Fisher evidence `s/z`、`R = sigma_e2 / (s + eps)`、IMQ weight、`mu/P` filter update，也不影响 `theta_bar` 的 Fisher 加权平均
 
-当前代码没有使用 `fedwolf_gamma_temperature`，因此配置文件中不提供该字段。gamma 直接使用 `sigmoid(mu)`。
+如果 gamma 长期停留在 `0.500x` 附近，可以尝试 `fedwolf_gamma_temperature: 0.05`、`0.02`、`0.01`。不建议一开始直接用 `0.001`，因为当 `mu` 已经到 `0.01` 到 `0.02` 时，`tau=0.001` 会让 gamma 迅速接近 1，可能过于激进。
 
 ## 实验切换方式
 
@@ -343,11 +349,12 @@ FedWoLF 日志中可观察：
 - expert Fisher evidence 会在每个客户端训练后额外做一次 forward/backward，训练开销会增加。
 - 默认 evidence pass 是 deterministic loader + eval-mode forward；这里的 eval-mode evidence 不是 inference / `no_grad`，而是在关闭训练态随机行为后仍然计算梯度的 Fisher evidence。
 - evidence pass 不使用 `torch.no_grad()`，不执行 `optimizer.step()`，不会更新模型参数；结束后会恢复进入 evidence 前的 `model.training` 状态。
+- 当前 expert evidence 使用 supervised cross-entropy loss 计算 per-sample empirical Fisher；`router_aux_loss` / `router_z_loss` 是 batch-level auxiliary losses，不纳入 expert Fisher。直接把 batch-level scalar 加到每个 sample loss 会重复计入 batch size 次并破坏 Fisher 尺度，而且当前 evidence 只针对 `blocks.*.ffn.experts.*` expert 参数。
 - Fisher score mode 只改变客户端上传的 scalar `s` 的尺度，不改变 server-side FedWoLF 的 `R`、IMQ、`mu/P`、`gamma` 或 expert 插值公式。
 - 如果日志里 `mean_s` 只有 `1e-12` 到 `1e-9`、`mean_R` 达到 `1e7` 以上、`mean_kalman_gain` 接近 0、`mu` 长期接近 0 或 `gamma` 长期接近 0.5，可以做 score mode 尺度消融。`trace_per_active_sample` 对 top-1 MoE 通常更适合作为优先消融，因为每个 expert 只在部分样本上被路由激活。
 - 某些 expert 的 Fisher score 可能为 0；此时该 expert 保留旧 global 参数。
 - `mu/P` 当前只存在内存中；断点续训如果只恢复 `server.pth`，filter state 会丢失。
-- `gamma = sigmoid(mu)` 可能过早饱和；可优先调 `fedwolf_process_noise_q`、`fedwolf_sigma_e2`、`fedwolf_imq_c`。
+- `gamma = sigmoid(mu / fedwolf_gamma_temperature)` 只校准 mu 到 gamma 的映射尺度；如果 gamma 长期接近 `0.5`，可优先尝试 `fedwolf_gamma_temperature: 0.05`、`0.02`、`0.01`。
 - `fedwolf_fisher_only` 和 `fedwolf` 语义不同：前者是消融，后者是完整方法。
 - `train.py` 的自动数据准备只会覆盖 `save/{run_name}/data` 下的 `partition_meta.pt` 和 `partition_stats.json`。
 - 如果 `train.allow_overwrite: false`，`train.py` 仍然会检查 `model/result` 输出目录是否非空，避免误覆盖训练结果。

@@ -155,17 +155,20 @@ class FedWoLFAggregator(Aggregator):
     # - shared / router / classifier 等非 expert 参数仍按客户端样本数做 FedAvg；
     # - expert 参数按客户端上传的 expert_fisher_score_by_layer 做 Fisher-score 加权平均。
     # - agg_method=fedwolf 时额外吸收 Fisher log evidence 更新 WoLF-IMQ filter state。
-    # - agg_method=fedwolf 时使用 gamma=sigmoid(mu) 在 old global expert 和 Theta_bar 之间插值。
+    # - agg_method=fedwolf 时使用 gamma=sigmoid(mu/tau) 在 old global expert 和 Theta_bar 之间插值。
     def __init__(self, args=None, use_wolf_filter=True, use_gamma=True):
         self.eps = float(getattr(args, "fedwolf_eps", 1e-8))
         self.process_noise_q = float(getattr(args, "fedwolf_process_noise_q", 0.01))
         self.sigma_e2 = float(getattr(args, "fedwolf_sigma_e2", 1.0))
         self.imq_c = float(getattr(args, "fedwolf_imq_c", 1.0))
+        self.gamma_temperature = float(getattr(args, "fedwolf_gamma_temperature", 1.0))
         self.num_experts = getattr(args, "num_experts", None)
         self.use_wolf_filter = use_wolf_filter
         self.use_gamma = use_gamma
         if self.use_wolf_filter and self.imq_c <= 0:
             raise ValueError("fedwolf_imq_c must be positive")
+        if self.gamma_temperature <= 0:
+            raise ValueError("fedwolf_gamma_temperature must be positive")
         self.expert_filter_mu = {}
         self.expert_filter_P = {}
         self.last_filter_summary = {}
@@ -410,11 +413,14 @@ class FedWoLFAggregator(Aggregator):
             }
         return summary
 
+    def _compute_gamma_from_mu(self, mu):
+        return stable_sigmoid(float(mu) / self.gamma_temperature)
+
     def _get_gamma(self, layer_id, expert_id):
         layer_id = str(layer_id)
         if layer_id not in self.expert_filter_mu or expert_id >= self.expert_filter_mu[layer_id].numel():
             return 0.5
-        return stable_sigmoid(self.expert_filter_mu[layer_id][expert_id].item())
+        return self._compute_gamma_from_mu(self.expert_filter_mu[layer_id][expert_id].item())
 
     def _record_gamma(self, layer_id, expert_id, gamma, total_fisher_weight):
         layer_id = str(layer_id)
@@ -438,9 +444,10 @@ class FedWoLFAggregator(Aggregator):
         for layer_id, layer_summary in self.last_filter_summary.items():
             if layer_id in self.expert_filter_mu:
                 layer_summary["gamma"] = format_scientific_list(
-                    stable_sigmoid(value)
+                    self._compute_gamma_from_mu(value)
                     for value in self.expert_filter_mu[layer_id].tolist()
                 )
+                layer_summary["gamma_temperature"] = f"{self.gamma_temperature:.12e}"
 
     def _get_fisher_score(self, client_stats, layer_id, expert_id):
         score = self._get_layer_expert_value(

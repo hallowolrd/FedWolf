@@ -6,7 +6,7 @@ data:
   data_path: ./data
 
   # DataLoader 的 batch size
-  batch_size: 128
+  batch_size: 32
 
   # Dirichlet 划分后，每个客户端至少要有多少条训练样本
   min_datasize: 32
@@ -38,7 +38,7 @@ model:
   # switch_transformer = patch embedding + Transformer
   # resnet20_switch_transformer = ResNet-20 backbone + Transformer
   # resnet32_switch_transformer = ResNet-32 backbone + Transformer
-  model_type: hybrid_switch_transformer
+  model_type: resnet20_switch_transformer
 
   # 标准 switch_transformer 的显式 patch 大小；
   # 为 null 时会回退到兼容逻辑，根据 token_grid_size 推导
@@ -46,7 +46,7 @@ model:
   patch_size: null
 
   # 每个 Switch FFN 中的专家数量
-  num_experts: 4
+  num_experts: 8
 
   # Transformer / MLP 中使用的 dropout 比例
   dropout: 0.1
@@ -172,3 +172,10 @@ train:
 
   # WoLF-IMQ 鲁棒权重尺度 c；越小越容易对残差大的 evidence 降权
   fedwolf_imq_c: 1.0
+
+  # FedWoLF gamma 温度系数：
+  # - gamma = sigmoid(mu / fedwolf_gamma_temperature)
+  # - 1.0 表示旧行为，即 gamma = sigmoid(mu)
+  # - 较小的值会放大 mu 对 gamma 的影响，使 gamma 更容易偏离 0.5
+  # - 必须 > 0
+  fedwolf_gamma_temperature: 1.0
