@@ -155,13 +155,15 @@ class FedWoLFAggregator(Aggregator):
     # - shared / router / classifier 等非 expert 参数仍按客户端样本数做 FedAvg；
     # - expert 参数按客户端上传的 expert_fisher_score_by_layer 做 Fisher-score 加权平均。
     # - agg_method=fedwolf 时额外吸收 Fisher log evidence 更新 WoLF-IMQ filter state。
-    # - agg_method=fedwolf 时使用 gamma=sigmoid(mu/tau) 在 old global expert 和 Theta_bar 之间插值。
+    # - agg_method=fedwolf 时使用 learned/fixed gamma 在 old global expert 和 Theta_bar 之间插值。
     def __init__(self, args=None, use_wolf_filter=True, use_gamma=True):
         self.eps = float(getattr(args, "fedwolf_eps", 1e-8))
         self.process_noise_q = float(getattr(args, "fedwolf_process_noise_q", 0.01))
         self.sigma_e2 = float(getattr(args, "fedwolf_sigma_e2", 1.0))
         self.imq_c = float(getattr(args, "fedwolf_imq_c", 1.0))
         self.gamma_temperature = float(getattr(args, "fedwolf_gamma_temperature", 1.0))
+        self.gamma_mode = str(getattr(args, "fedwolf_gamma_mode", "learned")).strip().lower()
+        self.fixed_gamma = None
         self.num_experts = getattr(args, "num_experts", None)
         self.use_wolf_filter = use_wolf_filter
         self.use_gamma = use_gamma
@@ -169,6 +171,18 @@ class FedWoLFAggregator(Aggregator):
             raise ValueError("fedwolf_imq_c must be positive")
         if self.gamma_temperature <= 0:
             raise ValueError("fedwolf_gamma_temperature must be positive")
+        if self.gamma_mode not in {"learned", "fixed"}:
+            raise ValueError("fedwolf_gamma_mode must be either 'learned' or 'fixed'")
+        if self.use_gamma and self.gamma_mode == "fixed":
+            raw_fixed_gamma = getattr(args, "fedwolf_fixed_gamma", None)
+            if raw_fixed_gamma is None:
+                raise ValueError("fedwolf_fixed_gamma must be set when fedwolf_gamma_mode is 'fixed'")
+            try:
+                self.fixed_gamma = float(raw_fixed_gamma)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("fedwolf_fixed_gamma must be convertible to float") from exc
+            if self.fixed_gamma < 0.0 or self.fixed_gamma > 1.0:
+                raise ValueError("fedwolf_fixed_gamma must be in [0, 1]")
         self.expert_filter_mu = {}
         self.expert_filter_P = {}
         self.last_filter_summary = {}
@@ -414,6 +428,8 @@ class FedWoLFAggregator(Aggregator):
         return summary
 
     def _compute_gamma_from_mu(self, mu):
+        if self.gamma_mode == "fixed":
+            return self.fixed_gamma
         return stable_sigmoid(float(mu) / self.gamma_temperature)
 
     def _get_gamma(self, layer_id, expert_id):
@@ -448,6 +464,10 @@ class FedWoLFAggregator(Aggregator):
                     for value in self.expert_filter_mu[layer_id].tolist()
                 )
                 layer_summary["gamma_temperature"] = f"{self.gamma_temperature:.12e}"
+                layer_summary["gamma_mode"] = self.gamma_mode
+                layer_summary["fixed_gamma"] = (
+                    "None" if self.fixed_gamma is None else f"{float(self.fixed_gamma):.12e}"
+                )
 
     def _get_fisher_score(self, client_stats, layer_id, expert_id):
         score = self._get_layer_expert_value(
