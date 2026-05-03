@@ -77,9 +77,15 @@ class Server:
         # 外层循环是一轮轮服务端通信，也就是联邦学习中的 global round。
         for c_T in range(self.server_epochs):
             self.logger.info(f"============================== T:{c_T+1} start !!! ===============================\n")
+            server_state_dict = {
+                key: value.detach().cpu().clone()
+                for key, value in self.model.state_dict().items()
+            }
             round_expert_usage_summary = torch.zeros(self.args.num_experts)
             round_layer_stats = {}
             round_client_expert_usages = []
+            round_client_states = []
+            round_client_sizes = []
             for id in self.clientsID_list:
                 # 每个客户端执行本地训练，并返回本轮信息。
                 client_stats = Client(
@@ -88,7 +94,11 @@ class Server:
                     logger=self.logger,
                     c_T=c_T,
                     partition_meta=self.partition_meta,
+                    server_state_dict=server_state_dict,
                 ).train()
+                client_state_dict = client_stats.pop("local_state_dict")
+                round_client_states.append(client_state_dict)
+                round_client_sizes.append(self.get_client_train_size(id))
                 client_expert_usage = client_stats["expert_activations"].float().cpu()
                 round_client_expert_usages.append(client_stats)
                 round_expert_usage_summary += client_expert_usage
@@ -121,7 +131,10 @@ class Server:
             self.logger.info(f"--client_expert_usage_summary : {client_usage_list}\n")
             self.logger.info(f"--round_expert_stats_by_layer : {layer_stats_log}\n")
             # 所有客户端本地训练完成后，服务端通过聚合器更新全局模型。
-            self.aggregation()
+            self.aggregation(
+                client_states=round_client_states,
+                client_sizes=round_client_sizes,
+            )
 
             # 每轮结束保存当前服务端模型，供下一轮客户端同步。
             self.save_server_model()
@@ -204,22 +217,30 @@ class Server:
         # FedAvg 使用客户端训练样本数作为聚合权重。
         return get_client_train_size(self.args, client_id, meta=self.partition_meta)
 
-    def aggregation_by_method(self):
+    def aggregation_by_method(self, client_states=None, client_sizes=None):
         """ 聚合器接口：按当前配置的聚合方法执行参数聚合
         - fedavg:对完整 state_dict 按客户端训练样本数加权平均；
         - expert_fedavg:普通层按客户端样本数聚合,专家层按每个 expert 实际处理样本数聚合；
         - fedwolf_fisher_only:普通层按客户端样本数聚合,专家层按 Fisher score 聚合；
         - fedwolf:在 Fisher score 聚合基础上加入 WoLF-IMQ 状态更新和 gamma 插值。 """
 
-        client_states = []
-        client_sizes = []
-        for id in self.clientsID_list:
-            client_state_dict = torch.load(
-                self.args.model_save_path + f"/{id}.pth",
-                map_location="cpu",
-            )
-            client_states.append(client_state_dict)
-            client_sizes.append(self.get_client_train_size(id))
+        if client_states is None:
+            self.logger.info("--client_state_transport : disk\n")
+            client_states = []
+            for id in self.clientsID_list:
+                client_state_dict = torch.load(
+                    self.args.model_save_path + f"/{id}.pth",
+                    map_location="cpu",
+                )
+                client_states.append(client_state_dict)
+        else:
+            self.logger.info("--client_state_transport : memory\n")
+
+        if client_sizes is None:
+            client_sizes = [
+                self.get_client_train_size(id)
+                for id in self.clientsID_list
+            ]
 
         total_size = sum(client_sizes)
         if total_size <= 0:
@@ -238,9 +259,12 @@ class Server:
         if filter_summary:
             self.logger.info(f"--fedwolf_filter_state_summary : {filter_summary}\n")
 
-    def aggregation(self):
+    def aggregation(self, client_states=None, client_sizes=None):
         """ 聚合入口函数。
         现在只是简单调用 aggregation_by_method()，
         后续如果想扩展多种聚合流程，可以在这里继续封装。 """
 
-        self.aggregation_by_method()
+        self.aggregation_by_method(
+            client_states=client_states,
+            client_sizes=client_sizes,
+        )

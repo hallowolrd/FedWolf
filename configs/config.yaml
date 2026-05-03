@@ -126,6 +126,11 @@ train:
   # 是否允许复用已有且非空的输出目录；false 可防止误覆盖
   allow_overwrite: false
 
+  # 是否每轮保存每个客户端的本地模型 {client_id}.pth。
+  # false: 默认，不保存客户端模型，server 直接使用 Client.train() 返回的 state_dict 聚合，减少磁盘 I/O。
+  # true: 调试/兼容旧流程时保存客户端模型。
+  save_client_models: false
+
   # 聚合方法：
   # - fedavg: 全模型按客户端样本数做 FedAvg
   # - expert_fedavg: shared/router 按样本数 FedAvg，expert 按 expert usage/token usage 加权

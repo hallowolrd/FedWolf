@@ -19,17 +19,27 @@ class Client:
     3. 每一轮会先同步服务端模型，再做本地训练
     4. 训练完保存本地模型，并返回一些统计信息给服务端 """
 
-    def __init__(self, args: SimpleNamespace, client_id: int, logger, c_T: int, partition_meta=None):
+    def __init__(
+        self,
+        args: SimpleNamespace,
+        client_id: int,
+        logger,
+        c_T: int,
+        partition_meta=None,
+        server_state_dict=None,
+    ):
         """ 初始化一个客户端对象。
         参数：
         - args: 所有配置参数
         - client_id: 当前客户端编号
         - logger: 日志记录器
         - c_T: 当前联邦通信轮次
-        - partition_meta: 可选，已经加载好的数据划分信息 """
+        - partition_meta: 可选，已经加载好的数据划分信息
+        - server_state_dict: 可选，服务端在内存中传入的全局模型参数 """
 
         self.args = args
         self.client_id = client_id
+        self.server_state_dict = server_state_dict
         self.model_path = self.args.model_save_path + f"/{self.client_id}.pth"
         self.model = build_model_from_args(self.args)
         self.device = self.args.device
@@ -99,11 +109,13 @@ class Client:
 
     def save_client_model(self):
         """ 本地训练结束后，把当前客户端模型保存回原来的路径。 """
-        cpu_state_dict = {
+        torch.save(self.get_cpu_state_dict(), self.model_path)
+
+    def get_cpu_state_dict(self):
+        return {
             key: value.detach().cpu().clone()
             for key, value in self.model.state_dict().items()
         }
-        torch.save(cpu_state_dict, self.model_path)
 
     def get_dataloader(self):
         """ 构造当前客户端自己的训练 DataLoader。
@@ -123,9 +135,16 @@ class Client:
         )
 
 
-    def renew_model(self):
+    def renew_model(self, server_state_dict=None):
         """ 在每一轮本地训练开始前，
         客户端先从服务端同步最新的全局模型参数。 """
+
+        if server_state_dict is None:
+            server_state_dict = self.server_state_dict
+
+        if server_state_dict is not None:
+            self.model.load_state_dict(server_state_dict)
+            return
 
         server_state_dict = torch.load(
             self.args.model_save_path + f"/server.pth",
@@ -347,7 +366,10 @@ class Client:
                 f"--skip_expert_fisher_evidence : agg_method={getattr(self.args, 'agg_method', None)}"
             )
 
-        self.save_client_model()
+        local_state_dict = self.get_cpu_state_dict()
+        if bool(getattr(self.args, "save_client_models", False)):
+            torch.save(local_state_dict, self.model_path)
+
         layer_stats_cpu = {
             layer_id: {
                 stat_key: (value.detach().cpu() if torch.is_tensor(value) else value)
@@ -364,4 +386,5 @@ class Client:
             },
             "expert_fisher_score_by_layer": fisher_score_by_layer,
             "expert_fisher_log_score_by_layer": fisher_log_score_by_layer,
+            "local_state_dict": local_state_dict,
         }
