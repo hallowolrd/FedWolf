@@ -164,6 +164,11 @@ class FedWoLFAggregator(Aggregator):
         self.gamma_temperature = float(getattr(args, "fedwolf_gamma_temperature", 1.0))
         self.gamma_mode = str(getattr(args, "fedwolf_gamma_mode", "learned")).strip().lower()
         self.fixed_gamma = None
+        try:
+            self.gamma_min = float(getattr(args, "fedwolf_gamma_min", 0.0))
+            self.gamma_max = float(getattr(args, "fedwolf_gamma_max", 1.0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("fedwolf_gamma_min and fedwolf_gamma_max must be convertible to float") from exc
         self.num_experts = getattr(args, "num_experts", None)
         self.use_wolf_filter = use_wolf_filter
         self.use_gamma = use_gamma
@@ -171,6 +176,14 @@ class FedWoLFAggregator(Aggregator):
             raise ValueError("fedwolf_imq_c must be positive")
         if self.gamma_temperature <= 0:
             raise ValueError("fedwolf_gamma_temperature must be positive")
+        if not math.isfinite(self.gamma_min) or not math.isfinite(self.gamma_max):
+            raise ValueError("fedwolf_gamma_min and fedwolf_gamma_max must be finite")
+        if self.gamma_min < 0.0 or self.gamma_min > 1.0:
+            raise ValueError("fedwolf_gamma_min must be in [0, 1]")
+        if self.gamma_max < 0.0 or self.gamma_max > 1.0:
+            raise ValueError("fedwolf_gamma_max must be in [0, 1]")
+        if self.gamma_min > self.gamma_max:
+            raise ValueError("fedwolf_gamma_min must be <= fedwolf_gamma_max")
         if self.gamma_mode not in {"learned", "fixed"}:
             raise ValueError("fedwolf_gamma_mode must be either 'learned' or 'fixed'")
         if self.use_gamma and self.gamma_mode == "fixed":
@@ -430,7 +443,8 @@ class FedWoLFAggregator(Aggregator):
     def _compute_gamma_from_mu(self, mu):
         if self.gamma_mode == "fixed":
             return self.fixed_gamma
-        return stable_sigmoid(float(mu) / self.gamma_temperature)
+        base_gamma = stable_sigmoid(float(mu) / self.gamma_temperature)
+        return self.gamma_min + (self.gamma_max - self.gamma_min) * base_gamma
 
     def _get_gamma(self, layer_id, expert_id):
         layer_id = str(layer_id)
@@ -468,6 +482,8 @@ class FedWoLFAggregator(Aggregator):
                 layer_summary["fixed_gamma"] = (
                     "None" if self.fixed_gamma is None else f"{float(self.fixed_gamma):.12e}"
                 )
+                layer_summary["gamma_min"] = f"{self.gamma_min:.12e}"
+                layer_summary["gamma_max"] = f"{self.gamma_max:.12e}"
 
     def _get_fisher_score(self, client_stats, layer_id, expert_id):
         score = self._get_layer_expert_value(

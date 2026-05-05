@@ -77,7 +77,7 @@ CUDA_VISIBLE_DEVICES=1 python train.py --config configs/test1/config.yaml
   - 客户端训练后额外计算 expert Fisher evidence：`s` 和 `z = log(1+s)`。
   - 服务端为每层每个 expert 维护 `mu/P` 状态。
   - 使用 WoLF-IMQ 权重对残差大的 evidence 降权。
-  - 使用 `gamma = sigmoid(mu / tau)` 在 old global expert 和 Fisher weighted expert average 之间插值，其中 `tau = fedwolf_gamma_temperature`；`tau=1.0` 时退化为 `gamma = sigmoid(mu)`。
+  - 使用 bounded learned gamma 在 old global expert 和 Fisher weighted expert average 之间插值：`gamma = gamma_min + (gamma_max - gamma_min) * sigmoid(mu / tau)`，其中 `tau = fedwolf_gamma_temperature`；默认 `gamma_min=0.0`、`gamma_max=1.0` 时退化为 `gamma = sigmoid(mu / tau)`。
 
 当前没有实现 `fedwolf_kf`。如果需要 Fisher + 普通 scalar filter 的消融入口，建议后续单独补充。
 
@@ -103,7 +103,7 @@ CUDA_VISIBLE_DEVICES=1 python train.py --config configs/test1/config.yaml
    - `w = (1 + residual^2 / c^2)^(-0.5)`
    - `obs_precision = w^2 / R`
 3. 用 Fisher raw score `s` 得到 `Theta_bar`。
-4. 对 `fedwolf`，计算 `gamma = sigmoid(mu / tau)`，其中 `tau = fedwolf_gamma_temperature`；`tau=1.0` 时退化为旧公式 `gamma = sigmoid(mu)`。
+4. 对 `fedwolf`，计算 `gamma = gamma_min + (gamma_max - gamma_min) * sigmoid(mu / tau)`，其中 `tau = fedwolf_gamma_temperature`，`gamma_min = fedwolf_gamma_min`，`gamma_max = fedwolf_gamma_max`；默认 `gamma_min=0.0`、`gamma_max=1.0` 时退化为旧公式 `gamma = sigmoid(mu / tau)`。
 5. 最终 expert 更新：
 
 ```text
@@ -151,10 +151,15 @@ FedWoLF 参数放在 `config.yaml` 的 `train` section：
   - `tau=1.0` 时退化为旧行为，较小的 `tau` 会让 gamma 更容易离开 `0.5`
   - 该温度只影响 `mu -> gamma -> expert_new = (1-gamma) * old_global + gamma * theta_bar`
   - 它不影响 Fisher evidence `s/z`、`R = sigma_e2 / (s + eps)`、IMQ weight、`mu/P` filter update，也不影响 `theta_bar` 的 Fisher 加权平均
+- `fedwolf_gamma_min` / `fedwolf_gamma_max`
+  - learned 模式下使用 bounded gamma：`gamma = gamma_min + (gamma_max - gamma_min) * sigmoid(mu / tau)`
+  - 默认 `fedwolf_gamma_min: 0.0`、`fedwolf_gamma_max: 1.0`，此时退化为旧公式 `gamma = sigmoid(mu / tau)`
+  - 两者合法范围都是 `[0, 1]`，且要求 `fedwolf_gamma_min <= fedwolf_gamma_max`
+  - 作用是避免 learned gamma 长期卡在 `0.50` 附近，同时保留不同 expert 的 `mu` 自适应差异
 - `fedwolf_gamma_mode`
   - 可选：`learned`、`fixed`
-  - 默认 `learned`，使用 `gamma = sigmoid(mu / tau)`，其中 `tau = fedwolf_gamma_temperature`
-  - `fixed` 用于消融诊断 learned gamma 是否过于保守，此时 `gamma = fedwolf_fixed_gamma`，不再由 `mu` 决定
+  - 默认 `learned`，使用 bounded learned gamma，其中 `tau = fedwolf_gamma_temperature`
+  - `fixed` 用于消融诊断 learned gamma 是否过于保守，此时 `gamma = fedwolf_fixed_gamma`，不再由 `mu` 决定，也不使用 `fedwolf_gamma_min/max`
 - `fedwolf_fixed_gamma`
   - 默认 `null`，仅当 `fedwolf_gamma_mode: fixed` 时生效，合法范围是 `[0, 1]`
   - `0.7`：测试更强 Fisher 插值是否优于 learned gamma
@@ -162,7 +167,7 @@ FedWoLF 参数放在 `config.yaml` 的 `train` section：
   - `1.0`：应近似退化为 `fedwolf_fisher_only`，用于验证实现
   - fixed-gamma 仍然保留 `mu/P` filter update 和日志，只改变最终 `mu -> gamma` 这一步
 
-如果 gamma 长期停留在 `0.500x` 附近，可以尝试 `fedwolf_gamma_temperature: 0.05`、`0.02`、`0.01`。不建议一开始直接用 `0.001`，因为当 `mu` 已经到 `0.01` 到 `0.02` 时，`tau=0.001` 会让 gamma 迅速接近 1，可能过于激进。
+如果 gamma 长期停留在 `0.500x` 附近，可以尝试 bounded learned gamma。当前第一候选是 `fedwolf_gamma_mode: learned`、`fedwolf_gamma_temperature: 0.03`、`fedwolf_gamma_min: 0.5`、`fedwolf_gamma_max: 1.0`，此时 `gamma = 0.5 + 0.5 * sigmoid(mu / 0.03)`，当 `mu≈0` 时 `gamma≈0.75`。第二候选是 `fedwolf_gamma_temperature: 0.03`、`fedwolf_gamma_min: 0.4`、`fedwolf_gamma_max: 1.0`，当 `mu≈0` 时 `gamma≈0.7`。更激进候选是 `fedwolf_gamma_temperature: 0.03`、`fedwolf_gamma_min: 0.7`、`fedwolf_gamma_max: 1.0`，当 `mu≈0` 时 `gamma≈0.85`。
 如果要判断 learned gamma 是否太保守，可以用 `fedwolf_gamma_mode: fixed` 搭配 `fedwolf_fixed_gamma: 0.7`、`0.9`、`1.0` 做消融。这个设置不改变 Fisher evidence `s/z`、score mode、`R = sigma_e2 / (s + eps)`、IMQ weight、`mu/P` filter update，也不改变 `theta_bar` 的 Fisher 加权平均，只改变最终 expert 插值强度。
 
 ## 实验切换方式
@@ -365,7 +370,7 @@ FedWoLF 日志中可观察：
 - 如果日志里 `mean_s` 只有 `1e-12` 到 `1e-9`、`mean_R` 达到 `1e7` 以上、`mean_kalman_gain` 接近 0、`mu` 长期接近 0 或 `gamma` 长期接近 0.5，可以做 score mode 尺度消融。`trace_per_active_sample` 对 top-1 MoE 通常更适合作为优先消融，因为每个 expert 只在部分样本上被路由激活。
 - 某些 expert 的 Fisher score 可能为 0；此时该 expert 保留旧 global 参数。
 - `mu/P` 当前只存在内存中；断点续训如果只恢复 `server.pth`，filter state 会丢失。
-- `gamma = sigmoid(mu / fedwolf_gamma_temperature)` 只校准 mu 到 gamma 的映射尺度；如果 gamma 长期接近 `0.5`，可优先尝试 `fedwolf_gamma_temperature: 0.05`、`0.02`、`0.01`。
+- bounded learned gamma 只校准 `mu -> gamma` 的映射区间；默认 `fedwolf_gamma_min: 0.0`、`fedwolf_gamma_max: 1.0` 时等价于 `gamma = sigmoid(mu / fedwolf_gamma_temperature)`，如果 gamma 长期接近 `0.5`，可优先尝试 `fedwolf_gamma_temperature: 0.03`、`fedwolf_gamma_min: 0.5`、`fedwolf_gamma_max: 1.0`。
 - fixed-gamma 消融只改变最终 expert 插值强度；`fedwolf_gamma_mode: fixed` 时仍会更新和记录 `mu/P`，便于诊断 learned gamma 是否过于保守。
 - `fedwolf_fisher_only` 和 `fedwolf` 语义不同：前者是消融，后者是完整方法。
 - `train.py` 的自动数据准备只会覆盖 `save/{run_name}/data` 下的 `partition_meta.pt` 和 `partition_stats.json`。

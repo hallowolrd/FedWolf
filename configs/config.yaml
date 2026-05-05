@@ -136,7 +136,7 @@ train:
   # - expert_fedavg: shared/router 按样本数 FedAvg，expert 按 expert usage/token usage 加权
   # - fedwolf_fisher_only: shared/router FedAvg，expert 按 Fisher raw score s 加权
   # - fedwolf: 完整 FedWoLF，包含 Fisher evidence、WoLF-IMQ 状态更新和 gamma 插值
-  agg_method: expert_fedavg
+  agg_method: fedwolf
 
   # FedWoLF expert Fisher evidence 使用的数据加载模式：
   # - deterministic: 使用确定性 transform，不做随机增强，不 shuffle
@@ -154,7 +154,7 @@ train:
   # - trace_per_sample: 不除以参数量，只按 total_samples 平均
   # - trace_per_active_sample: 不除以参数量，只按该 expert 有梯度的样本数平均
   # - trace_raw: 不做平均，直接使用 grad_square_sum，仅用于消融
-  fedwolf_fisher_score_mode: mean_diag
+  fedwolf_fisher_score_mode: trace_per_active_sample
 
   # Fisher evidence 逐 batch 诊断记录数量：
   # - 0: 不记录逐 batch 诊断，只保留 summary
@@ -173,22 +173,34 @@ train:
   fedwolf_process_noise_q: 0.01
 
   # FedWoLF 观测噪声基础强度 sigma_e^2；R = sigma_e2 / (s + eps)
-  fedwolf_sigma_e2: 1.0
+  fedwolf_sigma_e2: 1e-4
 
   # WoLF-IMQ 鲁棒权重尺度 c；越小越容易对残差大的 evidence 降权
   fedwolf_imq_c: 1.0
 
   # FedWoLF gamma 温度系数：
-  # - gamma = sigmoid(mu / fedwolf_gamma_temperature)
-  # - 1.0 表示旧行为，即 gamma = sigmoid(mu)
+  # - learned 模式下先计算 sigmoid(mu / fedwolf_gamma_temperature)，再由 gamma_min/gamma_max 映射
+  # - 当 gamma_min=0.0、gamma_max=1.0、temperature=1.0 时退化为旧行为 gamma = sigmoid(mu)
   # - 较小的值会放大 mu 对 gamma 的影响，使 gamma 更容易偏离 0.5
   # - 必须 > 0
-  fedwolf_gamma_temperature: 1.0
+  fedwolf_gamma_temperature: 0.05
+
+  # FedWoLF learned gamma 的下界：
+  # - learned 模式下 gamma = gamma_min + (gamma_max - gamma_min) * sigmoid(mu / fedwolf_gamma_temperature)
+  # - 默认 0.0，和 gamma_max=1.0 配合时等价旧公式 gamma = sigmoid(mu / tau)
+  # - 取值范围 [0, 1]
+  fedwolf_gamma_min: 0.0
+
+  # FedWoLF learned gamma 的上界：
+  # - learned 模式下 gamma = gamma_min + (gamma_max - gamma_min) * sigmoid(mu / fedwolf_gamma_temperature)
+  # - 默认 1.0，和 gamma_min=0.0 配合时等价旧公式 gamma = sigmoid(mu / tau)
+  # - 取值范围 [0, 1]，且必须 >= fedwolf_gamma_min
+  fedwolf_gamma_max: 1.0
 
   # FedWoLF gamma 模式：
-  # - learned: 使用 learned gamma，即 gamma = sigmoid(mu / fedwolf_gamma_temperature)
+  # - learned: 使用 bounded learned gamma，由 gamma_min/gamma_max 缩放 sigmoid(mu / fedwolf_gamma_temperature)
   # - fixed: 使用固定 gamma，即 gamma = fedwolf_fixed_gamma，用于消融诊断
-  fedwolf_gamma_mode: learned
+  fedwolf_gamma_mode: fixed
 
   # fixed gamma 消融值：
   # - 仅当 fedwolf_gamma_mode: fixed 时生效
