@@ -200,7 +200,7 @@ train:
   # FedWoLF gamma 模式：
   # - learned: 使用 bounded learned gamma，由 gamma_min/gamma_max 缩放 sigmoid(mu / fedwolf_gamma_temperature)
   # - fixed: 使用固定 gamma，即 gamma = fedwolf_fixed_gamma，用于消融诊断
-  fedwolf_gamma_mode: fixed
+  fedwolf_gamma_mode: learned
 
   # fixed gamma 消融值：
   # - 仅当 fedwolf_gamma_mode: fixed 时生效

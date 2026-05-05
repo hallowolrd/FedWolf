@@ -449,7 +449,7 @@ class FedWoLFAggregator(Aggregator):
     def _get_gamma(self, layer_id, expert_id):
         layer_id = str(layer_id)
         if layer_id not in self.expert_filter_mu or expert_id >= self.expert_filter_mu[layer_id].numel():
-            return 0.5
+            return self._compute_gamma_from_mu(0.0)
         return self._compute_gamma_from_mu(self.expert_filter_mu[layer_id][expert_id].item())
 
     def _record_gamma(self, layer_id, expert_id, gamma, total_fisher_weight):
