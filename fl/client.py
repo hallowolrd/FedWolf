@@ -90,6 +90,12 @@ class Client:
             "normalization",
             "model_mode",
             "debug_batches",
+            "max_samples",
+            "max_batches",
+            "limit_reached",
+            "stop_reason",
+            "effective_total_samples",
+            "effective_num_batches",
             "auxiliary_loss_used_for_fisher",
             "zero_score_reason",
             "num_samples_with_grad_by_layer",
@@ -317,12 +323,16 @@ class Client:
             evidence_model_mode = getattr(self.args, "fedwolf_evidence_model_mode", "eval")
             fisher_score_mode = getattr(self.args, "fedwolf_fisher_score_mode", "mean_diag")
             fisher_debug_batches = getattr(self.args, "fedwolf_fisher_debug_batches", 0)
+            fisher_max_samples = getattr(self.args, "fedwolf_fisher_max_samples", None)
+            fisher_max_batches = getattr(self.args, "fedwolf_fisher_max_batches", None)
             fisher_data_loader = self.get_fisher_data_loader()
             self.logger.info(
                 f"--client: {self.client_id} "
                 f"--fedwolf_evidence_loader_mode : {evidence_loader_mode} "
                 f"--fedwolf_evidence_model_mode : {evidence_model_mode} "
-                f"--fedwolf_fisher_score_mode : {fisher_score_mode}"
+                f"--fedwolf_fisher_score_mode : {fisher_score_mode} "
+                f"--fedwolf_fisher_max_samples : {fisher_max_samples} "
+                f"--fedwolf_fisher_max_batches : {fisher_max_batches}"
             )
             fisher_score_by_layer, fisher_log_score_by_layer, fisher_diagnostics = compute_expert_fisher_evidence(
                 model=self.model,
@@ -335,6 +345,8 @@ class Client:
                 model_mode=evidence_model_mode,
                 score_mode=fisher_score_mode,
                 debug_batches=fisher_debug_batches,
+                max_samples=fisher_max_samples,
+                max_batches=fisher_max_batches,
             )
             fisher_score_log = {
                 layer_id: [f"{float(v):.12e}" for v in scores.tolist()]

@@ -134,6 +134,15 @@ FedWoLF 参数放在 `config.yaml` 的 `train` section：
   - `trace_per_active_sample`：`grad_square_sum / num_samples_with_grad`
   - `trace_raw`：直接使用 `grad_square_sum`，仅用于诊断或消融
   - 如果 `mean_diag` 让 `s` 过小、`R` 过大、`mu/gamma` 几乎不动，优先尝试 `trace_per_active_sample`，其次尝试 `trace_per_sample`
+- `fedwolf_fisher_max_samples`
+  - 每个 client 的 Fisher evidence pass 最多使用多少样本，默认 `512`
+  - `null` 或 `0` 表示不限制，使用该 client 的全量 evidence 数据
+  - 调试阶段建议 `512` 或 `1024` 加速；正式实验建议设为 `null` 做全量 evidence
+- `fedwolf_fisher_max_batches`
+  - 每个 client 的 Fisher evidence pass 最多处理多少 batch，默认 `null`
+  - `null` 或 `0` 表示不限制
+  - 如果 `fedwolf_fisher_max_samples` 和 `fedwolf_fisher_max_batches` 同时设置，先达到任一上限就停止
+  - 这两个上限只减少 evidence pass 使用的数据量；被选中的样本仍然逐样本 backward 计算 per-sample Fisher，不会退化成 batch-approx Fisher
 - `fedwolf_fisher_debug_batches`
   - 默认 `0`，不记录逐 batch 的 `batch_grad_status`
   - 设置为正整数 `N` 时，只记录前 `N` 个 evidence batch 的简要诊断

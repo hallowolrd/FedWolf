@@ -156,6 +156,16 @@ train:
   # - trace_raw: 不做平均，直接使用 grad_square_sum，仅用于消融
   fedwolf_fisher_score_mode: trace_per_active_sample
 
+  # 每个 client 的 Fisher evidence pass 最多使用多少样本：
+  # - null 或 0: 不限制，使用该 client 的全部 evidence 数据
+  # - 正整数: 最多使用这么多样本；调试阶段可用 512/1024 加速
+  fedwolf_fisher_max_samples: 512
+
+  # 每个 client 的 Fisher evidence pass 最多处理多少 batch：
+  # - null 或 0: 不限制
+  # - 正整数: 最多处理这么多个 evidence batch；若 max_samples 同时设置，先到任一上限就停止
+  fedwolf_fisher_max_batches: null
+
   # Fisher evidence 逐 batch 诊断记录数量：
   # - 0: 不记录逐 batch 诊断，只保留 summary
   # - N>0: 只记录前 N 个 batch
@@ -183,7 +193,7 @@ train:
   # - 当 gamma_min=0.0、gamma_max=1.0、temperature=1.0 时退化为旧行为 gamma = sigmoid(mu)
   # - 较小的值会放大 mu 对 gamma 的影响，使 gamma 更容易偏离 0.5
   # - 必须 > 0
-  fedwolf_gamma_temperature: 0.05
+  fedwolf_gamma_temperature: 0.03
 
   # FedWoLF learned gamma 的下界：
   # - learned 模式下 gamma = gamma_min + (gamma_max - gamma_min) * sigmoid(mu / fedwolf_gamma_temperature)

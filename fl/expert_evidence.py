@@ -113,6 +113,33 @@ def canonicalize_fisher_score_mode(score_mode):
     return canonical_mode
 
 
+def parse_optional_positive_int_limit(value, field_name):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"", "none", "null"}:
+            return None
+        try:
+            value = int(normalized)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} must be a positive integer, 0/null/None, got {value!r}.") from exc
+    elif isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a positive integer, 0/null/None, got {value!r}.")
+    else:
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field_name} must be a positive integer, 0/null/None, got {value!r}.") from exc
+        if not math.isfinite(numeric_value) or not numeric_value.is_integer():
+            raise ValueError(f"{field_name} must be a positive integer, 0/null/None, got {value!r}.")
+        value = int(numeric_value)
+
+    if value <= 0:
+        return None
+    return int(value)
+
+
 def compute_fisher_scalar_from_sums(
     grad_square_sum,
     param_count,
@@ -219,6 +246,8 @@ def compute_expert_fisher_evidence(
     model_mode="eval",
     score_mode="mean_diag",
     debug_batches=0,
+    max_samples=None,
+    max_batches=None,
 ):
     """Compute per-sample empirical diagonal Fisher scalar evidence for experts.
 
@@ -234,6 +263,8 @@ def compute_expert_fisher_evidence(
 
     canonical_score_mode = canonicalize_fisher_score_mode(score_mode)
     debug_batches = max(int(debug_batches), 0)
+    max_samples = parse_optional_positive_int_limit(max_samples, "fedwolf_fisher_max_samples")
+    max_batches = parse_optional_positive_int_limit(max_batches, "fedwolf_fisher_max_batches")
 
     expert_entries, param_counts, matched_param_names = _collect_expert_parameter_entries(
         model=model,
@@ -263,6 +294,12 @@ def compute_expert_fisher_evidence(
         "normalization": FISHER_SCORE_NORMALIZATION[canonical_score_mode],
         "model_mode": model_mode,
         "debug_batches": int(debug_batches),
+        "max_samples": max_samples,
+        "max_batches": max_batches,
+        "limit_reached": False,
+        "stop_reason": None,
+        "effective_total_samples": 0,
+        "effective_num_batches": 0,
         # Expert Fisher evidence 只基于逐样本 supervised CE loss。
         # router 辅助损失是 batch-level 标量，不是逐样本 loss，加入这里会重复计入。
         "fisher_loss_source": "supervised_cross_entropy_only",
@@ -301,9 +338,33 @@ def compute_expert_fisher_evidence(
         model.train()
     num_batches = 0
     total_samples = 0
+    limit_reached = False
+    stop_reason = None
 
     try:
         for inputs, labels in data_loader:
+            if max_batches is not None and num_batches >= max_batches:
+                limit_reached = True
+                stop_reason = "max_batches"
+                break
+            if max_samples is not None and total_samples >= max_samples:
+                limit_reached = True
+                stop_reason = "max_samples"
+                break
+
+            if max_samples is not None:
+                remaining = max_samples - total_samples
+                if remaining <= 0:
+                    limit_reached = True
+                    stop_reason = "max_samples"
+                    break
+                if labels.size(0) > remaining:
+                    inputs = inputs[:remaining]
+                    labels = labels[:remaining]
+
+            if labels.size(0) <= 0:
+                continue
+
             inputs = inputs.to(device)
             labels = labels.to(device)
 
@@ -349,6 +410,15 @@ def compute_expert_fisher_evidence(
                         "sample_count": int(batch_size),
                     }
                 )
+
+            if max_samples is not None and total_samples >= max_samples:
+                limit_reached = True
+                stop_reason = "max_samples"
+                break
+            if max_batches is not None and num_batches >= max_batches:
+                limit_reached = True
+                stop_reason = "max_batches"
+                break
     finally:
         model.zero_grad(set_to_none=True)
         if was_training:
@@ -358,6 +428,10 @@ def compute_expert_fisher_evidence(
 
     diagnostics["total_samples"] = int(total_samples)
     diagnostics["num_batches"] = int(num_batches)
+    diagnostics["effective_total_samples"] = int(total_samples)
+    diagnostics["effective_num_batches"] = int(num_batches)
+    diagnostics["limit_reached"] = bool(limit_reached)
+    diagnostics["stop_reason"] = stop_reason
 
     score_by_layer = {}
     log_score_by_layer = {}
