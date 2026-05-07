@@ -157,7 +157,7 @@ class Server:
 
         with torch.no_grad():
             for inputs, labels in data_loader:
-                inputs, labels = inputs.to(self.device), labels.to(self.device)
+                inputs, labels = self._move_batch_to_device(inputs, labels)
                 result = self.model(inputs)
                 outputs = result["logits"]
                 loss = self.criterion(outputs, labels)
@@ -170,6 +170,16 @@ class Server:
         eval_acc = running_corrects.double() / len(data_loader.dataset)
         self.model.to("cpu")
         return eval_loss, eval_acc.item()
+
+    def _move_batch_to_device(self, inputs, labels):
+        non_blocking = (
+            bool(getattr(self.args, "pin_memory", False))
+            and str(self.device).startswith("cuda")
+        )
+        return (
+            inputs.to(self.device, non_blocking=non_blocking),
+            labels.to(self.device, non_blocking=non_blocking),
+        )
 
     def evaluate_round_on_global_test(self, round_id):
         """每轮聚合后在 global_test 上评估一次，仅用于监控训练曲线。"""

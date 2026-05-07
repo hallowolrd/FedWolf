@@ -235,6 +235,18 @@ def _compute_per_sample_supervised_losses(criterion, outputs, labels):
     return _reduce_loss_to_per_sample(per_element_losses, batch_size)
 
 
+def _is_cuda_device(device):
+    return str(torch.device(device)).startswith("cuda")
+
+
+def _move_batch_to_device(inputs, labels, device, pin_memory=False):
+    non_blocking = bool(pin_memory) and _is_cuda_device(device)
+    return (
+        inputs.to(device, non_blocking=non_blocking),
+        labels.to(device, non_blocking=non_blocking),
+    )
+
+
 def compute_expert_fisher_evidence(
     model,
     data_loader,
@@ -248,6 +260,7 @@ def compute_expert_fisher_evidence(
     debug_batches=0,
     max_samples=None,
     max_batches=None,
+    pin_memory=False,
 ):
     """Compute per-sample empirical diagonal Fisher scalar evidence for experts.
 
@@ -296,6 +309,8 @@ def compute_expert_fisher_evidence(
         "debug_batches": int(debug_batches),
         "max_samples": max_samples,
         "max_batches": max_batches,
+        "pin_memory": bool(pin_memory),
+        "non_blocking_transfer": bool(pin_memory) and _is_cuda_device(device),
         "limit_reached": False,
         "stop_reason": None,
         "effective_total_samples": 0,
@@ -365,8 +380,12 @@ def compute_expert_fisher_evidence(
             if labels.size(0) <= 0:
                 continue
 
-            inputs = inputs.to(device)
-            labels = labels.to(device)
+            inputs, labels = _move_batch_to_device(
+                inputs=inputs,
+                labels=labels,
+                device=device,
+                pin_memory=pin_memory,
+            )
 
             model.zero_grad(set_to_none=True)
             result = model(inputs)

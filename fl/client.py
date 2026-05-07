@@ -170,6 +170,16 @@ class Client:
         )
         return extra_loss, router_aux_loss, router_z_loss
 
+    def _move_batch_to_device(self, inputs, labels):
+        non_blocking = (
+            bool(getattr(self.args, "pin_memory", False))
+            and str(self.device).startswith("cuda")
+        )
+        return (
+            inputs.to(self.device, non_blocking=non_blocking),
+            labels.to(self.device, non_blocking=non_blocking),
+        )
+
     def get_expert_activations(self, result):
         """ 从模型输出结果里拿到 expert 的激活/使用统计。
         如果模型没有返回这个字段，就用全零向量代替。 """
@@ -252,7 +262,7 @@ class Client:
             router_prob_sum = torch.zeros(self.args.num_experts, device=self.device)
 
             for inputs, labels in self.train_loader:
-                inputs, labels = inputs.to(self.device), labels.to(self.device)
+                inputs, labels = self._move_batch_to_device(inputs, labels)
                 self.optimizer.zero_grad()
 
                 result = self.model(inputs)
@@ -353,6 +363,7 @@ class Client:
                 debug_batches=fisher_debug_batches,
                 max_samples=fisher_max_samples,
                 max_batches=fisher_max_batches,
+                pin_memory=getattr(self.args, "pin_memory", False),
             )
             fisher_score_log = {
                 layer_id: [f"{float(v):.12e}" for v in scores.tolist()]
