@@ -118,6 +118,13 @@ FedWoLF 参数放在 `config.yaml` 的 `train` section：
 
 - `agg_method`
   - 可选：`fedavg`、`expert_fedavg`、`fedwolf_fisher_only`、`fedwolf`
+- `aggregation_device`
+  - 可选：`cpu`、`cuda`、`cuda:<index>`，默认 `cpu`
+  - `cpu`：在 CPU 上聚合，显存占用更稳，和旧版本行为一致
+  - `cuda`：将每个参数 key 的浮点聚合临时放到 GPU 上完成，可能减少 CPU 聚合开销
+  - 聚合结果仍然转回 CPU state_dict，不会长期保存 GPU 版 client state_dict
+  - 多客户端、大模型时 `cuda` 聚合会增加聚合阶段显存占用；显存紧张时保持 `cpu`
+  - 这是工程加速开关，不改变 FedAvg、ExpertFedAvg、FedWoLF 的数学公式
 - `fedwolf_evidence_loader_mode`
   - 可选：`deterministic`、`train_loader`
   - 默认 `deterministic`：使用同一份客户端 `client_train_indices`，但采用 `ToTensor + Normalize` 的确定性 transform，不做 `RandomCrop` / `RandomHorizontalFlip`，并且 `shuffle=False`

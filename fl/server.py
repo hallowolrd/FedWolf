@@ -32,6 +32,7 @@ class Server:
         self.clientsID_list = [i+1 for i in range(self.num_clients)]
         self.device = self.args.device
         self.logger = logger
+        self.logger.info(f"--aggregation_device : {getattr(self.aggregator, 'aggregation_device', 'cpu')}\n")
         os.makedirs(self.args.model_save_path, exist_ok=True)
         self.partition_meta = load_partition_meta(self.args)
         self.global_test_loader = build_global_eval_loader(

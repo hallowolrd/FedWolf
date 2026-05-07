@@ -36,8 +36,54 @@ def format_scientific_list(values):
     return [f"{float(value):.12e}" for value in values]
 
 
+def resolve_aggregation_device(args):
+    raw_device = getattr(args, "aggregation_device", "cpu")
+    if raw_device is None:
+        raw_device = "cpu"
+    raw_device = str(raw_device).strip().lower()
+
+    if raw_device in {"", "none", "null"}:
+        raw_device = "cpu"
+
+    if raw_device == "cpu":
+        return torch.device("cpu")
+
+    if raw_device == "cuda":
+        if not torch.cuda.is_available():
+            raise ValueError("aggregation_device='cuda' but CUDA is not available.")
+        # 多 GPU 环境下优先跟随训练 device，避免聚合跑到错误的默认卡上。
+        train_device = str(getattr(args, "device", "cuda")).strip().lower()
+        if train_device.startswith("cuda"):
+            return torch.device(train_device)
+        return torch.device("cuda")
+
+    if raw_device.startswith("cuda:"):
+        if not torch.cuda.is_available():
+            raise ValueError(f"aggregation_device={raw_device!r} but CUDA is not available.")
+        return torch.device(raw_device)
+
+    raise ValueError(
+        "aggregation_device must be 'cpu', 'cuda', or 'cuda:<index>', "
+        f"got {raw_device!r}."
+    )
+
+
 class Aggregator(ABC):
     # 聚合器统一接口。后续新增聚合方法时，只需要新增实现类并在 build_aggregator 中注册。
+    def __init__(self, args=None):
+        self.aggregation_device = resolve_aggregation_device(args)
+
+    def _to_agg_device(self, tensor):
+        tensor = tensor.detach()
+        if tensor.device == self.aggregation_device:
+            return tensor
+        if self.aggregation_device.type == "cuda":
+            return tensor.to(self.aggregation_device, non_blocking=True)
+        return tensor.to(self.aggregation_device)
+
+    def _to_output_device(self, tensor):
+        return tensor.detach().cpu()
+
     @abstractmethod
     def aggregate(self, client_updates, client_weights, global_model=None, **kwargs):
         pass
@@ -46,6 +92,9 @@ class Aggregator(ABC):
 class FedAvgAggregator(Aggregator):
     # 标准 FedAvg：
     # 对完整 state_dict 做按客户端样本数加权平均，权重 w_i = n_i / sum_j n_j。
+    def __init__(self, args=None):
+        super().__init__(args)
+
     def aggregate(self, client_updates, client_weights, global_model=None, **kwargs):
         if len(client_updates) == 0:
             raise ValueError("FedAvg requires at least one client update")
@@ -58,14 +107,17 @@ class FedAvgAggregator(Aggregator):
 
         aggregated_state = collections.OrderedDict()
         for key in client_updates[0].keys():
-            first_value = client_updates[0][key].detach().cpu()
+            first_value = client_updates[0][key].detach()
             if torch.is_floating_point(first_value):
-                aggregated_state[key] = torch.zeros_like(first_value)
+                first_on_device = self._to_agg_device(first_value)
+                aggregated_tensor = torch.zeros_like(first_on_device)
                 for update, weight in zip(client_updates, client_weights):
-                    aggregated_state[key] += update[key].detach().cpu() * (weight / total_weight)
+                    update_tensor = self._to_agg_device(update[key])
+                    aggregated_tensor += update_tensor * (weight / total_weight)
+                aggregated_state[key] = self._to_output_device(aggregated_tensor)
             else:
                 # 非浮点 buffer 通常不能加权平均，沿用第一个客户端的值。
-                aggregated_state[key] = first_value.clone()
+                aggregated_state[key] = first_value.cpu().clone()
 
         return aggregated_state
 
@@ -74,8 +126,8 @@ class ExpertFedAvgAggregator(Aggregator):
     # FL + MoE 专家级 FedAvg：
     # - 普通共享层仍按客户端训练样本数 n_i 做标准 FedAvg；
     # - blocks.{layer}.ffn.experts.{expert_id}.* 参数按该层该专家实际处理的 token 数 n_{i,l,e} 加权。
-    def __init__(self):
-        pass
+    def __init__(self, args=None):
+        super().__init__(args)
 
     def aggregate(self, client_updates, client_weights, global_model=None, **kwargs):
         if len(client_updates) == 0:
@@ -96,9 +148,9 @@ class ExpertFedAvgAggregator(Aggregator):
             raise ValueError("ExpertFedAvg requires positive total client weight")
 
         for key in client_updates[0].keys():
-            first_value = client_updates[0][key].detach().cpu()
+            first_value = client_updates[0][key].detach()
             if not torch.is_floating_point(first_value):
-                aggregated_state[key] = first_value.clone()
+                aggregated_state[key] = first_value.cpu().clone()
                 continue
 
             expert_ref = self._parse_expert_ref(key)
@@ -117,12 +169,15 @@ class ExpertFedAvgAggregator(Aggregator):
                 if global_state is not None:
                     aggregated_state[key] = global_state[key].detach().cpu().clone()
                 else:
-                    aggregated_state[key] = first_value.clone()
+                    aggregated_state[key] = first_value.cpu().clone()
                 continue
 
-            aggregated_state[key] = torch.zeros_like(first_value)
+            first_on_device = self._to_agg_device(first_value)
+            aggregated_tensor = torch.zeros_like(first_on_device)
             for update, weight in zip(client_updates, weights):
-                aggregated_state[key] += update[key].detach().cpu() * (weight / total_weight)
+                update_tensor = self._to_agg_device(update[key])
+                aggregated_tensor += update_tensor * (weight / total_weight)
+            aggregated_state[key] = self._to_output_device(aggregated_tensor)
 
         return aggregated_state
 
@@ -157,6 +212,7 @@ class FedWoLFAggregator(Aggregator):
     # - agg_method=fedwolf 时额外吸收 Fisher log evidence 更新 WoLF-IMQ filter state。
     # - agg_method=fedwolf 时使用 learned/fixed gamma 在 old global expert 和 Theta_bar 之间插值。
     def __init__(self, args=None, use_wolf_filter=True, use_gamma=True):
+        super().__init__(args)
         self.eps = float(getattr(args, "fedwolf_eps", 1e-8))
         self.process_noise_q = float(getattr(args, "fedwolf_process_noise_q", 0.01))
         self.sigma_e2 = float(getattr(args, "fedwolf_sigma_e2", 1.0))
@@ -230,9 +286,9 @@ class FedWoLFAggregator(Aggregator):
 
         aggregated_state = collections.OrderedDict()
         for key in client_updates[0].keys():
-            first_value = client_updates[0][key].detach().cpu()
+            first_value = client_updates[0][key].detach()
             if not torch.is_floating_point(first_value):
-                aggregated_state[key] = first_value.clone()
+                aggregated_state[key] = first_value.cpu().clone()
                 continue
 
             expert_ref = parse_expert_ref_from_key(key)
@@ -254,21 +310,24 @@ class FedWoLFAggregator(Aggregator):
                 if global_state is not None:
                     aggregated_state[key] = global_state[key].detach().cpu().clone()
                 else:
-                    aggregated_state[key] = first_value.clone()
+                    aggregated_state[key] = first_value.cpu().clone()
                 continue
 
-            theta_bar = torch.zeros_like(first_value)
+            first_on_device = self._to_agg_device(first_value)
+            theta_bar = torch.zeros_like(first_on_device)
             for update, weight in zip(client_updates, weights):
-                theta_bar += update[key].detach().cpu() * (weight / denominator)
+                update_tensor = self._to_agg_device(update[key])
+                theta_bar += update_tensor * (weight / denominator)
 
             if expert_ref is None or not self.use_gamma:
-                aggregated_state[key] = theta_bar
+                aggregated_state[key] = self._to_output_device(theta_bar)
                 continue
 
             layer_id, expert_id = expert_ref
             gamma = self._get_gamma(layer_id, expert_id)
-            theta_old = global_state[key].detach().cpu()
-            aggregated_state[key] = theta_old * (1.0 - gamma) + theta_bar * gamma
+            theta_old = self._to_agg_device(global_state[key])
+            aggregated_tensor = theta_old * (1.0 - gamma) + theta_bar * gamma
+            aggregated_state[key] = self._to_output_device(aggregated_tensor)
             self._record_gamma(layer_id, expert_id, gamma, total_weight)
 
         if self.use_gamma:
@@ -535,7 +594,7 @@ def build_aggregator(args):
     if args.agg_method == "fedwolf":
         return FedWoLFAggregator(args, use_wolf_filter=True, use_gamma=True)
     if args.agg_method == "expert_fedavg":
-        return ExpertFedAvgAggregator()
+        return ExpertFedAvgAggregator(args)
     if args.agg_method == "fedavg":
-        return FedAvgAggregator()
+        return FedAvgAggregator(args)
     raise ValueError(f"Unknown aggregation method: {args.agg_method}")

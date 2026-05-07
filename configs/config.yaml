@@ -138,6 +138,12 @@ train:
   # - fedwolf: 完整 FedWoLF，包含 Fisher evidence、WoLF-IMQ 状态更新和 gamma 插值
   agg_method: fedwolf
 
+  # 聚合设备：
+  # - cpu: 默认，和旧行为一致，在 CPU 上聚合，显存更稳
+  # - cuda/cuda:0: 将每个参数 key 的浮点聚合临时放到 GPU，可能更快但会增加聚合阶段显存占用
+  # - 聚合完成后仍返回 CPU state_dict，不会长期保留 GPU 版 client state_dict
+  aggregation_device: cpu
+
   # FedWoLF expert Fisher evidence 使用的数据加载模式：
   # - deterministic: 使用确定性 transform，不做随机增强，不 shuffle
   # - train_loader: 复用训练 loader，包含随机增强和 shuffle，用于消融
