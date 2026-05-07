@@ -242,10 +242,10 @@ class Client:
 
         for epoch in range(self.client_epochs):
             self.model.train()
-            running_loss = 0.0
-            running_aux_loss = 0.0
-            running_z_loss = 0.0
-            running_corrects = 0
+            running_loss = torch.zeros((), device=self.device)
+            running_aux_loss = torch.zeros((), device=self.device)
+            running_z_loss = torch.zeros((), device=self.device)
+            running_corrects = torch.zeros((), device=self.device)
             total_samples = 0
             usage_total = torch.zeros(self.args.num_experts, device=self.device)
             layer_usage_total = {}
@@ -264,21 +264,27 @@ class Client:
                 self.optimizer.step()
 
                 batch_size = inputs.size(0)
-                running_loss += loss.item() * batch_size
-                running_aux_loss += router_aux_loss.item() * batch_size
-                running_z_loss += router_z_loss.item() * batch_size
+                running_loss += loss.detach() * batch_size
+                running_aux_loss += router_aux_loss.detach() * batch_size
+                running_z_loss += router_z_loss.detach() * batch_size
                 total_samples += batch_size
                 _, preds = torch.max(outputs, 1)
-                running_corrects += torch.sum(preds == labels.data)
+                running_corrects += torch.sum(preds == labels).detach()
 
                 usage_total += self.get_expert_activations(result)
                 self.add_layer_stats(layer_usage_total, self.get_layer_expert_stats(result))
                 router_prob_sum += self.get_avg_router_probs(result) * batch_size
 
-            train_loss = running_loss / len(self.train_loader.dataset)
-            train_acc = running_corrects.double() / len(self.train_loader.dataset)
-            avg_aux_loss = running_aux_loss / max(total_samples, 1)
-            avg_z_loss = running_z_loss / max(total_samples, 1)
+            denominator = max(total_samples, 1)
+            train_loss_tensor = running_loss / denominator
+            train_acc_tensor = running_corrects.double() / denominator
+            avg_aux_loss_tensor = running_aux_loss / denominator
+            avg_z_loss_tensor = running_z_loss / denominator
+
+            train_loss = float(train_loss_tensor.detach().cpu().item())
+            train_acc = float(train_acc_tensor.detach().cpu().item())
+            avg_aux_loss = float(avg_aux_loss_tensor.detach().cpu().item())
+            avg_z_loss = float(avg_z_loss_tensor.detach().cpu().item())
             local_usage_total += usage_total.detach()
             self.add_layer_stats(local_layer_usage_total, layer_usage_total)
             last_avg_router_probs = router_prob_sum / max(total_samples, 1)
@@ -308,7 +314,7 @@ class Client:
                 'client_epoch': epoch+1,
                 'client_id': self.client_id,
                 "train_loss": train_loss,
-                "train_acc": train_acc.item(),
+                "train_acc": train_acc,
                 "router_aux_loss": avg_aux_loss,
                 "router_z_loss": avg_z_loss,
             }
