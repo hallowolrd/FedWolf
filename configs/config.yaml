@@ -13,7 +13,7 @@ data:
 
   # Dirichlet 分布参数，越小表示客户端间数据越不均匀；
   # 官方 train 会全部按这个参数划分给各客户端
-  alpha: 0.1
+  alpha: 0.5
 
   # 全局随机种子，控制数据划分和训练可复现性
   seed: 1
@@ -109,10 +109,10 @@ train:
   num_clients: 10
 
   # 服务端通信轮数，也就是全局训练轮数
-  server_epochs: 50
+  server_epochs: 80
 
   # 每轮中每个客户端本地训练的 epoch 数
-  client_epochs: 1
+  client_epochs: 2
 
   # 训练设备，例如 cpu 或 cuda
   device: cuda

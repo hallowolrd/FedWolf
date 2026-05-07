@@ -323,11 +323,11 @@ def compute_expert_fisher_evidence(
         return {}, {}
 
     score_sums = {
-        layer_id: torch.zeros(num_experts, dtype=torch.float64)
+        layer_id: torch.zeros(num_experts, dtype=torch.float64, device=device)
         for layer_id in expert_entries
     }
     samples_with_grad = {
-        layer_id: torch.zeros(num_experts, dtype=torch.long)
+        layer_id: torch.zeros(num_experts, dtype=torch.long, device=device)
         for layer_id in expert_entries
     }
 
@@ -377,10 +377,11 @@ def compute_expert_fisher_evidence(
             num_batches += 1
             total_samples += batch_size
 
-            # Important:
-            # We intentionally compute grad(loss_i)^2 for each sample and then average.
-            # This is different from grad(mean_i loss_i)^2, which underestimates Fisher
-            # because gradients from different samples can cancel before squaring.
+            # 重要：
+            # 这里仍然逐样本 backward 并累计 grad(loss_i)^2，然后再平均。
+            # 这不同于 grad(mean_i loss_i)^2；后者会先让不同样本梯度相互抵消，再平方。
+            # 梯度平方和保留在 evidence device 上累计，避免内层循环里的 .cpu()/.item()/float(tensor)
+            # 触发 GPU 同步；只有最后构造 CPU 返回值和 diagnostics 时才转 CPU。
             for sample_idx in range(batch_size):
                 model.zero_grad(set_to_none=True)
                 retain_graph = sample_idx < batch_size - 1
@@ -388,19 +389,20 @@ def compute_expert_fisher_evidence(
 
                 for layer_id, experts in expert_entries.items():
                     for expert_id, entries in experts.items():
-                        grad_square_sum = 0.0
+                        grad_square_sum = None
                         has_grad_param_count = 0
                         none_grad_param_count = 0
                         for _, param in entries:
                             if param.grad is not None:
-                                grad_square_sum += float(param.grad.detach().pow(2).sum().cpu())
+                                value = param.grad.detach().pow(2).sum().to(dtype=torch.float64)
+                                grad_square_sum = value if grad_square_sum is None else grad_square_sum + value
                                 has_grad_param_count += 1
                             else:
                                 none_grad_param_count += 1
 
                         if has_grad_param_count > 0:
                             samples_with_grad[layer_id][expert_id] += 1
-                        score_sums[layer_id][expert_id] += grad_square_sum
+                            score_sums[layer_id][expert_id] += grad_square_sum
 
             if num_batches <= debug_batches:
                 diagnostics["batch_grad_status"].append(
@@ -437,6 +439,8 @@ def compute_expert_fisher_evidence(
     log_score_by_layer = {}
 
     for layer_id, scores in score_sums.items():
+        scores_cpu = scores.detach().cpu()
+        samples_with_grad_cpu = samples_with_grad[layer_id].detach().cpu()
         mode_scores_by_layer = {
             mode: torch.zeros(num_experts, dtype=torch.float64)
             for mode in FISHER_SCORE_MODES
@@ -444,10 +448,10 @@ def compute_expert_fisher_evidence(
         layer_scores = torch.zeros(num_experts, dtype=torch.float64)
         for expert_id in range(num_experts):
             param_count = param_counts.get((layer_id, expert_id), 0)
-            num_samples_with_grad = int(samples_with_grad[layer_id][expert_id].item())
+            num_samples_with_grad = int(samples_with_grad_cpu[expert_id].item())
             for mode in FISHER_SCORE_MODES:
                 mode_scores_by_layer[mode][expert_id] = compute_fisher_scalar_from_sums(
-                    grad_square_sum=scores[expert_id].item(),
+                    grad_square_sum=scores_cpu[expert_id].item(),
                     param_count=param_count,
                     total_samples=total_samples,
                     num_samples_with_grad=num_samples_with_grad,
@@ -462,9 +466,9 @@ def compute_expert_fisher_evidence(
             str(expert_id): int(param_counts.get((layer_id, expert_id), 0))
             for expert_id in range(num_experts)
         }
-        diagnostics["grad_square_sum_by_layer"][str(layer_id)] = _scientific_list(scores.tolist())
+        diagnostics["grad_square_sum_by_layer"][str(layer_id)] = _scientific_list(scores_cpu.tolist())
         diagnostics["num_samples_with_grad_by_layer"][str(layer_id)] = [
-            int(value) for value in samples_with_grad[layer_id].tolist()
+            int(value) for value in samples_with_grad_cpu.tolist()
         ]
         diagnostics["score_scientific_by_layer"][str(layer_id)] = _scientific_list(layer_scores.tolist())
         diagnostics["score_mean_diag_by_layer"][str(layer_id)] = _scientific_list(
