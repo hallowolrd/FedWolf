@@ -125,6 +125,13 @@ FedWoLF 参数放在 `config.yaml` 的 `train` section：
   - 聚合结果仍然转回 CPU state_dict，不会长期保存 GPU 版 client state_dict
   - 多客户端、大模型时 `cuda` 聚合会增加聚合阶段显存占用；显存紧张时保持 `cpu`
   - 这是工程加速开关，不改变 FedAvg、ExpertFedAvg、FedWoLF 的数学公式
+- `show_progress`
+  - 默认 `true`，显示一个总训练进度条，用于查看整体训练进度和 ETA
+  - `false`：关闭进度条，适合后台运行、日志重定向或输出混乱时使用
+- `progress_leave`
+  - 默认 `true`，训练结束后在终端保留进度条，方便查看总耗时和平均速度
+  - `false`：训练结束后清除进度条，终端输出更干净
+  - 当前只创建一个总进度条；总步数按每轮 client 训练、aggregation/save、round eval，以及最终 final eval 估计，ETA 由 tqdm 自动估计
 - `fedwolf_evidence_loader_mode`
   - 可选：`deterministic`、`train_loader`
   - 默认 `deterministic`：使用同一份客户端 `client_train_indices`，但采用 `ToTensor + Normalize` 的确定性 transform，不做 `RandomCrop` / `RandomHorizontalFlip`，并且 `shuffle=False`

@@ -1,7 +1,67 @@
-import torch
 import os
+import sys
+import time
 from types import SimpleNamespace
+
+import torch
 from torch import nn
+
+try:
+    from tqdm.auto import tqdm
+except ModuleNotFoundError:
+    class tqdm:
+        def __init__(
+            self,
+            total=None,
+            desc=None,
+            disable=False,
+            leave=True,
+            dynamic_ncols=True,
+            **kwargs,
+        ):
+            self.total = int(total or 0)
+            self.desc = desc or ""
+            self.disable = bool(disable)
+            self.leave = bool(leave)
+            self.n = 0
+            self.postfix = {}
+            self.start_time = time.time()
+            if not self.disable:
+                self._render()
+
+        def update(self, n=1):
+            self.n += int(n)
+            if not self.disable:
+                self._render()
+
+        def set_postfix(self, ordered_dict=None, **kwargs):
+            self.postfix = ordered_dict or kwargs
+            if not self.disable:
+                self._render()
+
+        def close(self):
+            if self.disable:
+                return
+            if self.leave:
+                sys.stderr.write("\n")
+            else:
+                sys.stderr.write("\r\033[K")
+            sys.stderr.flush()
+
+        def _render(self):
+            elapsed = max(time.time() - self.start_time, 1e-12)
+            if self.total > 0:
+                fraction = min(max(self.n / self.total, 0.0), 1.0)
+                percent = 100.0 * fraction
+                eta = elapsed * (self.total - self.n) / max(self.n, 1) if self.n > 0 else 0.0
+                progress = f"{self.n}/{self.total} {percent:6.2f}% ETA {eta:6.1f}s"
+            else:
+                progress = f"{self.n} steps"
+            postfix = ""
+            if self.postfix:
+                postfix = " | " + ", ".join(f"{key}={value}" for key, value in self.postfix.items())
+            sys.stderr.write(f"\r{self.desc}: {progress}{postfix}")
+            sys.stderr.flush()
 
 from data.loader import build_global_eval_loader, get_client_train_size, load_partition_meta
 from fl.aggregators import build_aggregator
@@ -65,6 +125,11 @@ class Server:
         }
         torch.save(cpu_state_dict, self.args.model_save_path + f"/server.pth")
 
+    def _progress_enabled(self):
+        return bool(getattr(self.args, "show_progress", True))
+
+    def _progress_leave(self):
+        return bool(getattr(self.args, "progress_leave", True))
 
     def train(self):
         """ 服务端训练主流程。
@@ -75,74 +140,110 @@ class Server:
         4. 保存 server.pth,供下一轮客户端同步
         5. 所有轮次结束后，在 global_test 上评估最终模型 """
 
-        # 外层循环是一轮轮服务端通信，也就是联邦学习中的 global round。
-        for c_T in range(self.server_epochs):
-            self.logger.info(f"============================== T:{c_T+1} start !!! ===============================\n")
-            server_state_dict = {
-                key: value.detach().cpu().clone()
-                for key, value in self.model.state_dict().items()
-            }
-            round_expert_usage_summary = torch.zeros(self.args.num_experts)
-            round_layer_stats = {}
-            round_client_expert_usages = []
-            round_client_states = []
-            round_client_sizes = []
-            for id in self.clientsID_list:
-                # 每个客户端执行本地训练，并返回本轮信息。
-                client_stats = Client(
-                    args=self.args,
-                    client_id=id,
-                    logger=self.logger,
-                    c_T=c_T,
-                    partition_meta=self.partition_meta,
-                    server_state_dict=server_state_dict,
-                ).train()
-                client_state_dict = client_stats.pop("local_state_dict")
-                round_client_states.append(client_state_dict)
-                round_client_sizes.append(self.get_client_train_size(id))
-                client_expert_usage = client_stats["expert_activations"].float().cpu()
-                round_client_expert_usages.append(client_stats)
-                round_expert_usage_summary += client_expert_usage
-                for layer_id, stats in client_stats.get("expert_stats_by_layer", {}).items():
-                    if layer_id not in round_layer_stats:
-                        round_layer_stats[layer_id] = {
-                            "expert_activations": torch.zeros(self.args.num_experts),
-                            "overflow_counts": torch.zeros(self.args.num_experts),
-                            "capacity": stats.get("capacity", 0),
-                        }
-                    round_layer_stats[layer_id]["expert_activations"] += stats["expert_activations"].float().cpu()
-                    round_layer_stats[layer_id]["overflow_counts"] += stats["overflow_counts"].float().cpu()
-                    round_layer_stats[layer_id]["capacity"] = stats.get("capacity", round_layer_stats[layer_id]["capacity"])
+        num_clients = len(self.clientsID_list)
+        steps_per_round = num_clients + 2
+        total_steps = self.server_epochs * steps_per_round + 1
+        progress_bar = tqdm(
+            total=total_steps,
+            desc="Total training progress",
+            disable=not self._progress_enabled(),
+            leave=self._progress_leave(),
+            dynamic_ncols=True,
+        )
 
-            usage_list = [int(v) for v in round_expert_usage_summary.tolist()]
-            self.logger.info(f"--round_expert_usage_summary : {usage_list}\n")
-            self.last_client_expert_usages = round_client_expert_usages
-            client_usage_list = [
-                [int(v) for v in stats["expert_activations"].tolist()]
-                for stats in round_client_expert_usages
-            ]
-            layer_stats_log = {
-                layer_id: {
-                    "expert_activations": [int(v) for v in stats["expert_activations"].tolist()],
-                    "overflow_counts": [int(v) for v in stats["overflow_counts"].tolist()],
-                    "capacity": int(stats["capacity"]),
+        try:
+            # 外层循环是一轮轮服务端通信，也就是联邦学习中的 global round。
+            for c_T in range(self.server_epochs):
+                self.logger.info(f"============================== T:{c_T+1} start !!! ===============================\n")
+                server_state_dict = {
+                    key: value.detach().cpu().clone()
+                    for key, value in self.model.state_dict().items()
                 }
-                for layer_id, stats in round_layer_stats.items()
-            }
-            self.logger.info(f"--client_expert_usage_summary : {client_usage_list}\n")
-            self.logger.info(f"--round_expert_stats_by_layer : {layer_stats_log}\n")
-            # 所有客户端本地训练完成后，服务端通过聚合器更新全局模型。
-            self.aggregation(
-                client_states=round_client_states,
-                client_sizes=round_client_sizes,
-            )
+                round_expert_usage_summary = torch.zeros(self.args.num_experts)
+                round_layer_stats = {}
+                round_client_expert_usages = []
+                round_client_states = []
+                round_client_sizes = []
+                for id in self.clientsID_list:
+                    # 每个客户端执行本地训练，并返回本轮信息。
+                    client_stats = Client(
+                        args=self.args,
+                        client_id=id,
+                        logger=self.logger,
+                        c_T=c_T,
+                        partition_meta=self.partition_meta,
+                        server_state_dict=server_state_dict,
+                    ).train()
+                    client_state_dict = client_stats.pop("local_state_dict")
+                    round_client_states.append(client_state_dict)
+                    round_client_sizes.append(self.get_client_train_size(id))
+                    client_expert_usage = client_stats["expert_activations"].float().cpu()
+                    round_client_expert_usages.append(client_stats)
+                    round_expert_usage_summary += client_expert_usage
+                    for layer_id, stats in client_stats.get("expert_stats_by_layer", {}).items():
+                        if layer_id not in round_layer_stats:
+                            round_layer_stats[layer_id] = {
+                                "expert_activations": torch.zeros(self.args.num_experts),
+                                "overflow_counts": torch.zeros(self.args.num_experts),
+                                "capacity": stats.get("capacity", 0),
+                            }
+                        round_layer_stats[layer_id]["expert_activations"] += stats["expert_activations"].float().cpu()
+                        round_layer_stats[layer_id]["overflow_counts"] += stats["overflow_counts"].float().cpu()
+                        round_layer_stats[layer_id]["capacity"] = stats.get("capacity", round_layer_stats[layer_id]["capacity"])
+                    progress_bar.update(1)
+                    progress_bar.set_postfix({
+                        "round": f"{c_T + 1}/{self.server_epochs}",
+                        "stage": "client",
+                        "client": id,
+                    })
 
-            # 每轮结束保存当前服务端模型，供下一轮客户端同步。
-            self.save_server_model()
-            self.evaluate_round_on_global_test(round_id=c_T + 1)
-            torch.cuda.empty_cache()
+                usage_list = [int(v) for v in round_expert_usage_summary.tolist()]
+                self.logger.info(f"--round_expert_usage_summary : {usage_list}\n")
+                self.last_client_expert_usages = round_client_expert_usages
+                client_usage_list = [
+                    [int(v) for v in stats["expert_activations"].tolist()]
+                    for stats in round_client_expert_usages
+                ]
+                layer_stats_log = {
+                    layer_id: {
+                        "expert_activations": [int(v) for v in stats["expert_activations"].tolist()],
+                        "overflow_counts": [int(v) for v in stats["overflow_counts"].tolist()],
+                        "capacity": int(stats["capacity"]),
+                    }
+                    for layer_id, stats in round_layer_stats.items()
+                }
+                self.logger.info(f"--client_expert_usage_summary : {client_usage_list}\n")
+                self.logger.info(f"--round_expert_stats_by_layer : {layer_stats_log}\n")
+                # 所有客户端本地训练完成后，服务端通过聚合器更新全局模型。
+                self.aggregation(
+                    client_states=round_client_states,
+                    client_sizes=round_client_sizes,
+                )
 
-        self.evaluate_final_on_global_test()
+                # 每轮结束保存当前服务端模型，供下一轮客户端同步。
+                self.save_server_model()
+                progress_bar.update(1)
+                progress_bar.set_postfix({
+                    "round": f"{c_T + 1}/{self.server_epochs}",
+                    "stage": "aggregation",
+                })
+
+                self.evaluate_round_on_global_test(round_id=c_T + 1)
+                progress_bar.update(1)
+                progress_bar.set_postfix({
+                    "round": f"{c_T + 1}/{self.server_epochs}",
+                    "stage": "round_eval",
+                })
+                torch.cuda.empty_cache()
+
+            self.evaluate_final_on_global_test()
+            progress_bar.update(1)
+            progress_bar.set_postfix({
+                "round": f"{self.server_epochs}/{self.server_epochs}",
+                "stage": "final_eval",
+            })
+        finally:
+            progress_bar.close()
 
     def evaluate_global_model(self, data_loader):
         """ 用给定的数据集(global_test)评估当前服务端模型。

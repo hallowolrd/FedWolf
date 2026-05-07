@@ -126,6 +126,13 @@ train:
   # 是否允许复用已有且非空的输出目录；false 可防止误覆盖
   allow_overwrite: false
 
+  # 是否显示一个总训练进度条；当前只显示总进度，不显示嵌套进度条
+  # 后台运行、重定向日志或输出混乱时，可以设为 false
+  show_progress: true
+
+  # 训练结束后是否在终端保留总进度条，便于查看总耗时和平均速度
+  progress_leave: true
+
   # 是否每轮保存每个客户端的本地模型 {client_id}.pth。
   # false: 默认，不保存客户端模型，server 直接使用 Client.train() 返回的 state_dict 聚合，减少磁盘 I/O。
   # true: 调试/兼容旧流程时保存客户端模型。
