@@ -30,13 +30,24 @@ def compute_imq_weight(residual, imq_c):
     return (1.0 + (residual * residual) / (imq_c * imq_c)) ** -0.5
 
 
-def wolf_scalar_update(mu, p, observation, score, sigma_e2, eps, imq_c):
+def wolf_scalar_update(
+    mu,
+    p,
+    observation,
+    score,
+    sigma_e2,
+    eps,
+    imq_c,
+    observation_reliability=None,
+):
     """One-dimensional WoLF-IMQ update for a scalar expert evidence state."""
 
     mu = _safe_float(mu)
     p = max(_safe_float(p, default=1.0), 1e-12)
     observation = _safe_float(observation)
-    r = compute_observation_noise(score, sigma_e2, eps)
+    noise_score = score if observation_reliability is None else observation_reliability
+    noise_score = max(_safe_float(noise_score), 0.0)
+    r = compute_observation_noise(noise_score, sigma_e2, eps)
     residual = observation - mu
     weight = compute_imq_weight(residual, imq_c)
 
@@ -52,4 +63,6 @@ def wolf_scalar_update(mu, p, observation, score, sigma_e2, eps, imq_c):
         "weight": weight,
         "kalman_gain": kalman_gain,
         "obs_precision": obs_precision,
+        "noise_score": noise_score,
+        "observation_reliability": noise_score,
     }

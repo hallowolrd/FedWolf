@@ -247,6 +247,133 @@ def _move_batch_to_device(inputs, labels, device, pin_memory=False):
     )
 
 
+def _zeros_for_experts(num_experts, dtype=torch.float64, device="cpu"):
+    return torch.zeros(num_experts, dtype=dtype, device=device)
+
+
+def _as_expert_vector(value, num_experts, device, dtype=torch.float64):
+    vector = _zeros_for_experts(num_experts=num_experts, dtype=dtype, device=device)
+    if value is None:
+        return vector
+
+    if torch.is_tensor(value):
+        flat_value = value.detach().to(device=device, dtype=dtype).flatten()
+    else:
+        try:
+            flat_value = torch.as_tensor(value, dtype=dtype, device=device).flatten()
+        except (TypeError, ValueError):
+            return vector
+
+    usable_size = min(num_experts, flat_value.numel())
+    if usable_size > 0:
+        vector[:usable_size] = flat_value[:usable_size]
+    return torch.nan_to_num(vector, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+
+
+def _get_result_layer_stats(result):
+    if not isinstance(result, dict):
+        return {}
+
+    layer_stats = result.get("expert_stats_by_layer")
+    if isinstance(layer_stats, dict):
+        return layer_stats
+
+    activations_by_layer = result.get("expert_activations_by_layer")
+    if isinstance(activations_by_layer, dict):
+        return {
+            layer_id: {"expert_activations": activations}
+            for layer_id, activations in activations_by_layer.items()
+        }
+
+    return {}
+
+
+def _accumulate_evidence_expert_stats(total_stats, result, num_experts, device):
+    """Accumulate expert token usage observed during the evidence forward pass."""
+
+    for layer_id, stats in _get_result_layer_stats(result).items():
+        layer_key = str(layer_id)
+        if not isinstance(stats, dict):
+            stats = {"expert_activations": stats}
+
+        if layer_key not in total_stats:
+            total_stats[layer_key] = {
+                "expert_activations": _zeros_for_experts(num_experts, device=device),
+                "selected_counts": _zeros_for_experts(num_experts, device=device),
+                "overflow_counts": _zeros_for_experts(num_experts, device=device),
+                "avg_router_probs_sum": _zeros_for_experts(num_experts, device=device),
+                "avg_router_probs_batches": 0,
+                "capacity": 0,
+            }
+
+        layer_total = total_stats[layer_key]
+        layer_total["expert_activations"] += _as_expert_vector(
+            stats.get("expert_activations"),
+            num_experts=num_experts,
+            device=device,
+        )
+        layer_total["selected_counts"] += _as_expert_vector(
+            stats.get("selected_counts"),
+            num_experts=num_experts,
+            device=device,
+        )
+        layer_total["overflow_counts"] += _as_expert_vector(
+            stats.get("overflow_counts"),
+            num_experts=num_experts,
+            device=device,
+        )
+
+        avg_router_probs = stats.get("avg_router_probs")
+        if avg_router_probs is not None:
+            layer_total["avg_router_probs_sum"] += _as_expert_vector(
+                avg_router_probs,
+                num_experts=num_experts,
+                device=device,
+            )
+            layer_total["avg_router_probs_batches"] += 1
+
+        capacity = stats.get("capacity", layer_total["capacity"])
+        if torch.is_tensor(capacity):
+            capacity = capacity.detach().cpu().item()
+        try:
+            layer_total["capacity"] = max(int(capacity), int(layer_total["capacity"]))
+        except (TypeError, ValueError):
+            pass
+
+
+def _finalize_evidence_expert_stats(total_stats):
+    stats_by_layer = {}
+    activations_by_layer = {}
+    selected_counts_by_layer = {}
+    overflow_counts_by_layer = {}
+
+    for layer_id, stats in total_stats.items():
+        avg_router_probs_batches = max(int(stats["avg_router_probs_batches"]), 1)
+        avg_router_probs = stats["avg_router_probs_sum"] / avg_router_probs_batches
+
+        expert_activations = [int(value) for value in stats["expert_activations"].detach().cpu().tolist()]
+        selected_counts = [int(value) for value in stats["selected_counts"].detach().cpu().tolist()]
+        overflow_counts = [int(value) for value in stats["overflow_counts"].detach().cpu().tolist()]
+
+        stats_by_layer[str(layer_id)] = {
+            "expert_activations": expert_activations,
+            "selected_counts": selected_counts,
+            "overflow_counts": overflow_counts,
+            "avg_router_probs": _scientific_list(avg_router_probs.detach().cpu().tolist()),
+            "capacity": int(stats["capacity"]),
+        }
+        activations_by_layer[str(layer_id)] = expert_activations
+        selected_counts_by_layer[str(layer_id)] = selected_counts
+        overflow_counts_by_layer[str(layer_id)] = overflow_counts
+
+    return (
+        stats_by_layer,
+        activations_by_layer,
+        selected_counts_by_layer,
+        overflow_counts_by_layer,
+    )
+
+
 def compute_expert_fisher_evidence(
     model,
     data_loader,
@@ -329,6 +456,10 @@ def compute_expert_fisher_evidence(
         "score_trace_per_sample_by_layer": {},
         "score_trace_per_active_sample_by_layer": {},
         "score_trace_raw_by_layer": {},
+        "evidence_expert_stats_by_layer": {},
+        "evidence_expert_activations_by_layer": {},
+        "evidence_selected_counts_by_layer": {},
+        "evidence_overflow_counts_by_layer": {},
     }
 
     if not expert_entries:
@@ -355,6 +486,7 @@ def compute_expert_fisher_evidence(
     total_samples = 0
     limit_reached = False
     stop_reason = None
+    evidence_expert_stats_by_layer = {}
 
     try:
         for inputs, labels in data_loader:
@@ -389,6 +521,12 @@ def compute_expert_fisher_evidence(
 
             model.zero_grad(set_to_none=True)
             result = model(inputs)
+            _accumulate_evidence_expert_stats(
+                total_stats=evidence_expert_stats_by_layer,
+                result=result,
+                num_experts=num_experts,
+                device=device,
+            )
             outputs = result["logits"] if isinstance(result, dict) else result
 
             per_sample_losses = _compute_per_sample_supervised_losses(criterion, outputs, labels)
@@ -453,6 +591,12 @@ def compute_expert_fisher_evidence(
     diagnostics["effective_num_batches"] = int(num_batches)
     diagnostics["limit_reached"] = bool(limit_reached)
     diagnostics["stop_reason"] = stop_reason
+    (
+        diagnostics["evidence_expert_stats_by_layer"],
+        diagnostics["evidence_expert_activations_by_layer"],
+        diagnostics["evidence_selected_counts_by_layer"],
+        diagnostics["evidence_overflow_counts_by_layer"],
+    ) = _finalize_evidence_expert_stats(evidence_expert_stats_by_layer)
 
     score_by_layer = {}
     log_score_by_layer = {}

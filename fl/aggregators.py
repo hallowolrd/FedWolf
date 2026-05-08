@@ -208,7 +208,8 @@ class ExpertFedAvgAggregator(Aggregator):
 class FedWoLFAggregator(Aggregator):
     # FedWoLF 聚合器：
     # - shared / router / classifier 等非 expert 参数仍按客户端样本数做 FedAvg；
-    # - expert 参数按客户端上传的 expert_fisher_score_by_layer 做 Fisher-score 加权平均。
+    # - fedwolf_fisher_only 的 expert 参数按 raw Fisher score 做旧版加权平均；
+    # - fedwolf 的 expert 参数按 sqrt(relative Fisher) 聚合，filter R 使用 evidence active tokens。
     # - agg_method=fedwolf 时额外吸收 Fisher log evidence 更新 WoLF-IMQ filter state。
     # - agg_method=fedwolf 时使用 learned/fixed gamma 在 old global expert 和 Theta_bar 之间插值。
     def __init__(self, args=None, use_wolf_filter=True, use_gamma=True):
@@ -228,6 +229,7 @@ class FedWoLFAggregator(Aggregator):
         self.num_experts = getattr(args, "num_experts", None)
         self.use_wolf_filter = use_wolf_filter
         self.use_gamma = use_gamma
+        self.use_relative_sqrt_fisher_aggregation = bool(use_wolf_filter and use_gamma)
         if self.use_wolf_filter and self.imq_c <= 0:
             raise ValueError("fedwolf_imq_c must be positive")
         if self.gamma_temperature <= 0:
@@ -298,10 +300,19 @@ class FedWoLFAggregator(Aggregator):
                 denominator = total_weight
             else:
                 layer_id, expert_id = expert_ref
-                weights = [
+                raw_scores = [
                     self._get_fisher_score(client_stat, layer_id, expert_id)
                     for client_stat in client_stats
                 ]
+                if self.use_relative_sqrt_fisher_aggregation:
+                    mean_s = self._mean_positive(raw_scores)
+                    weights = [
+                        self._sqrt_relative_weight(score, mean_s)
+                        for score in raw_scores
+                    ]
+                else:
+                    # fedwolf_fisher_only 保持旧消融语义：expert 直接按 raw Fisher score 聚合。
+                    weights = raw_scores
                 total_weight = sum(weights)
                 denominator = total_weight + self.eps
 
@@ -358,6 +369,11 @@ class FedWoLFAggregator(Aggregator):
 
         for layer_id, expert_id in expert_refs:
             self._ensure_filter_state_for_layer(layer_id, layer_sizes[layer_id])
+            active_tokens = [
+                self._get_evidence_active_tokens(client_stat, layer_id, expert_id)
+                for client_stat in client_stats
+            ]
+            mean_n_active = self._mean_positive(active_tokens)
             mu_current, p_current = predict_expert_state(
                 self.expert_filter_mu[layer_id][expert_id].item(),
                 self.expert_filter_P[layer_id][expert_id].item(),
@@ -370,6 +386,13 @@ class FedWoLFAggregator(Aggregator):
                     round_filter_stats[layer_id]["skipped_observations"][expert_id] += 1
                     continue
                 s = self._get_fisher_score(client_stat, layer_id, expert_id)
+                n_active = self._get_evidence_active_tokens(client_stat, layer_id, expert_id)
+                if n_active is None or mean_n_active <= 0.0:
+                    n_rel = 1.0
+                    n_reliability = 1.0
+                else:
+                    n_rel = max(float(n_active), 0.0) / (mean_n_active + self.eps)
+                    n_reliability = math.sqrt(max(n_rel, 0.0) + self.eps)
                 mu_current, p_current, update_info = wolf_scalar_update(
                     mu=mu_current,
                     p=p_current,
@@ -378,6 +401,7 @@ class FedWoLFAggregator(Aggregator):
                     sigma_e2=self.sigma_e2,
                     eps=self.eps,
                     imq_c=self.imq_c,
+                    observation_reliability=n_reliability,
                 )
                 self._add_filter_update_info(
                     stat_buffers=round_filter_stats[layer_id],
@@ -385,6 +409,9 @@ class FedWoLFAggregator(Aggregator):
                     update_info=update_info,
                     score=s,
                     observation=z,
+                    n_active=n_active,
+                    n_rel=n_rel,
+                    n_reliability=n_reliability,
                 )
 
             self.expert_filter_mu[layer_id][expert_id] = mu_current
@@ -425,15 +452,48 @@ class FedWoLFAggregator(Aggregator):
             "kalman_gain_sum": torch.zeros(num_experts, dtype=torch.float32),
             "max_kalman_gain": torch.zeros(num_experts, dtype=torch.float32),
             "skipped_observations": torch.zeros(num_experts, dtype=torch.float32),
+            "n_active_sum": torch.zeros(num_experts, dtype=torch.float32),
+            "max_n_active": torch.zeros(num_experts, dtype=torch.float32),
+            "n_rel_sum": torch.zeros(num_experts, dtype=torch.float32),
+            "max_n_rel": torch.zeros(num_experts, dtype=torch.float32),
+            "n_reliability_sum": torch.zeros(num_experts, dtype=torch.float32),
+            "min_n_reliability": torch.full((num_experts,), float("inf"), dtype=torch.float32),
+            "max_n_reliability": torch.zeros(num_experts, dtype=torch.float32),
+            "noise_score_sum": torch.zeros(num_experts, dtype=torch.float32),
         }
 
-    def _add_filter_update_info(self, stat_buffers, expert_id, update_info, score, observation):
-        score = max(float(score), 0.0)
-        observation = float(observation)
-        observation_noise = float(update_info["R"])
-        weight = float(update_info["weight"])
+    def _safe_nonnegative_float(self, value, default=0.0):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(value):
+            return default
+        return max(value, 0.0)
+
+    def _add_filter_update_info(
+        self,
+        stat_buffers,
+        expert_id,
+        update_info,
+        score,
+        observation,
+        n_active=None,
+        n_rel=None,
+        n_reliability=None,
+    ):
+        score = self._safe_nonnegative_float(score)
+        observation = self._safe_nonnegative_float(observation)
+        observation_noise = self._safe_nonnegative_float(update_info["R"])
+        weight = self._safe_nonnegative_float(update_info["weight"])
         residual = float(update_info["residual"])
-        kalman_gain = float(update_info["kalman_gain"])
+        if not math.isfinite(residual):
+            residual = 0.0
+        kalman_gain = self._safe_nonnegative_float(update_info["kalman_gain"])
+        n_active = self._safe_nonnegative_float(n_active)
+        n_rel = self._safe_nonnegative_float(n_rel, default=1.0)
+        n_reliability = self._safe_nonnegative_float(n_reliability, default=1.0)
+        noise_score = self._safe_nonnegative_float(update_info.get("noise_score", n_reliability))
 
         stat_buffers["count"][expert_id] += 1
         stat_buffers["score_sum"][expert_id] += score
@@ -449,9 +509,49 @@ class FedWoLFAggregator(Aggregator):
         stat_buffers["abs_residual_sum"][expert_id] += abs(residual)
         stat_buffers["kalman_gain_sum"][expert_id] += kalman_gain
         stat_buffers["max_kalman_gain"][expert_id] = max(float(stat_buffers["max_kalman_gain"][expert_id]), kalman_gain)
+        stat_buffers["n_active_sum"][expert_id] += n_active
+        stat_buffers["max_n_active"][expert_id] = max(float(stat_buffers["max_n_active"][expert_id]), n_active)
+        stat_buffers["n_rel_sum"][expert_id] += n_rel
+        stat_buffers["max_n_rel"][expert_id] = max(float(stat_buffers["max_n_rel"][expert_id]), n_rel)
+        stat_buffers["n_reliability_sum"][expert_id] += n_reliability
+        stat_buffers["min_n_reliability"][expert_id] = min(
+            float(stat_buffers["min_n_reliability"][expert_id]),
+            n_reliability,
+        )
+        stat_buffers["max_n_reliability"][expert_id] = max(
+            float(stat_buffers["max_n_reliability"][expert_id]),
+            n_reliability,
+        )
+        stat_buffers["noise_score_sum"][expert_id] += noise_score
 
     def _safe_mean(self, total, count):
         return torch.where(count > 0, total / count.clamp_min(1.0), torch.zeros_like(total))
+
+    def _mean_positive(self, values):
+        positives = []
+        for value in values:
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value) and value > 0.0:
+                positives.append(value)
+        if not positives:
+            return 0.0
+        return sum(positives) / len(positives)
+
+    def _sqrt_relative_weight(self, raw_score, positive_mean):
+        try:
+            raw_score = float(raw_score)
+            positive_mean = float(positive_mean)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(raw_score) or not math.isfinite(positive_mean):
+            return 0.0
+        if raw_score <= 0.0 or positive_mean <= 0.0:
+            return 0.0
+        relative_score = raw_score / (positive_mean + self.eps)
+        return math.sqrt(max(relative_score, 0.0) + self.eps)
 
     def _build_filter_summary(self, round_filter_stats):
         summary = {}
@@ -467,6 +567,10 @@ class FedWoLFAggregator(Aggregator):
             mean_weight = self._safe_mean(stats["weight_sum"], count)
             mean_abs_residual = self._safe_mean(stats["abs_residual_sum"], count)
             mean_kalman_gain = self._safe_mean(stats["kalman_gain_sum"], count)
+            mean_n_active = self._safe_mean(stats["n_active_sum"], count)
+            mean_n_rel = self._safe_mean(stats["n_rel_sum"], count)
+            mean_n_reliability = self._safe_mean(stats["n_reliability_sum"], count)
+            mean_noise_score = self._safe_mean(stats["noise_score_sum"], count)
             min_R = torch.where(
                 count > 0,
                 stats["min_R"],
@@ -477,12 +581,25 @@ class FedWoLFAggregator(Aggregator):
                 stats["min_weight"],
                 torch.zeros_like(stats["min_weight"]),
             )
+            min_n_reliability = torch.where(
+                count > 0,
+                stats["min_n_reliability"],
+                torch.zeros_like(stats["min_n_reliability"]),
+            )
             summary[layer_id] = {
                 "total_fisher_weight": format_scientific_list(stats["score_sum"].tolist()),
                 "mean_s": format_scientific_list(mean_s.tolist()),
                 "max_s": format_scientific_list(stats["max_score"].tolist()),
                 "mean_z": format_scientific_list(mean_z.tolist()),
                 "max_z": format_scientific_list(stats["max_observation"].tolist()),
+                "mean_n_active": format_scientific_list(mean_n_active.tolist()),
+                "max_n_active": format_scientific_list(stats["max_n_active"].tolist()),
+                "mean_n_rel": format_scientific_list(mean_n_rel.tolist()),
+                "max_n_rel": format_scientific_list(stats["max_n_rel"].tolist()),
+                "mean_n_reliability": format_scientific_list(mean_n_reliability.tolist()),
+                "min_n_reliability": format_scientific_list(min_n_reliability.tolist()),
+                "max_n_reliability": format_scientific_list(stats["max_n_reliability"].tolist()),
+                "mean_noise_score": format_scientific_list(mean_noise_score.tolist()),
                 "mean_R": format_scientific_list(mean_R.tolist()),
                 "min_R": format_scientific_list(min_R.tolist()),
                 "max_R": format_scientific_list(stats["max_R"].tolist()),
@@ -563,6 +680,35 @@ class FedWoLFAggregator(Aggregator):
             expert_id=expert_id,
         )
 
+    def _get_evidence_active_tokens(self, client_stats, layer_id, expert_id):
+        if not isinstance(client_stats, dict):
+            return None
+
+        value = self._get_layer_expert_value(
+            client_stats=client_stats,
+            field_name="evidence_expert_activations_by_layer",
+            layer_id=layer_id,
+            expert_id=expert_id,
+        )
+        if value is not None:
+            return max(value, 0.0)
+
+        stats_by_layer = client_stats.get("evidence_expert_stats_by_layer", {})
+        if not isinstance(stats_by_layer, dict):
+            return None
+
+        layer_stats = stats_by_layer.get(str(layer_id), {})
+        if not isinstance(layer_stats, dict):
+            return None
+
+        value = self._get_expert_value_from_sequence(
+            layer_stats.get("expert_activations"),
+            expert_id,
+        )
+        if value is None:
+            return None
+        return max(value, 0.0)
+
     def _get_layer_expert_value(self, client_stats, field_name, layer_id, expert_id):
         if not isinstance(client_stats, dict):
             return None
@@ -572,16 +718,23 @@ class FedWoLFAggregator(Aggregator):
         if layer_values is None:
             return None
 
-        if torch.is_tensor(layer_values):
-            flat_values = layer_values.detach().cpu().flatten()
+        return self._get_expert_value_from_sequence(layer_values, expert_id)
+
+    def _get_expert_value_from_sequence(self, values, expert_id):
+        if values is None:
+            return None
+        if torch.is_tensor(values):
+            flat_values = values.detach().cpu().flatten()
             if expert_id >= flat_values.numel():
                 return None
             value = flat_values[expert_id].item()
         else:
-            if expert_id >= len(layer_values):
+            try:
+                if expert_id >= len(values):
+                    return None
+                value = values[expert_id]
+            except (TypeError, KeyError, IndexError):
                 return None
-            value = layer_values[expert_id]
-
         value = float(value)
         if not math.isfinite(value):
             return None

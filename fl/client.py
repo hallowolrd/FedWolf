@@ -106,6 +106,10 @@ class Client:
             "score_trace_per_active_sample_by_layer",
             "score_trace_raw_by_layer",
             "param_count_by_layer",
+            "evidence_expert_stats_by_layer",
+            "evidence_expert_activations_by_layer",
+            "evidence_selected_counts_by_layer",
+            "evidence_overflow_counts_by_layer",
         ]
         return {
             key: diagnostics.get(key)
@@ -415,5 +419,21 @@ class Client:
             },
             "expert_fisher_score_by_layer": fisher_score_by_layer,
             "expert_fisher_log_score_by_layer": fisher_log_score_by_layer,
+            "evidence_expert_stats_by_layer": (
+                fisher_diagnostics.get("evidence_expert_stats_by_layer", {})
+                if fisher_diagnostics else {}
+            ),
+            "evidence_expert_activations_by_layer": (
+                fisher_diagnostics.get("evidence_expert_activations_by_layer", {})
+                if fisher_diagnostics else {}
+            ),
+            "evidence_selected_counts_by_layer": (
+                fisher_diagnostics.get("evidence_selected_counts_by_layer", {})
+                if fisher_diagnostics else {}
+            ),
+            "evidence_overflow_counts_by_layer": (
+                fisher_diagnostics.get("evidence_overflow_counts_by_layer", {})
+                if fisher_diagnostics else {}
+            ),
             "local_state_dict": local_state_dict,
         }
