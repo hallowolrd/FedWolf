@@ -261,6 +261,8 @@ class FedWoLFAggregator(Aggregator):
         self.last_aggregation_weight_summary = {}
 
     def aggregate(self, client_updates, client_weights, global_model=None, **kwargs):
+        self.last_aggregation_weight_summary = {}
+
         if len(client_updates) == 0:
             raise ValueError("FedWoLF requires at least one client update")
         if len(client_updates) != len(client_weights):
@@ -286,7 +288,6 @@ class FedWoLFAggregator(Aggregator):
         else:
             self.last_filter_summary = {}
         self.last_gamma_summary = {}
-        self.last_aggregation_weight_summary = {}
         recorded_expert_weight_refs = set()
 
         aggregated_state = collections.OrderedDict()

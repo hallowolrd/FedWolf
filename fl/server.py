@@ -333,8 +333,11 @@ class Server:
         """ 聚合器接口：按当前配置的聚合方法执行参数聚合
         - fedavg:对完整 state_dict 按客户端训练样本数加权平均；
         - expert_fedavg:普通层按客户端样本数聚合,专家层按每个 expert 实际处理样本数聚合；
-        - fedwolf_fisher_only:普通层按客户端样本数聚合,专家层按 Fisher score 聚合；
-        - fedwolf:在 Fisher score 聚合基础上加入 WoLF-IMQ 状态更新和 gamma 插值。 """
+        - fedwolf_fisher_only:普通层按客户端样本数聚合,专家层按 raw Fisher score 聚合；
+          不使用 WoLF filter/gamma,作为旧 Fisher-only baseline；
+        - fedwolf:expert 参数按 sqrt(relative Fisher) 聚合；filter observation 使用
+          log1p(raw Fisher)；filter observation noise 使用
+          sqrt(relative evidence active tokens)；然后进行 WoLF-IMQ 状态更新和 gamma 插值。 """
 
         if client_states is None:
             self.logger.info("--client_state_transport : disk\n")
