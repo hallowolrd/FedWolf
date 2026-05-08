@@ -258,6 +258,7 @@ class FedWoLFAggregator(Aggregator):
         self.expert_filter_P = {}
         self.last_filter_summary = {}
         self.last_gamma_summary = {}
+        self.last_aggregation_weight_summary = {}
 
     def aggregate(self, client_updates, client_weights, global_model=None, **kwargs):
         if len(client_updates) == 0:
@@ -285,6 +286,8 @@ class FedWoLFAggregator(Aggregator):
         else:
             self.last_filter_summary = {}
         self.last_gamma_summary = {}
+        self.last_aggregation_weight_summary = {}
+        recorded_expert_weight_refs = set()
 
         aggregated_state = collections.OrderedDict()
         for key in client_updates[0].keys():
@@ -315,6 +318,14 @@ class FedWoLFAggregator(Aggregator):
                     weights = raw_scores
                 total_weight = sum(weights)
                 denominator = total_weight + self.eps
+                weight_ref = (str(layer_id), int(expert_id))
+                if weight_ref not in recorded_expert_weight_refs:
+                    self._record_expert_aggregation_weight_summary(
+                        layer_id=layer_id,
+                        expert_id=expert_id,
+                        weights=weights,
+                    )
+                    recorded_expert_weight_refs.add(weight_ref)
 
             if total_weight <= 0:
                 # 该 expert 本轮没有有效 Fisher evidence 时，保留上一轮 global expert 参数。
@@ -343,6 +354,7 @@ class FedWoLFAggregator(Aggregator):
 
         if self.use_gamma:
             self._merge_gamma_summary()
+        self._merge_aggregation_weight_summary()
 
         return aggregated_state
 
@@ -653,6 +665,59 @@ class FedWoLFAggregator(Aggregator):
         while len(layer_summary["gamma"]) <= expert_id:
             layer_summary["gamma"].append("0.000000000000e+00")
         layer_summary["gamma"][expert_id] = f"{float(gamma):.12e}"
+
+    def _get_aggregation_weight_mode(self):
+        if self.use_relative_sqrt_fisher_aggregation:
+            return "sqrt_relative_fisher"
+        return "raw_fisher"
+
+    def _ensure_summary_slot(self, values, expert_id, default):
+        while len(values) <= expert_id:
+            values.append(default)
+
+    def _record_expert_aggregation_weight_summary(self, layer_id, expert_id, weights):
+        layer_id = str(layer_id)
+        clean_weights = []
+        for weight in weights:
+            try:
+                weight = float(weight)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(weight):
+                clean_weights.append(max(weight, 0.0))
+
+        total_weight = sum(clean_weights)
+        count = len(clean_weights)
+        mean_weight = total_weight / count if count > 0 else 0.0
+        min_weight = min(clean_weights) if clean_weights else 0.0
+        max_weight = max(clean_weights) if clean_weights else 0.0
+        positive_count = sum(1 for weight in clean_weights if weight > 0.0)
+
+        layer_summary = self.last_aggregation_weight_summary.setdefault(
+            layer_id,
+            {
+                "aggregation_weight_mode": self._get_aggregation_weight_mode(),
+                "total_s_agg_weight": [],
+                "mean_s_agg": [],
+                "min_s_agg": [],
+                "max_s_agg": [],
+                "positive_s_agg_clients": [],
+            },
+        )
+        layer_summary["aggregation_weight_mode"] = self._get_aggregation_weight_mode()
+        for key in ["total_s_agg_weight", "mean_s_agg", "min_s_agg", "max_s_agg"]:
+            self._ensure_summary_slot(layer_summary[key], expert_id, "0.000000000000e+00")
+        self._ensure_summary_slot(layer_summary["positive_s_agg_clients"], expert_id, 0)
+
+        layer_summary["total_s_agg_weight"][expert_id] = f"{total_weight:.12e}"
+        layer_summary["mean_s_agg"][expert_id] = f"{mean_weight:.12e}"
+        layer_summary["min_s_agg"][expert_id] = f"{min_weight:.12e}"
+        layer_summary["max_s_agg"][expert_id] = f"{max_weight:.12e}"
+        layer_summary["positive_s_agg_clients"][expert_id] = int(positive_count)
+
+    def _merge_aggregation_weight_summary(self):
+        for layer_id, aggregation_summary in self.last_aggregation_weight_summary.items():
+            self.last_filter_summary.setdefault(layer_id, {}).update(aggregation_summary)
 
     def _merge_gamma_summary(self):
         for layer_id, gamma_summary in self.last_gamma_summary.items():

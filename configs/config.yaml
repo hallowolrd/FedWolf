@@ -230,7 +230,10 @@ train:
   # fixed gamma 消融值：
   # - 仅当 fedwolf_gamma_mode: fixed 时生效
   # - 取值范围 [0, 1]
-  # - 0.7: 更强 Fisher 插值
-  # - 0.9: 接近 Fisher-only
-  # - 1.0: 应该近似退化为 fedwolf_fisher_only，用于验证实现
+  # - 0.0: 完全保留上一轮 global expert，不采用当前轮 theta_bar
+  # - 0.7/0.9: 控制当前轮 theta_bar 的插值强度，用于消融 gamma 更新幅度
+  # - 1.0: 完全采用当前 fedwolf 的 theta_bar；
+  #        在完整 fedwolf 中，该 theta_bar 来自 sqrt(relative Fisher) expert 聚合。
+  #        注意：这不等价于 fedwolf_fisher_only，因为 fedwolf_fisher_only 使用 raw Fisher 聚合，
+  #        且不使用 WoLF filter/gamma。
   fedwolf_fixed_gamma: null
