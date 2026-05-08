@@ -369,6 +369,11 @@ class FedWoLFAggregator(Aggregator):
 
         for layer_id, expert_id in expert_refs:
             self._ensure_filter_state_for_layer(layer_id, layer_sizes[layer_id])
+            raw_scores = [
+                self._get_fisher_score(client_stat, layer_id, expert_id)
+                for client_stat in client_stats
+            ]
+            mean_s = self._mean_positive(raw_scores)
             active_tokens = [
                 self._get_evidence_active_tokens(client_stat, layer_id, expert_id)
                 for client_stat in client_stats
@@ -380,12 +385,12 @@ class FedWoLFAggregator(Aggregator):
                 self.process_noise_q,
             )
 
-            for client_stat in client_stats:
+            for client_stat, s in zip(client_stats, raw_scores):
                 z = self._get_fisher_log_score(client_stat, layer_id, expert_id)
                 if z is None:
                     round_filter_stats[layer_id]["skipped_observations"][expert_id] += 1
                     continue
-                s = self._get_fisher_score(client_stat, layer_id, expert_id)
+                s_agg = self._sqrt_relative_weight(s, mean_s)
                 n_active = self._get_evidence_active_tokens(client_stat, layer_id, expert_id)
                 if n_active is None or mean_n_active <= 0.0:
                     n_rel = 1.0
@@ -412,6 +417,7 @@ class FedWoLFAggregator(Aggregator):
                     n_active=n_active,
                     n_rel=n_rel,
                     n_reliability=n_reliability,
+                    s_agg=s_agg,
                 )
 
             self.expert_filter_mu[layer_id][expert_id] = mu_current
@@ -460,6 +466,8 @@ class FedWoLFAggregator(Aggregator):
             "min_n_reliability": torch.full((num_experts,), float("inf"), dtype=torch.float32),
             "max_n_reliability": torch.zeros(num_experts, dtype=torch.float32),
             "noise_score_sum": torch.zeros(num_experts, dtype=torch.float32),
+            "s_agg_sum": torch.zeros(num_experts, dtype=torch.float32),
+            "max_s_agg": torch.zeros(num_experts, dtype=torch.float32),
         }
 
     def _safe_nonnegative_float(self, value, default=0.0):
@@ -481,6 +489,7 @@ class FedWoLFAggregator(Aggregator):
         n_active=None,
         n_rel=None,
         n_reliability=None,
+        s_agg=None,
     ):
         score = self._safe_nonnegative_float(score)
         observation = self._safe_nonnegative_float(observation)
@@ -494,6 +503,7 @@ class FedWoLFAggregator(Aggregator):
         n_rel = self._safe_nonnegative_float(n_rel, default=1.0)
         n_reliability = self._safe_nonnegative_float(n_reliability, default=1.0)
         noise_score = self._safe_nonnegative_float(update_info.get("noise_score", n_reliability))
+        s_agg = self._safe_nonnegative_float(s_agg)
 
         stat_buffers["count"][expert_id] += 1
         stat_buffers["score_sum"][expert_id] += score
@@ -523,6 +533,8 @@ class FedWoLFAggregator(Aggregator):
             n_reliability,
         )
         stat_buffers["noise_score_sum"][expert_id] += noise_score
+        stat_buffers["s_agg_sum"][expert_id] += s_agg
+        stat_buffers["max_s_agg"][expert_id] = max(float(stat_buffers["max_s_agg"][expert_id]), s_agg)
 
     def _safe_mean(self, total, count):
         return torch.where(count > 0, total / count.clamp_min(1.0), torch.zeros_like(total))
@@ -571,6 +583,7 @@ class FedWoLFAggregator(Aggregator):
             mean_n_rel = self._safe_mean(stats["n_rel_sum"], count)
             mean_n_reliability = self._safe_mean(stats["n_reliability_sum"], count)
             mean_noise_score = self._safe_mean(stats["noise_score_sum"], count)
+            mean_s_agg = self._safe_mean(stats["s_agg_sum"], count)
             min_R = torch.where(
                 count > 0,
                 stats["min_R"],
@@ -590,6 +603,9 @@ class FedWoLFAggregator(Aggregator):
                 "total_fisher_weight": format_scientific_list(stats["score_sum"].tolist()),
                 "mean_s": format_scientific_list(mean_s.tolist()),
                 "max_s": format_scientific_list(stats["max_score"].tolist()),
+                "mean_s_agg": format_scientific_list(mean_s_agg.tolist()),
+                "max_s_agg": format_scientific_list(stats["max_s_agg"].tolist()),
+                "total_s_agg_weight": format_scientific_list(stats["s_agg_sum"].tolist()),
                 "mean_z": format_scientific_list(mean_z.tolist()),
                 "max_z": format_scientific_list(stats["max_observation"].tolist()),
                 "mean_n_active": format_scientific_list(mean_n_active.tolist()),
