@@ -60,7 +60,16 @@ def init_result_csv(args):
     csv_path = get_csv_path(args)
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
     with open(csv_path, 'w', newline='') as csvfile:
-        fieldnames = ['T', 'client_epoch', 'client_id',"train_loss","train_acc","router_aux_loss","router_z_loss"]
+        fieldnames = [
+            'T',
+            'client_epoch',
+            'client_id',
+            'learning_rate',
+            "train_loss",
+            "train_acc",
+            "router_aux_loss",
+            "router_z_loss",
+        ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
 
@@ -88,7 +97,16 @@ def record_result(record_dic:dict, args):
 
     csv_path = get_csv_path(args)
     with open(csv_path, 'a', newline='') as csvfile:
-        fieldnames = ['T', 'client_epoch', 'client_id', "train_loss", "train_acc", "router_aux_loss", "router_z_loss"]
+        fieldnames = [
+            'T',
+            'client_epoch',
+            'client_id',
+            'learning_rate',
+            "train_loss",
+            "train_acc",
+            "router_aux_loss",
+            "router_z_loss",
+        ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writerow(record_dic)
 

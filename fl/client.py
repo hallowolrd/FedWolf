@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.optim as optim
 from types import SimpleNamespace
@@ -49,7 +51,8 @@ class Client:
         self.client_epochs = self.args.client_epochs
         # 分类任务常用交叉熵损失。
         self.criterion = nn.CrossEntropyLoss()
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+        self.current_lr = self.get_current_learning_rate()
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.current_lr)
 
         self.batch_size = self.args.batch_size
         self.partition_meta = partition_meta
@@ -61,6 +64,42 @@ class Client:
         self.logger = logger
         self.router_aux_loss_coef = self.args.router_aux_loss_coef
         self.router_z_loss_coef = self.args.router_z_loss_coef
+
+    def get_current_learning_rate(self) -> float:
+        """Return learning rate for the current global communication round.
+
+        This schedule is based on server round c_T, not local epoch or batch.
+        Client objects and Adam optimizers are recreated every server round,
+        so using a PyTorch local scheduler here would restart every round.
+        """
+
+        schedule = str(getattr(self.args, "lr_schedule", "constant")).strip().lower()
+        base_lr = float(self.args.learning_rate)
+
+        if schedule in {"constant", "none"}:
+            return base_lr
+
+        if schedule == "cosine":
+            min_lr = float(getattr(self.args, "min_learning_rate", 0.0))
+            if min_lr < 0.0:
+                raise ValueError("min_learning_rate must be non-negative.")
+            if min_lr > base_lr:
+                raise ValueError(
+                    "min_learning_rate must be <= learning_rate for cosine schedule."
+                )
+
+            total_rounds = int(getattr(self.args, "server_epochs", 1))
+            denominator = max(total_rounds - 1, 1)
+            progress = float(self.c_T) / float(denominator)
+            progress = min(max(progress, 0.0), 1.0)
+
+            cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_lr + (base_lr - min_lr) * cosine_factor
+
+        raise ValueError(
+            f"Unsupported lr_schedule: {schedule!r}. "
+            "Expected 'constant', 'none', or 'cosine'."
+        )
 
     def should_compute_fisher_evidence(self):
         return getattr(self.args, "agg_method", None) in FISHER_EVIDENCE_AGG_METHODS
@@ -308,6 +347,7 @@ class Client:
             self.logger.info(
                 f"--client: {self.client_id} --epoch:{epoch+1}/{self.client_epochs} "
                 f"--train_loss :{train_loss:.4f} --train_acc :{train_acc:.4f} "
+                f"--lr : {self.current_lr:.6e} "
                 f"--router_aux_loss : {avg_aux_loss:.4f} "
                 f"--router_z_loss : {avg_z_loss:.4f} "
                 f"--expert_usage : {usage_list} --avg_router_probs : {router_prob_list}"
@@ -325,8 +365,9 @@ class Client:
 
             record_dic = {
                 'T': self.c_T,
-                'client_epoch': epoch+1,
+                'client_epoch': epoch + 1,
                 'client_id': self.client_id,
+                "learning_rate": self.current_lr,
                 "train_loss": train_loss,
                 "train_acc": train_acc,
                 "router_aux_loss": avg_aux_loss,
