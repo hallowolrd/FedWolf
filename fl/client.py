@@ -105,8 +105,22 @@ class Client:
         return getattr(self.args, "agg_method", None) in FISHER_EVIDENCE_AGG_METHODS
 
     def get_fisher_data_loader(self):
-        evidence_loader_mode = getattr(self.args, "fedwolf_evidence_loader_mode", "deterministic")
+        if not self.should_compute_fisher_evidence():
+            raise RuntimeError(
+                "get_fisher_data_loader() was called although current agg_method "
+                f"does not require Fisher evidence: {getattr(self.args, 'agg_method', None)!r}"
+            )
+
+        evidence_loader_mode = str(
+            getattr(self.args, "fedwolf_evidence_loader_mode", "deterministic")
+        ).strip().lower()
         if evidence_loader_mode == "deterministic":
+            if self.evidence_loader is None:
+                self.evidence_loader = build_client_evidence_loader(
+                    args=self.args,
+                    client_id=self.client_id,
+                    meta=self.partition_meta,
+                )
             return self.evidence_loader
         if evidence_loader_mode == "train_loader":
             return self.train_loader
@@ -167,20 +181,40 @@ class Client:
         }
 
     def get_dataloader(self):
-        """ 构造当前客户端自己的训练 DataLoader。
-        注意：
-        客户端只拥有自己的训练数据；
-        验证集和测试集由服务端统一评估。 """
+        """构造当前客户端自己的训练 DataLoader。
+
+        train_loader 对所有聚合方法都需要；
+        evidence_loader 只在 FedWoLF Fisher evidence 需要 deterministic loader 时构造。
+        """
     
         self.train_loader = build_client_train_loader(
             args=self.args,
             client_id=self.client_id,
             meta=self.partition_meta,
         )
-        self.evidence_loader = build_client_evidence_loader(
-            args=self.args,
-            client_id=self.client_id,
-            meta=self.partition_meta,
+        self.evidence_loader = None
+
+        if not self.should_compute_fisher_evidence():
+            return
+
+        evidence_loader_mode = str(
+            getattr(self.args, "fedwolf_evidence_loader_mode", "deterministic")
+        ).strip().lower()
+
+        if evidence_loader_mode == "deterministic":
+            self.evidence_loader = build_client_evidence_loader(
+                args=self.args,
+                client_id=self.client_id,
+                meta=self.partition_meta,
+            )
+            return
+
+        if evidence_loader_mode == "train_loader":
+            return
+
+        raise ValueError(
+            "fedwolf_evidence_loader_mode must be either 'deterministic' or "
+            f"'train_loader', got {evidence_loader_mode!r}."
         )
 
 
