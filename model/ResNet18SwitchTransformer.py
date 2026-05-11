@@ -1,13 +1,188 @@
+import math
+
 import torch
+import torch.nn.functional as F
 from torch import nn
 
-from model.ResNet20SwitchTransformer import (
-    DenseFFN,
-    ResNetBasicBlock,
-    SwitchFFNExpert,
-    TokenSwitchFFN,
-    make_group_norm,
-)
+
+def make_group_norm(num_channels, max_groups=8):
+    for num_groups in range(min(max_groups, num_channels), 0, -1):
+        if num_channels % num_groups == 0:
+            return nn.GroupNorm(num_groups=num_groups, num_channels=num_channels)
+    return nn.GroupNorm(num_groups=1, num_channels=num_channels)
+
+
+class ResNetBasicBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(ResNetBasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            bias=False,
+        )
+        self.norm1 = make_group_norm(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+        )
+        self.norm2 = make_group_norm(out_channels)
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=1,
+                    stride=stride,
+                    bias=False,
+                ),
+                make_group_norm(out_channels),
+            )
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x):
+        out = self.relu(self.norm1(self.conv1(x)))
+        out = self.norm2(self.conv2(out))
+        out = out + self.shortcut(x)
+        return self.relu(out)
+
+
+class DenseFFN(nn.Module):
+    def __init__(self, embed_dim, mlp_ratio=4.0, dropout_rate=0.1):
+        super(DenseFFN, self).__init__()
+        hidden_dim = int(embed_dim * mlp_ratio)
+        self.net = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, embed_dim),
+            nn.Dropout(dropout_rate),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class SwitchFFNExpert(nn.Module):
+    def __init__(self, embed_dim, hidden_dim, dropout_rate=0.1):
+        super(SwitchFFNExpert, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, embed_dim),
+            nn.Dropout(dropout_rate),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class TokenSwitchFFN(nn.Module):
+    def __init__(
+        self,
+        embed_dim,
+        num_experts,
+        mlp_ratio=4.0,
+        dropout_rate=0.1,
+        router_jitter_noise=0.0,
+        capacity_factor=1.25,
+        min_capacity=4,
+        drop_tokens=True,
+        top_k=1,
+    ):
+        super(TokenSwitchFFN, self).__init__()
+        if top_k != 1:
+            raise ValueError("TokenSwitchFFN currently supports top_k=1 only")
+
+        self.embed_dim = embed_dim
+        self.num_experts = num_experts
+        self.router_jitter_noise = router_jitter_noise
+        self.capacity_factor = capacity_factor
+        self.min_capacity = min_capacity
+        self.drop_tokens = drop_tokens
+
+        hidden_dim = int(embed_dim * mlp_ratio)
+        self.router = nn.Linear(embed_dim, num_experts)
+        self.experts = nn.ModuleList([
+            SwitchFFNExpert(embed_dim, hidden_dim, dropout_rate)
+            for _ in range(num_experts)
+        ])
+
+    def forward(self, x):
+        batch_size, num_tokens, embed_dim = x.shape
+        router_input = x
+        if self.training and self.router_jitter_noise > 0:
+            noise = torch.empty_like(router_input).uniform_(
+                1.0 - self.router_jitter_noise,
+                1.0 + self.router_jitter_noise,
+            )
+            router_input = router_input * noise
+
+        router_logits = self.router(router_input)
+        router_probs = F.softmax(router_logits.float(), dim=-1).to(x.dtype)
+        top1_probs, top1_indices = torch.max(router_probs, dim=-1)
+
+        flat_x = x.reshape(batch_size * num_tokens, embed_dim)
+        flat_output = torch.zeros_like(flat_x)
+        flat_indices = top1_indices.reshape(-1)
+        flat_top1_probs = top1_probs.reshape(-1)
+
+        total_tokens = max(batch_size * num_tokens, 1)
+        capacity = max(
+            self.min_capacity,
+            math.ceil(self.capacity_factor * total_tokens / self.num_experts),
+        )
+        selected_counts = torch.bincount(
+            flat_indices,
+            minlength=self.num_experts,
+        ).to(x.device)
+        expert_activations = torch.zeros(self.num_experts, device=x.device, dtype=torch.long)
+        overflow_counts = torch.zeros(self.num_experts, device=x.device, dtype=torch.long)
+
+        for expert_id, expert in enumerate(self.experts):
+            token_positions = torch.nonzero(flat_indices == expert_id, as_tuple=False).flatten()
+            if token_positions.numel() == 0:
+                continue
+
+            overflow_count = max(token_positions.numel() - capacity, 0)
+            overflow_counts[expert_id] = overflow_count
+            if self.drop_tokens:
+                accepted_positions = token_positions[:capacity]
+            else:
+                accepted_positions = token_positions
+
+            expert_activations[expert_id] = accepted_positions.numel()
+            if accepted_positions.numel() > 0:
+                expert_output = expert(flat_x[accepted_positions])
+                flat_output[accepted_positions] = (
+                    expert_output * flat_top1_probs[accepted_positions].unsqueeze(-1)
+                )
+
+        output = flat_output.reshape(batch_size, num_tokens, embed_dim)
+        usage_fraction = selected_counts.float() / float(total_tokens)
+        avg_router_probs = router_probs.float().mean(dim=(0, 1))
+        router_aux_loss = self.num_experts * torch.sum(usage_fraction.detach() * avg_router_probs)
+        router_z_loss = torch.mean(torch.logsumexp(router_logits.float(), dim=-1) ** 2)
+
+        return {
+            "hidden": output,
+            "router_aux_loss": router_aux_loss,
+            "router_z_loss": router_z_loss,
+            "expert_activations": expert_activations,
+            "selected_counts": selected_counts,
+            "overflow_counts": overflow_counts,
+            "capacity": capacity,
+            "avg_router_probs": avg_router_probs,
+        }
 
 
 class ResNet18Backbone(nn.Module):
