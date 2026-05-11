@@ -1,6 +1,7 @@
 """Model package."""
 
 from model.HybridSwitchTransformer import HybridSwitchTransformer
+from model.ResNet18SwitchTransformer import ResNet18SwitchTransformer
 from model.ResNet20SwitchTransformer import ResNet20SwitchTransformer
 from model.ResNet32SwitchTransformer import ResNet32SwitchTransformer
 from model.SwitchTransformer import SwitchTransformer
@@ -57,6 +58,8 @@ def build_model_from_args(args):
 
     if args.model_type == "hybrid_switch_transformer":
         return HybridSwitchTransformer(**common_kwargs)
+    if args.model_type in {"resnet18_switch_transformer", "resnet18switchtransformer"}:
+        return ResNet18SwitchTransformer(**common_kwargs)
     if args.model_type == "resnet20_switch_transformer":
         return ResNet20SwitchTransformer(**common_kwargs)
     if args.model_type == "resnet32_switch_transformer":

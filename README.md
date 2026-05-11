@@ -204,6 +204,7 @@ FedWoLF 参数放在 `config.yaml` 的 `train` section：
 - 切模型：修改当前 `config.yaml` 的 `model.model_type`
   - `hybrid_switch_transformer`：CNN stem + Transformer
   - `switch_transformer`：patch embedding + Transformer
+  - `resnet18_switch_transformer`：ResNet-18 style backbone + Switch Transformer
   - `resnet20_switch_transformer`：ResNet-20 style backbone + Switch Transformer
   - `resnet32_switch_transformer`：ResNet-32 style backbone + Switch Transformer
   - `switch_transformer` 现在支持显式 `patch_size`；该字段只对标准 Switch 生效

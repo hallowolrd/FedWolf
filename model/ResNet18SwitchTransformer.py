@@ -1,0 +1,318 @@
+import torch
+from torch import nn
+
+from model.ResNet20SwitchTransformer import (
+    DenseFFN,
+    ResNetBasicBlock,
+    SwitchFFNExpert,
+    TokenSwitchFFN,
+    make_group_norm,
+)
+
+
+class ResNet18Backbone(nn.Module):
+    """CIFAR ResNet-18 feature extractor without a classification head."""
+
+    def __init__(self):
+        super(ResNet18Backbone, self).__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False),
+            make_group_norm(64),
+            nn.ReLU(inplace=True),
+        )
+        self.stage1 = self._make_stage(64, 64, num_blocks=2, stride=1)
+        self.stage2 = self._make_stage(64, 128, num_blocks=2, stride=2)
+        self.stage3 = self._make_stage(128, 256, num_blocks=2, stride=2)
+        # 保持 32x32 CIFAR 输入在 8x8 左右的特征图尺度，便于与 token_grid_size=8 对齐。
+        self.stage4 = self._make_stage(256, 512, num_blocks=2, stride=1)
+        self.out_channels = 512
+
+    def _make_stage(self, in_channels, out_channels, num_blocks, stride):
+        blocks = [ResNetBasicBlock(in_channels, out_channels, stride=stride)]
+        for _ in range(1, num_blocks):
+            blocks.append(ResNetBasicBlock(out_channels, out_channels, stride=1))
+        return nn.Sequential(*blocks)
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
+        return x
+
+
+class ResNet18TransformerBlock(nn.Module):
+    def __init__(
+        self,
+        embed_dim,
+        num_heads,
+        mlp_ratio=4.0,
+        dropout_rate=0.1,
+        use_switch_ffn=False,
+        num_experts=8,
+        router_jitter_noise=0.0,
+        capacity_factor=1.25,
+        min_capacity=4,
+        drop_tokens=True,
+        top_k=1,
+        layer_id=0,
+    ):
+        super(ResNet18TransformerBlock, self).__init__()
+        self.layer_id = layer_id
+        self.use_switch_ffn = use_switch_ffn
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=dropout_rate,
+            batch_first=True,
+        )
+        self.dropout = nn.Dropout(dropout_rate)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        if use_switch_ffn:
+            self.ffn = TokenSwitchFFN(
+                embed_dim=embed_dim,
+                num_experts=num_experts,
+                mlp_ratio=mlp_ratio,
+                dropout_rate=dropout_rate,
+                router_jitter_noise=router_jitter_noise,
+                capacity_factor=capacity_factor,
+                min_capacity=min_capacity,
+                drop_tokens=drop_tokens,
+                top_k=top_k,
+            )
+        else:
+            self.ffn = DenseFFN(
+                embed_dim=embed_dim,
+                mlp_ratio=mlp_ratio,
+                dropout_rate=dropout_rate,
+            )
+
+    def forward(self, x):
+        norm_x = self.norm1(x)
+        attention_out, _ = self.attention(norm_x, norm_x, norm_x, need_weights=False)
+        x = x + self.dropout(attention_out)
+
+        ffn_input = self.norm2(x)
+        if self.use_switch_ffn:
+            switch_result = self.ffn(ffn_input)
+            x = x + self.dropout(switch_result["hidden"])
+            return x, {
+                "layer_id": self.layer_id,
+                "router_aux_loss": switch_result["router_aux_loss"],
+                "router_z_loss": switch_result["router_z_loss"],
+                "expert_activations": switch_result["expert_activations"],
+                "selected_counts": switch_result["selected_counts"],
+                "overflow_counts": switch_result["overflow_counts"],
+                "capacity": switch_result["capacity"],
+                "avg_router_probs": switch_result["avg_router_probs"],
+            }
+
+        x = x + self.dropout(self.ffn(ffn_input))
+        return x, None
+
+
+class ResNet18SwitchTransformer(nn.Module):
+    """ResNet-18 feature extractor followed by Switch Transformer blocks."""
+
+    def __init__(
+        self,
+        num_classes=100,
+        embed_dim=128,
+        depth=4,
+        num_heads=4,
+        mlp_ratio=4.0,
+        num_experts=8,
+        moe_layers=None,
+        dropout_rate=0.1,
+        router_jitter_noise=0.0,
+        capacity_factor=1.25,
+        min_capacity=4,
+        drop_tokens=True,
+        top_k=1,
+        stem_channels=None,
+        token_grid_size=8,
+        use_cls_token=False,
+        router_aux_loss_coef=0.01,
+        router_z_loss_coef=0.001,
+    ):
+        super(ResNet18SwitchTransformer, self).__init__()
+        if embed_dim % num_heads != 0:
+            raise ValueError("embed_dim must be divisible by num_heads")
+
+        _ = stem_channels  # 保留该参数只是为了兼容 builder 接口。
+        self.num_experts = num_experts
+        self.embed_dim = embed_dim
+        self.depth = depth
+        self.moe_layers = set(moe_layers or [])
+        self.token_grid_size = token_grid_size
+        self.use_cls_token = use_cls_token
+        self.router_aux_loss_coef = router_aux_loss_coef
+        self.router_z_loss_coef = router_z_loss_coef
+
+        self.backbone = ResNet18Backbone()
+        self.token_pool = nn.AdaptiveAvgPool2d((token_grid_size, token_grid_size))
+        self.token_projection = nn.Conv2d(self.backbone.out_channels, embed_dim, kernel_size=1)
+        num_position_tokens = token_grid_size * token_grid_size + (1 if use_cls_token else 0)
+        self.position_embedding = nn.Parameter(torch.zeros(1, num_position_tokens, embed_dim))
+        if use_cls_token:
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        else:
+            self.cls_token = None
+        self.position_dropout = nn.Dropout(dropout_rate)
+
+        self.blocks = nn.ModuleList([
+            ResNet18TransformerBlock(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                dropout_rate=dropout_rate,
+                use_switch_ffn=layer_id in self.moe_layers,
+                num_experts=num_experts,
+                router_jitter_noise=router_jitter_noise,
+                capacity_factor=capacity_factor,
+                min_capacity=min_capacity,
+                drop_tokens=drop_tokens,
+                top_k=top_k,
+                layer_id=layer_id,
+            )
+            for layer_id in range(depth)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
+        self.classifier = nn.Linear(embed_dim, num_classes)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.trunc_normal_(self.position_embedding, std=0.02)
+        if self.cls_token is not None:
+            nn.init.trunc_normal_(self.cls_token, std=0.02)
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(module, nn.Linear):
+                nn.init.trunc_normal_(module.weight, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def get_expert_state_dict_by_layer(self):
+        expert_states = {}
+        for layer_id, block in enumerate(self.blocks):
+            if not block.use_switch_ffn:
+                continue
+            expert_states[str(layer_id)] = {
+                str(expert_id): expert.state_dict()
+                for expert_id, expert in enumerate(block.ffn.experts)
+            }
+        return expert_states
+
+    def get_router_state_dict_by_layer(self):
+        router_states = {}
+        for layer_id, block in enumerate(self.blocks):
+            if block.use_switch_ffn:
+                router_states[str(layer_id)] = block.ffn.router.state_dict()
+        return router_states
+
+    def get_moe_parameter_groups(self):
+        parameter_groups = []
+        for layer_id, block in enumerate(self.blocks):
+            if not block.use_switch_ffn:
+                continue
+            parameter_groups.append({
+                "type": "router",
+                "layer_id": str(layer_id),
+                "params": block.ffn.router.parameters(),
+            })
+            for expert_id, expert in enumerate(block.ffn.experts):
+                parameter_groups.append({
+                    "type": "expert",
+                    "layer_id": str(layer_id),
+                    "expert_id": str(expert_id),
+                    "params": expert.parameters(),
+                })
+        return parameter_groups
+
+    def forward(self, x):
+        feature_map = self.backbone(x)
+        feature_map = self.token_pool(feature_map)
+        tokens = self.token_projection(feature_map)
+        tokens = tokens.flatten(2).transpose(1, 2)
+        if self.cls_token is not None:
+            cls_tokens = self.cls_token.expand(tokens.size(0), -1, -1)
+            tokens = torch.cat([cls_tokens, tokens], dim=1)
+        tokens = self.position_dropout(tokens + self.position_embedding)
+
+        router_aux_loss = tokens.new_tensor(0.0)
+        router_z_loss = tokens.new_tensor(0.0)
+        expert_activations = torch.zeros(self.num_experts, device=tokens.device)
+        selected_counts = torch.zeros(self.num_experts, device=tokens.device)
+        overflow_counts = torch.zeros(self.num_experts, device=tokens.device)
+        avg_router_probs = torch.zeros(self.num_experts, device=tokens.device)
+        expert_stats_by_layer = {}
+        expert_activations_by_layer = {}
+        selected_counts_by_layer = {}
+        overflow_counts_by_layer = {}
+        avg_router_probs_by_layer = {}
+        capacity_by_layer = {}
+        switch_layer_count = 0
+
+        for block in self.blocks:
+            tokens, switch_stats = block(tokens)
+            if switch_stats is None:
+                continue
+
+            layer_key = str(switch_stats["layer_id"])
+            router_aux_loss = router_aux_loss + switch_stats["router_aux_loss"]
+            router_z_loss = router_z_loss + switch_stats["router_z_loss"]
+            expert_activations = expert_activations + switch_stats["expert_activations"]
+            selected_counts = selected_counts + switch_stats["selected_counts"]
+            overflow_counts = overflow_counts + switch_stats["overflow_counts"]
+            avg_router_probs = avg_router_probs + switch_stats["avg_router_probs"]
+            layer_stats = {
+                "expert_activations": switch_stats["expert_activations"],
+                "selected_counts": switch_stats["selected_counts"],
+                "overflow_counts": switch_stats["overflow_counts"],
+                "capacity": switch_stats["capacity"],
+                "avg_router_probs": switch_stats["avg_router_probs"],
+            }
+            expert_stats_by_layer[layer_key] = layer_stats
+            expert_activations_by_layer[layer_key] = layer_stats["expert_activations"]
+            selected_counts_by_layer[layer_key] = layer_stats["selected_counts"]
+            overflow_counts_by_layer[layer_key] = layer_stats["overflow_counts"]
+            avg_router_probs_by_layer[layer_key] = layer_stats["avg_router_probs"]
+            capacity_by_layer[layer_key] = layer_stats["capacity"]
+            switch_layer_count += 1
+
+        if switch_layer_count > 0:
+            router_aux_loss = router_aux_loss / switch_layer_count
+            router_z_loss = router_z_loss / switch_layer_count
+            avg_router_probs = avg_router_probs / switch_layer_count
+
+        total_router_loss = (
+            self.router_aux_loss_coef * router_aux_loss
+            + self.router_z_loss_coef * router_z_loss
+        )
+        tokens = self.norm(tokens)
+        pooled = tokens[:, 0] if self.cls_token is not None else tokens.mean(dim=1)
+        logits = self.classifier(pooled)
+
+        return {
+            "logits": logits,
+            "feature": pooled,
+            "aux_loss": router_aux_loss,
+            "router_aux_loss": router_aux_loss,
+            "router_z_loss": router_z_loss,
+            "total_router_loss": total_router_loss,
+            "expert_activations": expert_activations,
+            "expert_activations_summary": expert_activations,
+            "selected_counts_summary": selected_counts,
+            "overflow_counts_summary": overflow_counts,
+            "avg_router_probs": avg_router_probs,
+            "expert_stats_by_layer": expert_stats_by_layer,
+            "expert_activations_by_layer": expert_activations_by_layer,
+            "selected_counts_by_layer": selected_counts_by_layer,
+            "overflow_counts_by_layer": overflow_counts_by_layer,
+            "avg_router_probs_by_layer": avg_router_probs_by_layer,
+            "capacity_by_layer": capacity_by_layer,
+        }

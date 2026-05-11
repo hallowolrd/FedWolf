@@ -36,6 +36,7 @@ model:
   # 模型类型：
   # hybrid_switch_transformer = CNN stem + Transformer
   # switch_transformer = patch embedding + Transformer
+  # resnet18_switch_transformer = ResNet-18 backbone + Switch Transformer
   # resnet20_switch_transformer = ResNet-20 backbone + Transformer
   # resnet32_switch_transformer = ResNet-32 backbone + Transformer
   model_type: resnet20_switch_transformer
