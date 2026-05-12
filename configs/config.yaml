@@ -150,7 +150,7 @@ train:
   # 聚合方法：
   # - fedavg: 全模型按客户端样本数做 FedAvg
   # - expert_fedavg: shared/router 按样本数 FedAvg，expert 按 expert usage/token usage 加权
-  # - fedwolf_fisher_only: shared/router FedAvg，expert 按 raw Fisher score s 聚合，不使用 WoLF filter/gamma
+  # - fedwolf_fisher_only: shared/router FedAvg，expert 按 raw Fisher score s 聚合，不使用 WoLF filter，作为旧 Fisher-only baseline
   # - fedwolf: 完整 FedWoLF；expert 按 sqrt(relative Fisher) 聚合，filter R 使用 evidence active token 的 sqrt(relative usage)
   agg_method: fedwolf
 
@@ -206,43 +206,9 @@ train:
 
   # FedWoLF 观测噪声基础强度 sigma_e^2。
   # fedwolf 主方法中，R = sigma_e2 / (sqrt(relative evidence active tokens) + eps)。
-  # fedwolf_fisher_only 不使用 WoLF filter/gamma，保留 raw Fisher expert 聚合作为旧 baseline。
+  # fedwolf_fisher_only 不使用 WoLF filter，保留 raw Fisher expert 聚合作为旧 baseline。
   fedwolf_sigma_e2: 1e-4
 
   # WoLF-IMQ 鲁棒权重尺度 c；越小越容易对残差大的 evidence 降权
   fedwolf_imq_c: 1.0
 
-  # FedWoLF gamma 温度系数：
-  # - learned 模式下先计算 sigmoid(mu / fedwolf_gamma_temperature)，再由 gamma_min/gamma_max 映射
-  # - 当 gamma_min=0.0、gamma_max=1.0、temperature=1.0 时退化为旧行为 gamma = sigmoid(mu)
-  # - 较小的值会放大 mu 对 gamma 的影响，使 gamma 更容易偏离 0.5
-  # - 必须 > 0
-  fedwolf_gamma_temperature: 0.03
-
-  # FedWoLF learned gamma 的下界：
-  # - learned 模式下 gamma = gamma_min + (gamma_max - gamma_min) * sigmoid(mu / fedwolf_gamma_temperature)
-  # - 默认 0.0，和 gamma_max=1.0 配合时等价旧公式 gamma = sigmoid(mu / tau)
-  # - 取值范围 [0, 1]
-  fedwolf_gamma_min: 0.0
-
-  # FedWoLF learned gamma 的上界：
-  # - learned 模式下 gamma = gamma_min + (gamma_max - gamma_min) * sigmoid(mu / fedwolf_gamma_temperature)
-  # - 默认 1.0，和 gamma_min=0.0 配合时等价旧公式 gamma = sigmoid(mu / tau)
-  # - 取值范围 [0, 1]，且必须 >= fedwolf_gamma_min
-  fedwolf_gamma_max: 1.0
-
-  # FedWoLF gamma 模式：
-  # - learned: 使用 bounded learned gamma，由 gamma_min/gamma_max 缩放 sigmoid(mu / fedwolf_gamma_temperature)
-  # - fixed: 使用固定 gamma，即 gamma = fedwolf_fixed_gamma，用于消融诊断
-  fedwolf_gamma_mode: learned
-
-  # fixed gamma 消融值：
-  # - 仅当 fedwolf_gamma_mode: fixed 时生效
-  # - 取值范围 [0, 1]
-  # - 0.0: 完全保留上一轮 global expert，不采用当前轮 theta_bar
-  # - 0.7/0.9: 控制当前轮 theta_bar 的插值强度，用于消融 gamma 更新幅度
-  # - 1.0: 完全采用当前 fedwolf 的 theta_bar；
-  #        在完整 fedwolf 中，该 theta_bar 来自 sqrt(relative Fisher) expert 聚合。
-  #        注意：这不等价于 fedwolf_fisher_only，因为 fedwolf_fisher_only 使用 raw Fisher 聚合，
-  #        且不使用 WoLF filter/gamma。
-  fedwolf_fixed_gamma: null

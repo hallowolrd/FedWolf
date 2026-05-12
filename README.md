@@ -70,14 +70,13 @@ CUDA_VISIBLE_DEVICES=1 python train.py --config configs/test1/config.yaml
 - `fedwolf_fisher_only`
   - shared/backbone/router/classifier 按客户端样本数 FedAvg。
   - expert 参数按客户端上传的 Fisher raw score `s` 加权。
-  - 不使用 `mu/P`，不使用 IMQ 权重，不使用 gamma。
+  - 不使用 `mu/P`、不使用 IMQ 权重。
   - 这是 FedWoLF 的 Fisher-only 消融。
 - `fedwolf`
   - 完整 FedWoLF。
-  - 客户端训练后额外计算 expert Fisher evidence：`s` 和 `z = log(1+s)`。
-  - 服务端为每层每个 expert 维护 `mu/P` 状态。
-  - 使用 WoLF-IMQ 权重对残差大的 evidence 降权。
-  - 使用 bounded learned gamma 在 old global expert 和 Fisher weighted expert average 之间插值：`gamma = gamma_min + (gamma_max - gamma_min) * sigmoid(mu / tau)`，其中 `tau = fedwolf_gamma_temperature`；默认 `gamma_min=0.0`、`gamma_max=1.0` 时退化为 `gamma = sigmoid(mu / tau)`。
+  - 客户端训练后额外计算 expert Fisher evidence：`s`、`z = log(1+s)` 和 activation support `n`。
+  - 服务端为每个 expert 维护 `mu/P`，使用 activation-support-derived observation noise、IMQ 鲁棒权重、Fisher salience、leave-one-out consistency 和 client-expert precision fusion。
+  - 不再使用旧插值步骤。
 
 当前没有实现 `fedwolf_kf`。如果需要 Fisher + 普通 scalar filter 的消融入口，建议后续单独补充。
 
@@ -95,22 +94,13 @@ CUDA_VISIBLE_DEVICES=1 python train.py --config configs/test1/config.yaml
 服务端：
 
 1. shared/backbone/router/classifier 继续普通 FedAvg。
-2. 对每层每个 expert，按客户端顺序用 `z/s` 更新 scalar filter state：
-   - `mu_pred = mu_prev`
-   - `P_pred = P_prev + q`
-   - `R = sigma_e2 / (s + eps)`
-   - `residual = z - mu`
-   - `w = (1 + residual^2 / c^2)^(-0.5)`
-   - `obs_precision = w^2 / R`
-3. 用 Fisher raw score `s` 得到 `Theta_bar`。
-4. 对 `fedwolf`，计算 `gamma = gamma_min + (gamma_max - gamma_min) * sigmoid(mu / tau)`，其中 `tau = fedwolf_gamma_temperature`，`gamma_min = fedwolf_gamma_min`，`gamma_max = fedwolf_gamma_max`；默认 `gamma_min=0.0`、`gamma_max=1.0` 时退化为旧公式 `gamma = sigmoid(mu / tau)`。
-5. 最终 expert 更新：
-
-```text
-expert_new = (1 - gamma) * expert_old + gamma * Theta_bar
-```
-
-如果某个 expert 本轮 Fisher 总权重为 0，则保留旧 global expert，不用随机客户端参数覆盖。
+2. 对每个 expert：
+   - 先做 filter predict，得到 `mu_pred`, `P_pred`
+   - 用 activation support 计算 `R`
+   - 用 `z = log1p(s)` 和 `R` 做 standardized residual / IMQ / filter precision update
+   - 用 Fisher salience、leave-one-out consistency 得到 `lambda_clients`
+   - 用 `lambda0` 和 `lambda_clients` 做 client-expert precision fusion
+3. 如果某个 expert 本轮没有有效 evidence，则保留旧 global expert。
 
 ## FedWoLF 配置
 
@@ -123,75 +113,32 @@ FedWoLF 参数放在 `config.yaml` 的 `train` section：
   - `cpu`：在 CPU 上聚合，显存占用更稳，和旧版本行为一致
   - `cuda`：将每个参数 key 的浮点聚合临时放到 GPU 上完成，可能减少 CPU 聚合开销
   - 聚合结果仍然转回 CPU state_dict，不会长期保存 GPU 版 client state_dict
-  - 多客户端、大模型时 `cuda` 聚合会增加聚合阶段显存占用；显存紧张时保持 `cpu`
-  - 这是工程加速开关，不改变 FedAvg、ExpertFedAvg、FedWoLF 的数学公式
-- `show_progress`
-  - 默认 `true`，显示一个总训练进度条，用于查看整体训练进度和 ETA
-  - `false`：关闭进度条，适合后台运行、日志重定向或输出混乱时使用
-- `progress_leave`
-  - 默认 `true`，训练结束后在终端保留进度条，方便查看总耗时和平均速度
-  - `false`：训练结束后清除进度条，终端输出更干净
-  - 当前只创建一个总进度条；总步数按每轮 client 训练、aggregation/save、round eval，以及最终 final eval 估计，ETA 由 tqdm 自动估计
 - `fedwolf_evidence_loader_mode`
-  - 可选：`deterministic`、`train_loader`
-  - 默认 `deterministic`：使用同一份客户端 `client_train_indices`，但采用 `ToTensor + Normalize` 的确定性 transform，不做 `RandomCrop` / `RandomHorizontalFlip`，并且 `shuffle=False`
-  - `train_loader`：复用训练 loader，包含训练增强和 shuffle，主要用于消融
+  - 默认 `deterministic`
 - `fedwolf_evidence_model_mode`
-  - 可选：`eval`、`train`
-  - 默认 `eval`：关闭 Dropout / BN 更新等训练态随机行为，但仍保留 autograd 梯度计算
-  - `train`：使用训练模式计算 evidence，更贴近训练态但随机性更强
+  - 默认 `eval`
 - `fedwolf_fisher_score_mode`
-  - 可选：`mean_diag`、`mean_diag_active`、`trace_per_sample`、`trace_per_active_sample`、`trace_raw`
-  - 默认 `mean_diag`，保持旧行为并与 PDF 定义对齐：`s = 1/d_k * trace(F_diag) = grad_square_sum / (param_count * total_samples)`
-  - `mean_diag_active`：`grad_square_sum / (param_count * num_samples_with_grad)`
-  - `trace_per_sample`：`grad_square_sum / total_samples`
-  - `trace_per_active_sample`：`grad_square_sum / num_samples_with_grad`
-  - `trace_raw`：直接使用 `grad_square_sum`，仅用于诊断或消融
-  - 如果 `mean_diag` 让 `s` 过小、`R` 过大、`mu/gamma` 几乎不动，优先尝试 `trace_per_active_sample`，其次尝试 `trace_per_sample`
+  - 默认 `trace_per_active_sample`
 - `fedwolf_fisher_max_samples`
-  - 每个 client 的 Fisher evidence pass 最多使用多少样本，默认 `512`
-  - `null` 或 `0` 表示不限制，使用该 client 的全量 evidence 数据
-  - 调试阶段建议 `512` 或 `1024` 加速；正式实验建议设为 `null` 做全量 evidence
+  - 默认 `512`
 - `fedwolf_fisher_max_batches`
-  - 每个 client 的 Fisher evidence pass 最多处理多少 batch，默认 `null`
-  - `null` 或 `0` 表示不限制
-  - 如果 `fedwolf_fisher_max_samples` 和 `fedwolf_fisher_max_batches` 同时设置，先达到任一上限就停止
-  - 这两个上限只减少 evidence pass 使用的数据量；被选中的样本仍然逐样本 backward 计算 per-sample Fisher，不会退化成 batch-approx Fisher
+  - 默认 `null`
 - `fedwolf_fisher_debug_batches`
-  - 默认 `0`，不记录逐 batch 的 `batch_grad_status`
-  - 设置为正整数 `N` 时，只记录前 `N` 个 evidence batch 的简要诊断
+  - 默认 `0`
+- `fedwolf_fisher_debug`
+  - 默认 `false`
 - `fedwolf_eps`
-  - 数值稳定项，用于 Fisher 权重归一化和观测噪声分母，默认 `1e-8`
+  - 数值稳定项，用于权重归一化和观测噪声分母，默认 `1e-8`
 - `fedwolf_process_noise_q`
   - expert 可信度状态的过程噪声，默认 `0.01`
 - `fedwolf_sigma_e2`
-  - 观测噪声基础强度，`R = sigma_e2 / (s + eps)`，默认 `1.0`
+  - 观测噪声基础强度；FedWoLF 主方法中由 activation support 计算 observation noise
 - `fedwolf_imq_c`
   - WoLF-IMQ 鲁棒权重尺度，越小越容易对残差大的 evidence 降权，默认 `1.0`
-- `fedwolf_gamma_temperature`
-  - gamma 温度系数 `tau`，默认 `1.0`
-  - 原始映射是 `gamma = sigmoid(mu)`；工程温度校准版是 `gamma = sigmoid(mu / tau)`
-  - `tau=1.0` 时退化为旧行为，较小的 `tau` 会让 gamma 更容易离开 `0.5`
-  - 该温度只影响 `mu -> gamma -> expert_new = (1-gamma) * old_global + gamma * theta_bar`
-  - 它不影响 Fisher evidence `s/z`、`R = sigma_e2 / (s + eps)`、IMQ weight、`mu/P` filter update，也不影响 `theta_bar` 的 Fisher 加权平均
-- `fedwolf_gamma_min` / `fedwolf_gamma_max`
-  - learned 模式下使用 bounded gamma：`gamma = gamma_min + (gamma_max - gamma_min) * sigmoid(mu / tau)`
-  - 默认 `fedwolf_gamma_min: 0.0`、`fedwolf_gamma_max: 1.0`，此时退化为旧公式 `gamma = sigmoid(mu / tau)`
-  - 两者合法范围都是 `[0, 1]`，且要求 `fedwolf_gamma_min <= fedwolf_gamma_max`
-  - 作用是避免 learned gamma 长期卡在 `0.50` 附近，同时保留不同 expert 的 `mu` 自适应差异
-- `fedwolf_gamma_mode`
-  - 可选：`learned`、`fixed`
-  - 默认 `learned`，使用 bounded learned gamma，其中 `tau = fedwolf_gamma_temperature`
-  - `fixed` 用于消融诊断 learned gamma 是否过于保守，此时 `gamma = fedwolf_fixed_gamma`，不再由 `mu` 决定，也不使用 `fedwolf_gamma_min/max`
-- `fedwolf_fixed_gamma`
-  - 默认 `null`，仅当 `fedwolf_gamma_mode: fixed` 时生效，合法范围是 `[0, 1]`
-  - `0.7`：测试更强 Fisher 插值是否优于 learned gamma
-  - `0.9`：测试接近 Fisher-only 是否更好
-  - `1.0`：应近似退化为 `fedwolf_fisher_only`，用于验证实现
-  - fixed-gamma 仍然保留 `mu/P` filter update 和日志，只改变最终 `mu -> gamma` 这一步
-
-如果 gamma 长期停留在 `0.500x` 附近，可以尝试 bounded learned gamma。当前第一候选是 `fedwolf_gamma_mode: learned`、`fedwolf_gamma_temperature: 0.03`、`fedwolf_gamma_min: 0.5`、`fedwolf_gamma_max: 1.0`，此时 `gamma = 0.5 + 0.5 * sigmoid(mu / 0.03)`，当 `mu≈0` 时 `gamma≈0.75`。第二候选是 `fedwolf_gamma_temperature: 0.03`、`fedwolf_gamma_min: 0.4`、`fedwolf_gamma_max: 1.0`，当 `mu≈0` 时 `gamma≈0.7`。更激进候选是 `fedwolf_gamma_temperature: 0.03`、`fedwolf_gamma_min: 0.7`、`fedwolf_gamma_max: 1.0`，当 `mu≈0` 时 `gamma≈0.85`。
-如果要判断 learned gamma 是否太保守，可以用 `fedwolf_gamma_mode: fixed` 搭配 `fedwolf_fixed_gamma: 0.7`、`0.9`、`1.0` 做消融。这个设置不改变 Fisher evidence `s/z`、score mode、`R = sigma_e2 / (s + eps)`、IMQ weight、`mu/P` filter update，也不改变 `theta_bar` 的 Fisher 加权平均，只改变最终 expert 插值强度。
+- `fedwolf_consistency_min`
+  - leave-one-out update consistency 的下界，默认 `0.05`
+- `fedwolf_lambda_min` / `fedwolf_lambda_max`
+  - client-expert precision 的归一化后裁剪范围，默认分别为 `0.05` / `5.0`
 
 ## 实验切换方式
 
@@ -367,14 +314,25 @@ FedWoLF 日志中可观察：
 
 - `--expert_fisher_score_by_layer`
 - `--expert_fisher_log_score_by_layer`
-- `--fedwolf_filter_state_summary`
-  - `mu`
-  - `P`
-  - `mean_weight`
-  - `mean_abs_residual`
-  - `mean_kalman_gain`
-  - `gamma`
-  - `total_fisher_weight`
+- `--fedwolf_filter_summary`
+  - `aggregation_weight_mode`
+  - `num_experts`
+  - `num_valid_experts`
+  - `lambda0`
+  - `mean_lambda_filter`
+  - `mean_lambda_raw`
+  - `mean_lambda_final`
+  - `mean_R`
+  - `mean_rho`
+  - `mean_std_residual`
+  - `mean_abs_standardized_residual`
+  - `mean_fisher_salience`
+  - `mean_update_consistency`
+  - `mean_mu`
+  - `mean_P`
+  - `skipped_observations`
+
+  其中 `mean_s_agg` / `total_s_agg_weight` 以及各类 `min/max` 诊断字段也会保留在 summary 字典里，用于更细的 expert 权重分析，但默认日志行只展开上面的核心字段。
 
 ## references 边界
 
@@ -390,12 +348,11 @@ FedWoLF 日志中可观察：
 - 默认 evidence pass 是 deterministic loader + eval-mode forward；这里的 eval-mode evidence 不是 inference / `no_grad`，而是在关闭训练态随机行为后仍然计算梯度的 Fisher evidence。
 - evidence pass 不使用 `torch.no_grad()`，不执行 `optimizer.step()`，不会更新模型参数；结束后会恢复进入 evidence 前的 `model.training` 状态。
 - 当前 expert evidence 使用 supervised cross-entropy loss 计算 per-sample empirical Fisher；`router_aux_loss` / `router_z_loss` 是 batch-level auxiliary losses，不纳入 expert Fisher。直接把 batch-level scalar 加到每个 sample loss 会重复计入 batch size 次并破坏 Fisher 尺度，而且当前 evidence 只针对 `blocks.*.ffn.experts.*` expert 参数。
-- Fisher score mode 只改变客户端上传的 scalar `s` 的尺度，不改变 server-side FedWoLF 的 `R`、IMQ、`mu/P`、`gamma` 或 expert 插值公式。
-- 如果日志里 `mean_s` 只有 `1e-12` 到 `1e-9`、`mean_R` 达到 `1e7` 以上、`mean_kalman_gain` 接近 0、`mu` 长期接近 0 或 `gamma` 长期接近 0.5，可以做 score mode 尺度消融。`trace_per_active_sample` 对 top-1 MoE 通常更适合作为优先消融，因为每个 expert 只在部分样本上被路由激活。
+- Fisher score mode 只改变客户端上传的 scalar `s` 的尺度，不改变 server-side FedWoLF 的 `R`、IMQ、`mu/P` 或 expert precision fusion。
+- 如果日志里 `mean_s` 只有 `1e-12` 到 `1e-9`、`mean_R` 达到 `1e7` 以上、`mean_kalman_gain` 接近 0、`mu` 长期接近 0，可以做 score mode 尺度消融。`trace_per_active_sample` 对 top-1 MoE 通常更适合作为优先消融，因为每个 expert 只在部分样本上被路由激活。
 - 某些 expert 的 Fisher score 可能为 0；此时该 expert 保留旧 global 参数。
 - `mu/P` 当前只存在内存中；断点续训如果只恢复 `server.pth`，filter state 会丢失。
-- bounded learned gamma 只校准 `mu -> gamma` 的映射区间；默认 `fedwolf_gamma_min: 0.0`、`fedwolf_gamma_max: 1.0` 时等价于 `gamma = sigmoid(mu / fedwolf_gamma_temperature)`，如果 gamma 长期接近 `0.5`，可优先尝试 `fedwolf_gamma_temperature: 0.03`、`fedwolf_gamma_min: 0.5`、`fedwolf_gamma_max: 1.0`。
-- fixed-gamma 消融只改变最终 expert 插值强度；`fedwolf_gamma_mode: fixed` 时仍会更新和记录 `mu/P`，便于诊断 learned gamma 是否过于保守。
+- FedWoLF 当前只输出 precision fusion 诊断字段；旧插值相关超参已经删除，当前只使用 client-expert precision fusion。
 - `fedwolf_fisher_only` 和 `fedwolf` 语义不同：前者是消融，后者是完整方法。
 - `train.py` 的自动数据准备只会覆盖 `save/{run_name}/data` 下的 `partition_meta.pt` 和 `partition_stats.json`。
 - 如果 `train.allow_overwrite: false`，`train.py` 仍然会检查 `model/result` 输出目录是否非空，避免误覆盖训练结果。

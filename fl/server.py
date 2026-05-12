@@ -69,6 +69,21 @@ from fl.client import Client
 from model import build_model_from_args
 from utils.utils import init_result_csv, init_server_result_csv, record_server_result
 
+
+def _format_fedwolf_summary_value(value, integer=False):
+    if value is None:
+        return "None"
+    if isinstance(value, str):
+        return value
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if integer:
+        return str(int(round(numeric_value)))
+    return f"{numeric_value:.12e}"
+
+
 class Server:
     """ Server 表示联邦学习中的服务端。
     它不直接拿全部训练数据训练，而是：
@@ -334,10 +349,10 @@ class Server:
         - fedavg:对完整 state_dict 按客户端训练样本数加权平均；
         - expert_fedavg:普通层按客户端样本数聚合,专家层按每个 expert 实际处理样本数聚合；
         - fedwolf_fisher_only:普通层按客户端样本数聚合,专家层按 raw Fisher score 聚合；
-          不使用 WoLF filter/gamma,作为旧 Fisher-only baseline；
-        - fedwolf:expert 参数按 sqrt(relative Fisher) 聚合；filter observation 使用
+          不使用 WoLF filter，作为旧 Fisher-only baseline；
+        - fedwolf:expert 参数按 client-expert precision fusion 聚合；filter observation 使用
           log1p(raw Fisher)；filter observation noise 使用
-          sqrt(relative evidence active tokens)；然后进行 WoLF-IMQ 状态更新和 gamma 插值。 """
+          sqrt(relative evidence active tokens)；然后进行 WoLF-IMQ 状态更新和 precision fusion。 """
 
         if client_states is None:
             self.logger.info("--client_state_transport : disk\n")
@@ -372,7 +387,33 @@ class Server:
         self.logger.info(f"--client_train_sizes : {client_sizes}\n")
         filter_summary = getattr(self.aggregator, "last_filter_summary", None)
         if filter_summary:
-            self.logger.info(f"--fedwolf_filter_state_summary : {filter_summary}\n")
+            if isinstance(filter_summary, dict) and "lambda0" in filter_summary:
+                summary_keys = [
+                    "aggregation_weight_mode",
+                    "num_experts",
+                    "num_valid_experts",
+                    "lambda0",
+                    "mean_lambda_filter",
+                    "mean_lambda_raw",
+                    "mean_lambda_final",
+                    "mean_R",
+                    "mean_rho",
+                    "mean_std_residual",
+                    "mean_abs_standardized_residual",
+                    "mean_fisher_salience",
+                    "mean_update_consistency",
+                    "mean_mu",
+                    "mean_P",
+                    "skipped_observations",
+                ]
+                summary_text = " ".join(
+                    f"{key}={_format_fedwolf_summary_value(filter_summary.get(key), integer=key in {'num_experts', 'num_valid_experts', 'skipped_observations'})}"
+                    for key in summary_keys
+                    if key in filter_summary
+                )
+                self.logger.info(f"--fedwolf_filter_summary : {summary_text}\n")
+            else:
+                self.logger.info(f"--fedwolf_filter_state_summary : {filter_summary}\n")
 
     def aggregation(self, client_states=None, client_sizes=None):
         """ 聚合入口函数。

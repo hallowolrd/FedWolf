@@ -4,7 +4,15 @@ from abc import ABC, abstractmethod
 
 import torch
 
-from fl.expert_filter_state import predict_expert_state, wolf_scalar_update
+from fl.expert_filter_state import (
+    batch_update_filter_state,
+    compute_filter_precision,
+    compute_imq_weight,
+    compute_standardized_residual,
+    compute_support_noise,
+    predict_expert_state,
+    safe_float,
+)
 
 
 def parse_expert_ref_from_key(key):
@@ -121,6 +129,557 @@ class FedAvgAggregator(Aggregator):
 
         return aggregated_state
 
+    def _parse_expert_ref_from_key(self, key):
+        expert_ref = parse_expert_ref_from_key(key)
+        if expert_ref is None:
+            return None
+        layer_id, expert_id = expert_ref
+        return int(layer_id), int(expert_id)
+
+    def _collect_expert_param_keys_by_ref(self, state_keys):
+        expert_param_keys_by_ref = {}
+        for key in state_keys:
+            expert_ref = self._parse_expert_ref_from_key(key)
+            if expert_ref is None:
+                continue
+            expert_param_keys_by_ref.setdefault(expert_ref, []).append(key)
+        return expert_param_keys_by_ref
+
+    def _aggregate_fedavg_param(self, key, first_value, client_updates, client_weights, total_weight):
+        first_on_device = self._to_agg_device(first_value)
+        aggregated_tensor = torch.zeros_like(first_on_device)
+        for update, weight in zip(client_updates, client_weights):
+            aggregated_tensor += self._to_agg_device(update[key]) * (weight / total_weight)
+        return self._to_output_device(aggregated_tensor)
+
+    def _aggregate_fisher_only_expert_param(
+        self,
+        key,
+        first_value,
+        expert_ref,
+        client_updates,
+        client_stats,
+        global_state,
+    ):
+        layer_id, expert_id = expert_ref
+        weights = [
+            self._nonnegative_or_zero(self._get_fisher_score(client_stat, layer_id, expert_id))
+            for client_stat in client_stats
+        ]
+        total_weight = sum(weights)
+        if total_weight <= 0.0:
+            if global_state is not None and key in global_state:
+                return global_state[key].detach().cpu().clone()
+            return first_value.cpu().clone()
+
+        first_on_device = self._to_agg_device(first_value)
+        aggregated_tensor = torch.zeros_like(first_on_device)
+        denominator = total_weight + self.eps
+        for update, weight in zip(client_updates, weights):
+            if weight <= 0.0 or key not in update:
+                continue
+            aggregated_tensor += self._to_agg_device(update[key]) * (weight / denominator)
+        return self._to_output_device(aggregated_tensor)
+
+    def _aggregate_precision_fusion_expert_param(
+        self,
+        key,
+        first_value,
+        expert_ref,
+        client_updates,
+        global_state,
+        precision_cache,
+    ):
+        if global_state is None or key not in global_state:
+            return first_value.cpu().clone()
+
+        cache = precision_cache.get(expert_ref)
+        if cache is None or sum(cache["lambda_clients"]) <= 0.0:
+            return global_state[key].detach().cpu().clone()
+
+        theta_old = self._to_agg_device(global_state[key])
+        lambda0 = max(float(cache["lambda0"]), 0.0)
+        numerator = theta_old * lambda0
+        denominator = lambda0
+        valid_client_count = 0
+
+        for update, lambda_client in zip(client_updates, cache["lambda_clients"]):
+            lambda_client = max(float(lambda_client), 0.0)
+            if lambda_client <= 0.0 or key not in update:
+                continue
+            numerator += self._to_agg_device(update[key]) * lambda_client
+            denominator += lambda_client
+            valid_client_count += 1
+
+        if valid_client_count == 0 or denominator <= 0.0:
+            return global_state[key].detach().cpu().clone()
+
+        return self._to_output_device(numerator / (denominator + self.eps))
+
+    def _prepare_fedwolf_precision_cache(
+        self,
+        expert_param_keys_by_ref,
+        client_updates,
+        client_stats,
+        global_state,
+    ):
+        precision_cache = {}
+        self.last_filter_summary = {}
+
+        layer_sizes = {}
+        for layer_id, expert_id in expert_param_keys_by_ref:
+            layer_key = str(layer_id)
+            layer_sizes[layer_key] = max(layer_sizes.get(layer_key, 0), expert_id + 1)
+        if self.num_experts is not None:
+            for layer_key in layer_sizes:
+                layer_sizes[layer_key] = max(layer_sizes[layer_key], int(self.num_experts))
+
+        for (layer_id, expert_id), param_keys in sorted(expert_param_keys_by_ref.items()):
+            layer_key = str(layer_id)
+            self._ensure_filter_state_for_layer(layer_key, layer_sizes[layer_key])
+            mu_pred, p_pred = predict_expert_state(
+                self.expert_filter_mu[layer_key][expert_id].item(),
+                self.expert_filter_P[layer_key][expert_id].item(),
+                self.process_noise_q,
+                eps=self.eps,
+            )
+            lambda0 = 1.0 / (p_pred + self.eps)
+            has_global_params = all(key in global_state for key in param_keys)
+
+            raw_scores = []
+            observations = []
+            active_tokens = []
+            valid = []
+            for update, client_stat in zip(client_updates, client_stats):
+                s_value = self._get_fisher_score(client_stat, layer_id, expert_id)
+                z_value = self._get_fisher_log_score(client_stat, layer_id, expert_id)
+                n_value = self._get_evidence_active_tokens(client_stat, layer_id, expert_id)
+                has_client_params = self._client_has_all_expert_params(update, param_keys)
+                is_valid = (
+                    has_global_params
+                    and has_client_params
+                    and s_value is not None
+                    and z_value is not None
+                    and s_value >= 0.0
+                    and math.isfinite(float(z_value))
+                )
+                raw_scores.append(s_value)
+                observations.append(z_value)
+                active_tokens.append(n_value)
+                valid.append(bool(is_valid))
+
+            positive_ns = [
+                float(n_value)
+                for n_value, is_valid in zip(active_tokens, valid)
+                if is_valid and n_value is not None and math.isfinite(float(n_value)) and float(n_value) > 0.0
+            ]
+            mean_positive_n = sum(positive_ns) / len(positive_ns) if positive_ns else 0.0
+
+            R_values = []
+            n_rel_values = []
+            support_values = []
+            nu_values = []
+            rho_values = []
+            lambda_filters = []
+            for is_valid, z_value, n_value in zip(valid, observations, active_tokens):
+                if not is_valid:
+                    R_values.append(0.0)
+                    n_rel_values.append(0.0)
+                    support_values.append(0.0)
+                    nu_values.append(0.0)
+                    rho_values.append(0.0)
+                    lambda_filters.append(0.0)
+                    continue
+
+                R, n_rel, support_reliability = compute_support_noise(
+                    n_active=n_value,
+                    mean_positive_n=mean_positive_n,
+                    sigma_e2=self.sigma_e2,
+                    eps=self.eps,
+                )
+                nu = compute_standardized_residual(
+                    observation=z_value,
+                    mu_pred=mu_pred,
+                    p_pred=p_pred,
+                    R=R,
+                    eps=self.eps,
+                )
+                rho = compute_imq_weight(
+                    standardized_residual=nu,
+                    imq_c=self.imq_c,
+                    eps=self.eps,
+                )
+                lambda_filter = compute_filter_precision(rho=rho, R=R, eps=self.eps)
+                R_values.append(R)
+                n_rel_values.append(n_rel)
+                support_values.append(support_reliability)
+                nu_values.append(nu)
+                rho_values.append(rho)
+                lambda_filters.append(lambda_filter)
+
+            valid_observations = [
+                z_value for z_value, is_valid in zip(observations, valid) if is_valid
+            ]
+            valid_lambda_filters = [
+                lambda_filter for lambda_filter, is_valid in zip(lambda_filters, valid) if is_valid
+            ]
+            mu_new, p_new = batch_update_filter_state(
+                mu_pred=mu_pred,
+                p_pred=p_pred,
+                observations=valid_observations,
+                lambda_filters=valid_lambda_filters,
+                eps=self.eps,
+            )
+            self.expert_filter_mu[layer_key][expert_id] = mu_new
+            self.expert_filter_P[layer_key][expert_id] = p_new
+
+            positive_scores = [
+                float(score)
+                for score, is_valid in zip(raw_scores, valid)
+                if is_valid and score is not None and math.isfinite(float(score)) and float(score) > 0.0
+            ]
+            mean_positive_s = sum(positive_scores) / len(positive_scores) if positive_scores else 0.0
+            fisher_salience = [
+                self._sqrt_relative_weight(score, mean_positive_s) if is_valid and score is not None else 0.0
+                for score, is_valid in zip(raw_scores, valid)
+            ]
+            w_pre = [
+                salience * lambda_filter if is_valid else 0.0
+                for salience, lambda_filter, is_valid in zip(fisher_salience, lambda_filters, valid)
+            ]
+            update_consistency = self._compute_leave_one_out_update_consistency(
+                param_keys=param_keys,
+                client_updates=client_updates,
+                global_state=global_state,
+                valid=valid,
+                w_pre=w_pre,
+            )
+            lambda_raw = [
+                salience * lambda_filter * consistency if is_valid else 0.0
+                for salience, lambda_filter, consistency, is_valid in zip(
+                    fisher_salience,
+                    lambda_filters,
+                    update_consistency,
+                    valid,
+                )
+            ]
+            positive_lambda_raw = [
+                value for value, is_valid in zip(lambda_raw, valid) if is_valid and value > 0.0
+            ]
+            mean_lambda_raw = (
+                sum(positive_lambda_raw) / len(positive_lambda_raw)
+                if positive_lambda_raw else 0.0
+            )
+            if mean_lambda_raw <= 0.0:
+                lambda_clients = [0.0 for _ in lambda_raw]
+            else:
+                lambda_clients = [
+                    self._clip_lambda(value / (mean_lambda_raw + self.eps)) if is_valid and value > 0.0 else 0.0
+                    for value, is_valid in zip(lambda_raw, valid)
+                ]
+
+            precision_cache[(layer_id, expert_id)] = {
+                "lambda0": float(lambda0),
+                "lambda_clients": lambda_clients,
+                "lambda_filter": lambda_filters,
+                "lambda_raw": lambda_raw,
+                "fisher_salience": fisher_salience,
+                "update_consistency": update_consistency,
+                "R": R_values,
+                "rho": rho_values,
+                "nu": nu_values,
+                "valid": valid,
+                "mu_pred": float(mu_pred),
+                "P_pred": float(p_pred),
+                "mu_new": float(mu_new),
+                "P_new": float(p_new),
+                "mean_positive_s": float(mean_positive_s),
+                "mean_positive_n": float(mean_positive_n),
+            }
+
+        return precision_cache
+
+    def _client_has_all_expert_params(self, client_update, param_keys):
+        return all(key in client_update for key in param_keys)
+
+    def _clip_lambda(self, value):
+        value = safe_float(value, default=0.0)
+        if value <= 0.0:
+            return 0.0
+        return min(max(value, self.lambda_min), self.lambda_max)
+
+    def _get_delta_tensor(self, update, global_state, key):
+        return self._to_agg_device(update[key]) - self._to_agg_device(global_state[key])
+
+    def _compute_leave_one_out_update_consistency(
+        self,
+        param_keys,
+        client_updates,
+        global_state,
+        valid,
+        w_pre,
+    ):
+        valid_indices = [idx for idx, is_valid in enumerate(valid) if is_valid]
+        if len(valid_indices) < 2:
+            return [1.0 if is_valid else 0.0 for is_valid in valid]
+
+        weighted_sum_delta = {
+            key: torch.zeros_like(self._to_agg_device(global_state[key]))
+            for key in param_keys
+        }
+        sum_w_pre = 0.0
+        for idx in valid_indices:
+            weight = max(safe_float(w_pre[idx], default=0.0), 0.0)
+            if weight <= 0.0:
+                continue
+            sum_w_pre += weight
+            for key in param_keys:
+                weighted_sum_delta[key] += weight * self._get_delta_tensor(
+                    client_updates[idx],
+                    global_state,
+                    key,
+                )
+
+        consistency = []
+        for idx, is_valid in enumerate(valid):
+            if not is_valid:
+                consistency.append(0.0)
+                continue
+
+            weight = max(safe_float(w_pre[idx], default=0.0), 0.0)
+            denom_minus = sum_w_pre - weight
+            if denom_minus <= self.eps:
+                consistency.append(1.0)
+                continue
+
+            dot = 0.0
+            norm_delta_sq = 0.0
+            norm_center_sq = 0.0
+            for key in param_keys:
+                delta = self._get_delta_tensor(client_updates[idx], global_state, key)
+                center = (weighted_sum_delta[key] - weight * delta) / (denom_minus + self.eps)
+                dot += float(torch.sum(delta * center).detach().cpu().item())
+                norm_delta_sq += float(torch.sum(delta * delta).detach().cpu().item())
+                norm_center_sq += float(torch.sum(center * center).detach().cpu().item())
+
+            norm_delta = math.sqrt(max(norm_delta_sq, 0.0))
+            norm_center = math.sqrt(max(norm_center_sq, 0.0))
+            if norm_delta <= self.eps or norm_center <= self.eps:
+                consistency.append(1.0)
+                continue
+
+            cosine = dot / (norm_delta * norm_center + self.eps)
+            cosine = min(max(cosine, -1.0), 1.0)
+            consistency.append(
+                self.consistency_min
+                + (1.0 - self.consistency_min) * max(0.0, cosine)
+            )
+
+        return consistency
+
+    def _finite_values(self, values, mask=None, positive_only=False):
+        finite_values = []
+        for idx, value in enumerate(values or []):
+            if mask is not None and not mask[idx]:
+                continue
+            value = safe_float(value, default=None)
+            if value is None:
+                continue
+            if positive_only and value <= 0.0:
+                continue
+            finite_values.append(value)
+        return finite_values
+
+    def _mean_or_zero(self, values):
+        return sum(values) / len(values) if values else 0.0
+
+    def _min_or_zero(self, values):
+        return min(values) if values else 0.0
+
+    def _max_or_zero(self, values):
+        return max(values) if values else 0.0
+
+    def _build_filter_summary_from_precision_cache(self, precision_cache):
+        summary = {
+            "num_experts": 0,
+            "num_valid_experts": 0,
+            "aggregation_weight_mode": self._get_aggregation_weight_mode(),
+            "lambda0": 0.0,
+            "mean_lambda_filter": 0.0,
+            "min_lambda_filter": 0.0,
+            "max_lambda_filter": 0.0,
+            "mean_lambda_raw": 0.0,
+            "min_lambda_raw": 0.0,
+            "max_lambda_raw": 0.0,
+            "mean_lambda_final": 0.0,
+            "min_lambda_final": 0.0,
+            "max_lambda_final": 0.0,
+            "mean_s_agg": 0.0,
+            "total_s_agg_weight": 0.0,
+            "min_s_agg": 0.0,
+            "max_s_agg": 0.0,
+            "positive_s_agg_clients": 0,
+            "mean_R": 0.0,
+            "min_R": 0.0,
+            "max_R": 0.0,
+            "mean_rho": 0.0,
+            "min_rho": 0.0,
+            "max_rho": 0.0,
+            "mean_std_residual": 0.0,
+            "mean_abs_standardized_residual": 0.0,
+            "mean_fisher_salience": 0.0,
+            "mean_update_consistency": 0.0,
+            "mean_mu": 0.0,
+            "mean_P": 0.0,
+            "skipped_observations": 0,
+        }
+
+        if not precision_cache:
+            return summary
+
+        lambda0_values = []
+        lambda_filter_values = []
+        lambda_raw_values = []
+        lambda_final_values = []
+        R_values = []
+        rho_values = []
+        std_residual_values = []
+        abs_std_residual_values = []
+        fisher_salience_values = []
+        update_consistency_values = []
+        mu_values = []
+        P_values = []
+        skipped_observations = 0
+
+        for cache in precision_cache.values():
+            summary["num_experts"] += 1
+            valid = [bool(flag) for flag in cache.get("valid", [])]
+            if any(valid):
+                summary["num_valid_experts"] += 1
+
+            lambda0 = safe_float(cache.get("lambda0"), default=None)
+            if lambda0 is not None:
+                lambda0_values.append(lambda0)
+
+            lambda_filter_values.extend(self._finite_values(cache.get("lambda_filter"), mask=valid))
+            lambda_raw_values.extend(self._finite_values(cache.get("lambda_raw"), mask=valid))
+            lambda_final_values.extend(self._finite_values(cache.get("lambda_clients"), mask=valid))
+            R_values.extend(self._finite_values(cache.get("R"), mask=valid))
+            rho_values.extend(self._finite_values(cache.get("rho"), mask=valid))
+            std_residual_values.extend(self._finite_values(cache.get("nu"), mask=valid))
+            abs_std_residual_values.extend(
+                abs(value) for value in self._finite_values(cache.get("nu"), mask=valid)
+            )
+            fisher_salience_values.extend(
+                self._finite_values(cache.get("fisher_salience"), mask=valid)
+            )
+            update_consistency_values.extend(
+                self._finite_values(cache.get("update_consistency"), mask=valid)
+            )
+
+            mu_new = safe_float(cache.get("mu_new"), default=None)
+            if mu_new is not None:
+                mu_values.append(mu_new)
+            p_new = safe_float(cache.get("P_new"), default=None)
+            if p_new is not None:
+                P_values.append(p_new)
+
+            skipped_observations += int(len(valid) - sum(valid))
+
+        summary["lambda0"] = self._mean_or_zero(lambda0_values)
+        summary["mean_lambda_filter"] = self._mean_or_zero(lambda_filter_values)
+        summary["min_lambda_filter"] = self._min_or_zero(lambda_filter_values)
+        summary["max_lambda_filter"] = self._max_or_zero(lambda_filter_values)
+        summary["mean_lambda_raw"] = self._mean_or_zero(lambda_raw_values)
+        summary["min_lambda_raw"] = self._min_or_zero(lambda_raw_values)
+        summary["max_lambda_raw"] = self._max_or_zero(lambda_raw_values)
+        summary["mean_lambda_final"] = self._mean_or_zero(lambda_final_values)
+        summary["min_lambda_final"] = self._min_or_zero(lambda_final_values)
+        summary["max_lambda_final"] = self._max_or_zero(lambda_final_values)
+        summary["mean_s_agg"] = summary["mean_lambda_final"]
+        summary["total_s_agg_weight"] = sum(lambda_final_values) if lambda_final_values else 0.0
+        summary["min_s_agg"] = self._min_or_zero(lambda_final_values)
+        summary["max_s_agg"] = self._max_or_zero(lambda_final_values)
+        summary["positive_s_agg_clients"] = int(sum(1 for value in lambda_final_values if value > 0.0))
+        summary["mean_R"] = self._mean_or_zero(R_values)
+        summary["min_R"] = self._min_or_zero(R_values)
+        summary["max_R"] = self._max_or_zero(R_values)
+        summary["mean_rho"] = self._mean_or_zero(rho_values)
+        summary["min_rho"] = self._min_or_zero(rho_values)
+        summary["max_rho"] = self._max_or_zero(rho_values)
+        summary["mean_std_residual"] = self._mean_or_zero(std_residual_values)
+        summary["mean_abs_standardized_residual"] = self._mean_or_zero(abs_std_residual_values)
+        summary["mean_fisher_salience"] = self._mean_or_zero(fisher_salience_values)
+        summary["mean_update_consistency"] = self._mean_or_zero(update_consistency_values)
+        summary["mean_mu"] = self._mean_or_zero(mu_values)
+        summary["mean_P"] = self._mean_or_zero(P_values)
+        summary["skipped_observations"] = skipped_observations
+        return summary
+
+    def _record_precision_summary(self, layer_id, expert_id, cache):
+        layer_id = str(layer_id)
+        layer_size = self.expert_filter_mu[layer_id].numel()
+        layer_summary = self.last_filter_summary.setdefault(
+            layer_id,
+            {
+                "lambda0": ["0.000000000000e+00"] * layer_size,
+                "mean_lambda_filter": ["0.000000000000e+00"] * layer_size,
+                "min_lambda_filter": ["0.000000000000e+00"] * layer_size,
+                "max_lambda_filter": ["0.000000000000e+00"] * layer_size,
+                "mean_lambda_raw": ["0.000000000000e+00"] * layer_size,
+                "min_lambda_raw": ["0.000000000000e+00"] * layer_size,
+                "max_lambda_raw": ["0.000000000000e+00"] * layer_size,
+                "mean_lambda_final": ["0.000000000000e+00"] * layer_size,
+                "min_lambda_final": ["0.000000000000e+00"] * layer_size,
+                "max_lambda_final": ["0.000000000000e+00"] * layer_size,
+                "mean_fisher_salience": ["0.000000000000e+00"] * layer_size,
+                "mean_update_consistency": ["0.000000000000e+00"] * layer_size,
+                "mean_R": ["0.000000000000e+00"] * layer_size,
+                "min_R": ["0.000000000000e+00"] * layer_size,
+                "max_R": ["0.000000000000e+00"] * layer_size,
+                "mean_rho": ["0.000000000000e+00"] * layer_size,
+                "mean_abs_standardized_residual": ["0.000000000000e+00"] * layer_size,
+                "mean_positive_s": ["0.000000000000e+00"] * layer_size,
+                "mean_positive_n": ["0.000000000000e+00"] * layer_size,
+                "mu": ["0.000000000000e+00"] * layer_size,
+                "P": ["0.000000000000e+00"] * layer_size,
+                "skipped_observations": [0] * layer_size,
+            },
+        )
+
+        valid = cache["valid"]
+        lambda_filter = self._finite_values(cache["lambda_filter"], mask=valid)
+        lambda_raw = self._finite_values(cache["lambda_raw"], mask=valid)
+        lambda_final = self._finite_values(cache["lambda_clients"], mask=valid)
+        fisher_salience = self._finite_values(cache["fisher_salience"], mask=valid)
+        update_consistency = self._finite_values(cache["update_consistency"], mask=valid)
+        R_values = self._finite_values(cache["R"], mask=valid)
+        rho_values = self._finite_values(cache["rho"], mask=valid)
+        abs_nu_values = [abs(value) for value in self._finite_values(cache["nu"], mask=valid)]
+
+        layer_summary["lambda0"][expert_id] = f"{cache['lambda0']:.12e}"
+        layer_summary["mean_lambda_filter"][expert_id] = f"{self._mean_or_zero(lambda_filter):.12e}"
+        layer_summary["min_lambda_filter"][expert_id] = f"{self._min_or_zero(lambda_filter):.12e}"
+        layer_summary["max_lambda_filter"][expert_id] = f"{self._max_or_zero(lambda_filter):.12e}"
+        layer_summary["mean_lambda_raw"][expert_id] = f"{self._mean_or_zero(lambda_raw):.12e}"
+        layer_summary["min_lambda_raw"][expert_id] = f"{self._min_or_zero(lambda_raw):.12e}"
+        layer_summary["max_lambda_raw"][expert_id] = f"{self._max_or_zero(lambda_raw):.12e}"
+        layer_summary["mean_lambda_final"][expert_id] = f"{self._mean_or_zero(lambda_final):.12e}"
+        layer_summary["min_lambda_final"][expert_id] = f"{self._min_or_zero(lambda_final):.12e}"
+        layer_summary["max_lambda_final"][expert_id] = f"{self._max_or_zero(lambda_final):.12e}"
+        layer_summary["mean_fisher_salience"][expert_id] = f"{self._mean_or_zero(fisher_salience):.12e}"
+        layer_summary["mean_update_consistency"][expert_id] = f"{self._mean_or_zero(update_consistency):.12e}"
+        layer_summary["mean_R"][expert_id] = f"{self._mean_or_zero(R_values):.12e}"
+        layer_summary["min_R"][expert_id] = f"{self._min_or_zero(R_values):.12e}"
+        layer_summary["max_R"][expert_id] = f"{self._max_or_zero(R_values):.12e}"
+        layer_summary["mean_rho"][expert_id] = f"{self._mean_or_zero(rho_values):.12e}"
+        layer_summary["mean_abs_standardized_residual"][expert_id] = f"{self._mean_or_zero(abs_nu_values):.12e}"
+        layer_summary["mean_positive_s"][expert_id] = f"{cache['mean_positive_s']:.12e}"
+        layer_summary["mean_positive_n"][expert_id] = f"{cache['mean_positive_n']:.12e}"
+        layer_summary["mu"][expert_id] = f"{cache['mu_new']:.12e}"
+        layer_summary["P"][expert_id] = f"{cache['P_new']:.12e}"
+        layer_summary["skipped_observations"][expert_id] = int(len(valid) - sum(valid))
+
 
 class ExpertFedAvgAggregator(Aggregator):
     # FL + MoE 专家级 FedAvg：
@@ -205,59 +764,39 @@ class ExpertFedAvgAggregator(Aggregator):
         return float(client_usage[expert_id])
 
 
-class FedWoLFAggregator(Aggregator):
+class FedWoLFAggregator(FedAvgAggregator):
     # FedWoLF 聚合器：
     # - shared / router / classifier 等非 expert 参数仍按客户端样本数做 FedAvg；
     # - fedwolf_fisher_only 的 expert 参数按 raw Fisher score 做旧版加权平均；
     # - fedwolf 的 expert 参数按 sqrt(relative Fisher) 聚合，filter R 使用 evidence active tokens。
-    # - agg_method=fedwolf 时额外吸收 Fisher log evidence 更新 WoLF-IMQ filter state。
-    # - agg_method=fedwolf 时使用 learned/fixed gamma 在 old global expert 和 Theta_bar 之间插值。
-    def __init__(self, args=None, use_wolf_filter=True, use_gamma=True):
+    # - agg_method=fedwolf 时使用 Fisher salience、filter precision、update consistency
+    #   和 old global prior precision 做 client-expert precision fusion。
+    def __init__(self, args=None, use_wolf_filter=True):
         super().__init__(args)
         self.eps = float(getattr(args, "fedwolf_eps", 1e-8))
         self.process_noise_q = float(getattr(args, "fedwolf_process_noise_q", 0.01))
         self.sigma_e2 = float(getattr(args, "fedwolf_sigma_e2", 1.0))
         self.imq_c = float(getattr(args, "fedwolf_imq_c", 1.0))
-        self.gamma_temperature = float(getattr(args, "fedwolf_gamma_temperature", 1.0))
-        self.gamma_mode = str(getattr(args, "fedwolf_gamma_mode", "learned")).strip().lower()
-        self.fixed_gamma = None
-        try:
-            self.gamma_min = float(getattr(args, "fedwolf_gamma_min", 0.0))
-            self.gamma_max = float(getattr(args, "fedwolf_gamma_max", 1.0))
-        except (TypeError, ValueError) as exc:
-            raise ValueError("fedwolf_gamma_min and fedwolf_gamma_max must be convertible to float") from exc
+        self.consistency_min = float(getattr(args, "fedwolf_consistency_min", 0.05))
+        self.lambda_min = float(getattr(args, "fedwolf_lambda_min", 0.05))
+        self.lambda_max = float(getattr(args, "fedwolf_lambda_max", 5.0))
         self.num_experts = getattr(args, "num_experts", None)
         self.use_wolf_filter = use_wolf_filter
-        self.use_gamma = use_gamma
-        self.use_relative_sqrt_fisher_aggregation = bool(use_wolf_filter and use_gamma)
-        if self.use_wolf_filter and self.imq_c <= 0:
+        if self.imq_c <= 0:
             raise ValueError("fedwolf_imq_c must be positive")
-        if self.gamma_temperature <= 0:
-            raise ValueError("fedwolf_gamma_temperature must be positive")
-        if not math.isfinite(self.gamma_min) or not math.isfinite(self.gamma_max):
-            raise ValueError("fedwolf_gamma_min and fedwolf_gamma_max must be finite")
-        if self.gamma_min < 0.0 or self.gamma_min > 1.0:
-            raise ValueError("fedwolf_gamma_min must be in [0, 1]")
-        if self.gamma_max < 0.0 or self.gamma_max > 1.0:
-            raise ValueError("fedwolf_gamma_max must be in [0, 1]")
-        if self.gamma_min > self.gamma_max:
-            raise ValueError("fedwolf_gamma_min must be <= fedwolf_gamma_max")
-        if self.gamma_mode not in {"learned", "fixed"}:
-            raise ValueError("fedwolf_gamma_mode must be either 'learned' or 'fixed'")
-        if self.use_gamma and self.gamma_mode == "fixed":
-            raw_fixed_gamma = getattr(args, "fedwolf_fixed_gamma", None)
-            if raw_fixed_gamma is None:
-                raise ValueError("fedwolf_fixed_gamma must be set when fedwolf_gamma_mode is 'fixed'")
-            try:
-                self.fixed_gamma = float(raw_fixed_gamma)
-            except (TypeError, ValueError) as exc:
-                raise ValueError("fedwolf_fixed_gamma must be convertible to float") from exc
-            if self.fixed_gamma < 0.0 or self.fixed_gamma > 1.0:
-                raise ValueError("fedwolf_fixed_gamma must be in [0, 1]")
+        if self.sigma_e2 <= 0:
+            raise ValueError("fedwolf_sigma_e2 must be positive")
+        if self.process_noise_q < 0:
+            raise ValueError("fedwolf_process_noise_q must be non-negative")
+        if self.consistency_min < 0.0 or self.consistency_min >= 1.0:
+            raise ValueError("fedwolf_consistency_min must satisfy 0 <= value < 1")
+        if self.lambda_min <= 0.0:
+            raise ValueError("fedwolf_lambda_min must be positive")
+        if self.lambda_max < self.lambda_min:
+            raise ValueError("fedwolf_lambda_max must be >= fedwolf_lambda_min")
         self.expert_filter_mu = {}
         self.expert_filter_P = {}
         self.last_filter_summary = {}
-        self.last_gamma_summary = {}
         self.last_aggregation_weight_summary = {}
 
     def aggregate(self, client_updates, client_weights, global_model=None, **kwargs):
@@ -277,18 +816,25 @@ class FedWoLFAggregator(Aggregator):
             raise ValueError("client_stats/expert_weights and client_updates must have the same length")
 
         global_state = global_model.state_dict() if global_model is not None else None
-        if self.use_gamma and global_state is None:
-            raise ValueError("FedWoLF gamma interpolation requires global_model for old expert parameters")
         total_client_weight = sum(client_weights)
         if total_client_weight <= 0:
             raise ValueError("FedWoLF requires positive total client weight")
 
+        expert_state_keys = global_state.keys() if global_state is not None else client_updates[0].keys()
+        expert_param_keys_by_ref = self._collect_expert_param_keys_by_ref(expert_state_keys)
+        precision_cache = {}
         if self.use_wolf_filter:
-            self._update_filter_state(client_updates[0].keys(), client_stats)
+            if global_state is None:
+                raise ValueError("FedWoLF precision fusion requires global_model for old global expert prior")
+            precision_cache = self._prepare_fedwolf_precision_cache(
+                expert_param_keys_by_ref=expert_param_keys_by_ref,
+                client_updates=client_updates,
+                client_stats=client_stats,
+                global_state=global_state,
+            )
+            self.last_filter_summary = self._build_filter_summary_from_precision_cache(precision_cache)
         else:
             self.last_filter_summary = {}
-        self.last_gamma_summary = {}
-        recorded_expert_weight_refs = set()
 
         aggregated_state = collections.OrderedDict()
         for key in client_updates[0].keys():
@@ -297,146 +843,43 @@ class FedWoLFAggregator(Aggregator):
                 aggregated_state[key] = first_value.cpu().clone()
                 continue
 
-            expert_ref = parse_expert_ref_from_key(key)
+            expert_ref = self._parse_expert_ref_from_key(key)
             if expert_ref is None:
-                weights = client_weights
-                total_weight = total_client_weight
-                denominator = total_weight
-            else:
-                layer_id, expert_id = expert_ref
-                raw_scores = [
-                    self._get_fisher_score(client_stat, layer_id, expert_id)
-                    for client_stat in client_stats
-                ]
-                if self.use_relative_sqrt_fisher_aggregation:
-                    mean_s = self._mean_positive(raw_scores)
-                    weights = [
-                        self._sqrt_relative_weight(score, mean_s)
-                        for score in raw_scores
-                    ]
-                else:
-                    # fedwolf_fisher_only 保持旧消融语义：expert 直接按 raw Fisher score 聚合。
-                    weights = raw_scores
-                total_weight = sum(weights)
-                denominator = total_weight + self.eps
-                weight_ref = (str(layer_id), int(expert_id))
-                if weight_ref not in recorded_expert_weight_refs:
-                    self._record_expert_aggregation_weight_summary(
-                        layer_id=layer_id,
-                        expert_id=expert_id,
-                        weights=weights,
-                    )
-                    recorded_expert_weight_refs.add(weight_ref)
-
-            if total_weight <= 0:
-                # 该 expert 本轮没有有效 Fisher evidence 时，保留上一轮 global expert 参数。
-                if global_state is not None:
-                    aggregated_state[key] = global_state[key].detach().cpu().clone()
-                else:
-                    aggregated_state[key] = first_value.cpu().clone()
+                aggregated_state[key] = self._aggregate_fedavg_param(
+                    key=key,
+                    first_value=first_value,
+                    client_updates=client_updates,
+                    client_weights=client_weights,
+                    total_weight=total_client_weight,
+                )
                 continue
 
-            first_on_device = self._to_agg_device(first_value)
-            theta_bar = torch.zeros_like(first_on_device)
-            for update, weight in zip(client_updates, weights):
-                update_tensor = self._to_agg_device(update[key])
-                theta_bar += update_tensor * (weight / denominator)
-
-            if expert_ref is None or not self.use_gamma:
-                aggregated_state[key] = self._to_output_device(theta_bar)
+            if not self.use_wolf_filter:
+                aggregated_state[key] = self._aggregate_fisher_only_expert_param(
+                    key=key,
+                    first_value=first_value,
+                    expert_ref=expert_ref,
+                    client_updates=client_updates,
+                    client_stats=client_stats,
+                    global_state=global_state,
+                )
                 continue
 
-            layer_id, expert_id = expert_ref
-            gamma = self._get_gamma(layer_id, expert_id)
-            theta_old = self._to_agg_device(global_state[key])
-            aggregated_tensor = theta_old * (1.0 - gamma) + theta_bar * gamma
-            aggregated_state[key] = self._to_output_device(aggregated_tensor)
-            self._record_gamma(layer_id, expert_id, gamma, total_weight)
-
-        if self.use_gamma:
-            self._merge_gamma_summary()
-        self._merge_aggregation_weight_summary()
-
+            aggregated_state[key] = self._aggregate_precision_fusion_expert_param(
+                key=key,
+                first_value=first_value,
+                expert_ref=expert_ref,
+                client_updates=client_updates,
+                global_state=global_state,
+                precision_cache=precision_cache,
+            )
         return aggregated_state
 
     def _update_filter_state(self, state_keys, client_stats):
-        expert_refs = sorted(
-            {expert_ref for key in state_keys if (expert_ref := parse_expert_ref_from_key(key)) is not None},
-            key=lambda item: (int(item[0]), item[1]),
+        raise RuntimeError(
+            "_update_filter_state is deprecated. FedWoLF now uses "
+            "_prepare_fedwolf_precision_cache for batch-form state updates."
         )
-        if not expert_refs:
-            self.last_filter_summary = {}
-            return
-
-        layer_sizes = {}
-        for layer_id, expert_id in expert_refs:
-            layer_sizes[layer_id] = max(layer_sizes.get(layer_id, 0), expert_id + 1)
-        if self.num_experts is not None:
-            for layer_id in layer_sizes:
-                layer_sizes[layer_id] = max(layer_sizes[layer_id], int(self.num_experts))
-
-        round_filter_stats = {
-            layer_id: self._new_filter_stat_buffers(size)
-            for layer_id, size in layer_sizes.items()
-        }
-
-        for layer_id, expert_id in expert_refs:
-            self._ensure_filter_state_for_layer(layer_id, layer_sizes[layer_id])
-            raw_scores = [
-                self._get_fisher_score(client_stat, layer_id, expert_id)
-                for client_stat in client_stats
-            ]
-            mean_s = self._mean_positive(raw_scores)
-            active_tokens = [
-                self._get_evidence_active_tokens(client_stat, layer_id, expert_id)
-                for client_stat in client_stats
-            ]
-            mean_n_active = self._mean_positive(active_tokens)
-            mu_current, p_current = predict_expert_state(
-                self.expert_filter_mu[layer_id][expert_id].item(),
-                self.expert_filter_P[layer_id][expert_id].item(),
-                self.process_noise_q,
-            )
-
-            for client_stat, s in zip(client_stats, raw_scores):
-                z = self._get_fisher_log_score(client_stat, layer_id, expert_id)
-                if z is None:
-                    round_filter_stats[layer_id]["skipped_observations"][expert_id] += 1
-                    continue
-                s_agg = self._sqrt_relative_weight(s, mean_s)
-                n_active = self._get_evidence_active_tokens(client_stat, layer_id, expert_id)
-                if n_active is None or mean_n_active <= 0.0:
-                    n_rel = 1.0
-                    n_reliability = 1.0
-                else:
-                    n_rel = max(float(n_active), 0.0) / (mean_n_active + self.eps)
-                    n_reliability = math.sqrt(max(n_rel, 0.0) + self.eps)
-                mu_current, p_current, update_info = wolf_scalar_update(
-                    mu=mu_current,
-                    p=p_current,
-                    observation=z,
-                    score=s,
-                    sigma_e2=self.sigma_e2,
-                    eps=self.eps,
-                    imq_c=self.imq_c,
-                    observation_reliability=n_reliability,
-                )
-                self._add_filter_update_info(
-                    stat_buffers=round_filter_stats[layer_id],
-                    expert_id=expert_id,
-                    update_info=update_info,
-                    score=s,
-                    observation=z,
-                    n_active=n_active,
-                    n_rel=n_rel,
-                    n_reliability=n_reliability,
-                    s_agg=s_agg,
-                )
-
-            self.expert_filter_mu[layer_id][expert_id] = mu_current
-            self.expert_filter_P[layer_id][expert_id] = p_current
-
-        self.last_filter_summary = self._build_filter_summary(round_filter_stats)
 
     def _ensure_filter_state_for_layer(self, layer_id, num_experts):
         layer_id = str(layer_id)
@@ -491,6 +934,9 @@ class FedWoLFAggregator(Aggregator):
         if not math.isfinite(value):
             return default
         return max(value, 0.0)
+
+    def _nonnegative_or_zero(self, value):
+        return self._safe_nonnegative_float(value)
 
     def _add_filter_update_info(
         self,
@@ -645,32 +1091,8 @@ class FedWoLFAggregator(Aggregator):
             }
         return summary
 
-    def _compute_gamma_from_mu(self, mu):
-        if self.gamma_mode == "fixed":
-            return self.fixed_gamma
-        base_gamma = stable_sigmoid(float(mu) / self.gamma_temperature)
-        return self.gamma_min + (self.gamma_max - self.gamma_min) * base_gamma
-
-    def _get_gamma(self, layer_id, expert_id):
-        layer_id = str(layer_id)
-        if layer_id not in self.expert_filter_mu or expert_id >= self.expert_filter_mu[layer_id].numel():
-            return self._compute_gamma_from_mu(0.0)
-        return self._compute_gamma_from_mu(self.expert_filter_mu[layer_id][expert_id].item())
-
-    def _record_gamma(self, layer_id, expert_id, gamma, total_fisher_weight):
-        layer_id = str(layer_id)
-        layer_summary = self.last_gamma_summary.setdefault(
-            layer_id,
-            {"gamma": []},
-        )
-        while len(layer_summary["gamma"]) <= expert_id:
-            layer_summary["gamma"].append("0.000000000000e+00")
-        layer_summary["gamma"][expert_id] = f"{float(gamma):.12e}"
-
     def _get_aggregation_weight_mode(self):
-        if self.use_relative_sqrt_fisher_aggregation:
-            return "sqrt_relative_fisher"
-        return "raw_fisher"
+        return "precision_fusion" if self.use_wolf_filter else "raw_fisher"
 
     def _ensure_summary_slot(self, values, expert_id, default):
         while len(values) <= expert_id:
@@ -720,29 +1142,6 @@ class FedWoLFAggregator(Aggregator):
         for layer_id, aggregation_summary in self.last_aggregation_weight_summary.items():
             self.last_filter_summary.setdefault(layer_id, {}).update(aggregation_summary)
 
-    def _merge_gamma_summary(self):
-        for layer_id, gamma_summary in self.last_gamma_summary.items():
-            non_gamma_summary = {
-                key: value
-                for key, value in gamma_summary.items()
-                if key != "gamma"
-            }
-            if non_gamma_summary:
-                self.last_filter_summary.setdefault(layer_id, {}).update(non_gamma_summary)
-        for layer_id, layer_summary in self.last_filter_summary.items():
-            if layer_id in self.expert_filter_mu:
-                layer_summary["gamma"] = format_scientific_list(
-                    self._compute_gamma_from_mu(value)
-                    for value in self.expert_filter_mu[layer_id].tolist()
-                )
-                layer_summary["gamma_temperature"] = f"{self.gamma_temperature:.12e}"
-                layer_summary["gamma_mode"] = self.gamma_mode
-                layer_summary["fixed_gamma"] = (
-                    "None" if self.fixed_gamma is None else f"{float(self.fixed_gamma):.12e}"
-                )
-                layer_summary["gamma_min"] = f"{self.gamma_min:.12e}"
-                layer_summary["gamma_max"] = f"{self.gamma_max:.12e}"
-
     def _get_fisher_score(self, client_stats, layer_id, expert_id):
         score = self._get_layer_expert_value(
             client_stats=client_stats,
@@ -751,16 +1150,23 @@ class FedWoLFAggregator(Aggregator):
             expert_id=expert_id,
         )
         if score is None:
-            return 0.0
+            return None
         return max(score, 0.0)
 
     def _get_fisher_log_score(self, client_stats, layer_id, expert_id):
-        return self._get_layer_expert_value(
+        log_score = self._get_layer_expert_value(
             client_stats=client_stats,
             field_name="expert_fisher_log_score_by_layer",
             layer_id=layer_id,
             expert_id=expert_id,
         )
+        if log_score is not None:
+            return log_score
+
+        score = self._get_fisher_score(client_stats, layer_id, expert_id)
+        if score is None:
+            return None
+        return math.log1p(max(score, 0.0))
 
     def _get_evidence_active_tokens(self, client_stats, layer_id, expert_id):
         if not isinstance(client_stats, dict):
@@ -860,9 +1266,9 @@ class FedWoLFAggregator(Aggregator):
 
 def build_aggregator(args):
     if args.agg_method == "fedwolf_fisher_only":
-        return FedWoLFAggregator(args, use_wolf_filter=False, use_gamma=False)
+        return FedWoLFAggregator(args, use_wolf_filter=False)
     if args.agg_method == "fedwolf":
-        return FedWoLFAggregator(args, use_wolf_filter=True, use_gamma=True)
+        return FedWoLFAggregator(args, use_wolf_filter=True)
     if args.agg_method == "expert_fedavg":
         return ExpertFedAvgAggregator(args)
     if args.agg_method == "fedavg":
