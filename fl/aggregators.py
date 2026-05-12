@@ -267,6 +267,9 @@ class FedAvgAggregator(Aggregator):
             nu_values = []
             rho_values = []
             lambda_filters = []
+            # Diagnostic only: n_rel/support_values explain the support-derived
+            # observation noise R. Do not multiply them into lambda_raw again,
+            # otherwise activation support would be counted twice.
             for is_valid, z_value, n_value in zip(valid, observations, active_tokens):
                 if not is_valid:
                     R_values.append(0.0)
@@ -381,6 +384,26 @@ class FedAvgAggregator(Aggregator):
                 "P_new": float(p_new),
                 "mean_positive_s": float(mean_positive_s),
                 "mean_positive_n": float(mean_positive_n),
+                "n_rel_values": n_rel_values,
+                "support_values": support_values,
+                "mean_n_rel": self._mean_or_zero(
+                    self._finite_values(n_rel_values, mask=valid)
+                ),
+                "min_n_rel": self._min_or_zero(
+                    self._finite_values(n_rel_values, mask=valid)
+                ),
+                "max_n_rel": self._max_or_zero(
+                    self._finite_values(n_rel_values, mask=valid)
+                ),
+                "mean_support_reliability": self._mean_or_zero(
+                    self._finite_values(support_values, mask=valid)
+                ),
+                "min_support_reliability": self._min_or_zero(
+                    self._finite_values(support_values, mask=valid)
+                ),
+                "max_support_reliability": self._max_or_zero(
+                    self._finite_values(support_values, mask=valid)
+                ),
             }
 
         return precision_cache
@@ -526,6 +549,8 @@ class FedAvgAggregator(Aggregator):
         rho_values = []
         std_residual_values = []
         abs_std_residual_values = []
+        n_rel_values = []
+        support_reliability_values = []
         fisher_salience_values = []
         update_consistency_values = []
         mu_values = []
@@ -546,6 +571,10 @@ class FedAvgAggregator(Aggregator):
             lambda_raw_values.extend(self._finite_values(cache.get("lambda_raw"), mask=valid))
             lambda_final_values.extend(self._finite_values(cache.get("lambda_clients"), mask=valid))
             R_values.extend(self._finite_values(cache.get("R"), mask=valid))
+            n_rel_values.extend(self._finite_values(cache.get("n_rel_values"), mask=valid))
+            support_reliability_values.extend(
+                self._finite_values(cache.get("support_values"), mask=valid)
+            )
             rho_values.extend(self._finite_values(cache.get("rho"), mask=valid))
             std_residual_values.extend(self._finite_values(cache.get("nu"), mask=valid))
             abs_std_residual_values.extend(
@@ -580,6 +609,12 @@ class FedAvgAggregator(Aggregator):
         summary["mean_R"] = self._mean_or_zero(R_values)
         summary["min_R"] = self._min_or_zero(R_values)
         summary["max_R"] = self._max_or_zero(R_values)
+        summary["mean_n_rel"] = self._mean_or_zero(n_rel_values)
+        summary["min_n_rel"] = self._min_or_zero(n_rel_values)
+        summary["max_n_rel"] = self._max_or_zero(n_rel_values)
+        summary["mean_support_reliability"] = self._mean_or_zero(support_reliability_values)
+        summary["min_support_reliability"] = self._min_or_zero(support_reliability_values)
+        summary["max_support_reliability"] = self._max_or_zero(support_reliability_values)
         summary["mean_rho"] = self._mean_or_zero(rho_values)
         summary["min_rho"] = self._min_or_zero(rho_values)
         summary["max_rho"] = self._max_or_zero(rho_values)

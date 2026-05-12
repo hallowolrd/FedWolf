@@ -376,12 +376,17 @@ class Server:
         if total_size <= 0:
             raise ValueError("FedAvg requires at least one training sample across clients")
 
-        fedavg_state = self.aggregator.aggregate(
-            client_updates=client_states,
-            client_weights=client_sizes,
-            global_model=self.model,
-            expert_weights=getattr(self, "last_client_expert_usages", None),
-        )
+        aggregate_kwargs = {
+            "client_updates": client_states,
+            "client_weights": client_sizes,
+            "global_model": self.model,
+        }
+        if self.args.agg_method == "fedwolf":
+            aggregate_kwargs["client_stats"] = getattr(self, "last_client_expert_usages", None)
+        else:
+            aggregate_kwargs["expert_weights"] = getattr(self, "last_client_expert_usages", None)
+
+        fedavg_state = self.aggregator.aggregate(**aggregate_kwargs)
         self.model.load_state_dict(fedavg_state)
         self.logger.info(f"--aggregation_method : {self.args.agg_method}\n")
         self.logger.info(f"--client_train_sizes : {client_sizes}\n")
@@ -397,6 +402,12 @@ class Server:
                     "mean_lambda_raw",
                     "mean_lambda_final",
                     "mean_R",
+                    "mean_n_rel",
+                    "min_n_rel",
+                    "max_n_rel",
+                    "mean_support_reliability",
+                    "min_support_reliability",
+                    "max_support_reliability",
                     "mean_rho",
                     "mean_std_residual",
                     "mean_abs_standardized_residual",
