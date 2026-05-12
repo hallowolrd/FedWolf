@@ -332,7 +332,7 @@ FedWoLF 日志中可观察：
   - `mean_P`
   - `skipped_observations`
 
-  其中 `mean_s_agg` / `total_s_agg_weight` 以及各类 `min/max` 诊断字段也会保留在 summary 字典里，用于更细的 expert 权重分析，但默认日志行只展开上面的核心字段。
+  summary 字典会保留上面的核心字段，以及若干精简的 min/max 诊断项；默认日志行只展开这些核心字段。
 
 ## references 边界
 

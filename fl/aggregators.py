@@ -500,11 +500,6 @@ class FedAvgAggregator(Aggregator):
             "mean_lambda_final": 0.0,
             "min_lambda_final": 0.0,
             "max_lambda_final": 0.0,
-            "mean_s_agg": 0.0,
-            "total_s_agg_weight": 0.0,
-            "min_s_agg": 0.0,
-            "max_s_agg": 0.0,
-            "positive_s_agg_clients": 0,
             "mean_R": 0.0,
             "min_R": 0.0,
             "max_R": 0.0,
@@ -582,11 +577,6 @@ class FedAvgAggregator(Aggregator):
         summary["mean_lambda_final"] = self._mean_or_zero(lambda_final_values)
         summary["min_lambda_final"] = self._min_or_zero(lambda_final_values)
         summary["max_lambda_final"] = self._max_or_zero(lambda_final_values)
-        summary["mean_s_agg"] = summary["mean_lambda_final"]
-        summary["total_s_agg_weight"] = sum(lambda_final_values) if lambda_final_values else 0.0
-        summary["min_s_agg"] = self._min_or_zero(lambda_final_values)
-        summary["max_s_agg"] = self._max_or_zero(lambda_final_values)
-        summary["positive_s_agg_clients"] = int(sum(1 for value in lambda_final_values if value > 0.0))
         summary["mean_R"] = self._mean_or_zero(R_values)
         summary["min_R"] = self._min_or_zero(R_values)
         summary["max_R"] = self._max_or_zero(R_values)
@@ -753,10 +743,15 @@ class ExpertFedAvgAggregator(Aggregator):
 class FedWoLFAggregator(FedAvgAggregator):
     # FedWoLF 聚合器：
     # - shared / router / classifier 等非 expert 参数仍按客户端样本数做 FedAvg；
-    # - fedwolf_fisher_only 的 expert 参数按 raw Fisher score 做旧版加权平均；
-    # - fedwolf 的 expert 参数按 sqrt(relative Fisher) 聚合，filter R 使用 evidence active tokens。
-    # - agg_method=fedwolf 时使用 Fisher salience、filter precision、update consistency
-    #   和 old global prior precision 做 client-expert precision fusion。
+    # - fedwolf_fisher_only 的 expert 参数按 raw Fisher score 做 Fisher-only baseline；
+    # - fedwolf 的 expert 参数使用 client-expert precision fusion：
+    #   Fisher salience × filter reliability × leave-one-out update consistency，
+    #   再 normalize + clip，并与 old global prior precision lambda0 融合。
+    #
+    # 注意：
+    # - fedwolf 不再使用旧的插值路径。
+    # - Fisher salience 只是最终 client-expert precision 的一个因子。
+    # - filter 输出 lambda_filter。
     def __init__(self, args=None, use_wolf_filter=True):
         super().__init__(args)
         self.eps = float(getattr(args, "fedwolf_eps", 1e-8))

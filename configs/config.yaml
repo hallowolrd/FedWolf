@@ -213,3 +213,10 @@ train:
 
   # WoLF-IMQ 鲁棒权重尺度 c；越小越容易对残差大的 evidence 降权
   fedwolf_imq_c: 1.0
+
+  # FedWoLF precision fusion: update consistency 的最低保留权重，避免 non-IID 少数派客户端被完全压成 0
+  fedwolf_consistency_min: 0.05
+
+  # FedWoLF precision fusion: normalized client-expert precision 的裁剪范围
+  fedwolf_lambda_min: 0.05
+  fedwolf_lambda_max: 5.0
