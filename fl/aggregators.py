@@ -547,6 +547,8 @@ class FedAvgAggregator(Aggregator):
             "mean_lambda_final": 0.0,
             "min_lambda_final": 0.0,
             "max_lambda_final": 0.0,
+            "lambda_at_min_clip_fraction": 0.0,
+            "lambda_at_max_clip_fraction": 0.0,
             "mean_R": 0.0,
             "min_R": 0.0,
             "max_R": 0.0,
@@ -561,8 +563,22 @@ class FedAvgAggregator(Aggregator):
             "max_rho": 0.0,
             "mean_std_residual": 0.0,
             "mean_abs_standardized_residual": 0.0,
+            "min_abs_standardized_residual": 0.0,
+            "max_abs_standardized_residual": 0.0,
             "mean_fisher_salience": 0.0,
+            "min_fisher_salience": 0.0,
+            "max_fisher_salience": 0.0,
             "mean_update_consistency": 0.0,
+            "min_update_consistency": 0.0,
+            "max_update_consistency": 0.0,
+            "mean_positive_s": 0.0,
+            "min_mean_positive_s": 0.0,
+            "max_mean_positive_s": 0.0,
+            "mean_positive_n": 0.0,
+            "min_mean_positive_n": 0.0,
+            "max_mean_positive_n": 0.0,
+            "low_consistency_fraction": 0.0,
+            "rho_low_fraction": 0.0,
             "mean_mu": 0.0,
             "mean_P": 0.0,
             "skipped_observations": 0,
@@ -576,6 +592,8 @@ class FedAvgAggregator(Aggregator):
         lambda_raw_values = []
         lambda_final_values = []
         old_prior_fraction_values = []
+        mean_positive_s_values = []
+        mean_positive_n_values = []
         R_values = []
         rho_values = []
         std_residual_values = []
@@ -627,6 +645,12 @@ class FedAvgAggregator(Aggregator):
             p_new = safe_float(cache.get("P_new"), default=None)
             if p_new is not None:
                 P_values.append(p_new)
+            mean_positive_s = safe_float(cache.get("mean_positive_s"), default=None)
+            if mean_positive_s is not None:
+                mean_positive_s_values.append(mean_positive_s)
+            mean_positive_n = safe_float(cache.get("mean_positive_n"), default=None)
+            if mean_positive_n is not None:
+                mean_positive_n_values.append(mean_positive_n)
 
             skipped_observations += int(len(valid) - sum(valid))
 
@@ -644,6 +668,12 @@ class FedAvgAggregator(Aggregator):
         summary["mean_lambda_final"] = self._mean_or_zero(lambda_final_values)
         summary["min_lambda_final"] = self._min_or_zero(lambda_final_values)
         summary["max_lambda_final"] = self._max_or_zero(lambda_final_values)
+        summary["lambda_at_min_clip_fraction"] = self._fraction_or_zero(
+            lambda_final_values, lambda value: value <= self.lambda_min + self.eps
+        )
+        summary["lambda_at_max_clip_fraction"] = self._fraction_or_zero(
+            lambda_final_values, lambda value: value >= self.lambda_max - self.eps
+        )
         summary["mean_R"] = self._mean_or_zero(R_values)
         summary["min_R"] = self._min_or_zero(R_values)
         summary["max_R"] = self._max_or_zero(R_values)
@@ -656,14 +686,39 @@ class FedAvgAggregator(Aggregator):
         summary["mean_rho"] = self._mean_or_zero(rho_values)
         summary["min_rho"] = self._min_or_zero(rho_values)
         summary["max_rho"] = self._max_or_zero(rho_values)
+        summary["rho_low_fraction"] = self._fraction_or_zero(
+            rho_values, lambda value: value < 0.5
+        )
         summary["mean_std_residual"] = self._mean_or_zero(std_residual_values)
         summary["mean_abs_standardized_residual"] = self._mean_or_zero(abs_std_residual_values)
+        summary["min_abs_standardized_residual"] = self._min_or_zero(abs_std_residual_values)
+        summary["max_abs_standardized_residual"] = self._max_or_zero(abs_std_residual_values)
         summary["mean_fisher_salience"] = self._mean_or_zero(fisher_salience_values)
+        summary["min_fisher_salience"] = self._min_or_zero(fisher_salience_values)
+        summary["max_fisher_salience"] = self._max_or_zero(fisher_salience_values)
         summary["mean_update_consistency"] = self._mean_or_zero(update_consistency_values)
+        summary["min_update_consistency"] = self._min_or_zero(update_consistency_values)
+        summary["max_update_consistency"] = self._max_or_zero(update_consistency_values)
+        summary["mean_positive_s"] = self._mean_or_zero(mean_positive_s_values)
+        summary["min_mean_positive_s"] = self._min_or_zero(mean_positive_s_values)
+        summary["max_mean_positive_s"] = self._max_or_zero(mean_positive_s_values)
+        summary["mean_positive_n"] = self._mean_or_zero(mean_positive_n_values)
+        summary["min_mean_positive_n"] = self._min_or_zero(mean_positive_n_values)
+        summary["max_mean_positive_n"] = self._max_or_zero(mean_positive_n_values)
+        summary["low_consistency_fraction"] = self._fraction_or_zero(
+            update_consistency_values,
+            lambda value: value <= self.consistency_min + self.eps,
+        )
         summary["mean_mu"] = self._mean_or_zero(mu_values)
         summary["mean_P"] = self._mean_or_zero(P_values)
         summary["skipped_observations"] = skipped_observations
         return summary
+
+    def _fraction_or_zero(self, values, predicate):
+        finite = [float(v) for v in values if math.isfinite(float(v))]
+        if not finite:
+            return 0.0
+        return sum(1 for value in finite if predicate(value)) / float(len(finite))
 
 
 class ExpertFedAvgAggregator(Aggregator):
