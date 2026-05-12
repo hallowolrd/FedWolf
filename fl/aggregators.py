@@ -779,7 +779,9 @@ class FedWoLFAggregator(Aggregator):
         if not isinstance(stats_by_layer, dict):
             return None
 
-        layer_stats = stats_by_layer.get(str(layer_id), {})
+        layer_stats = self._get_value_by_id(stats_by_layer, layer_id)
+        if layer_stats is None:
+            layer_stats = {}
         if not isinstance(layer_stats, dict):
             return None
 
@@ -796,16 +798,49 @@ class FedWoLFAggregator(Aggregator):
             return None
 
         value_by_layer = client_stats.get(field_name, {})
-        layer_values = value_by_layer.get(str(layer_id))
+        if not isinstance(value_by_layer, dict):
+            return None
+
+        layer_values = self._get_value_by_id(value_by_layer, layer_id)
         if layer_values is None:
             return None
 
         return self._get_expert_value_from_sequence(layer_values, expert_id)
 
+    def _get_value_by_id(self, mapping, key):
+        if not isinstance(mapping, dict):
+            return None
+
+        candidates = [key, str(key)]
+        try:
+            candidates.append(int(key))
+        except (TypeError, ValueError):
+            pass
+
+        seen = set()
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if candidate in mapping:
+                return mapping[candidate]
+        return None
+
     def _get_expert_value_from_sequence(self, values, expert_id):
         if values is None:
             return None
-        if torch.is_tensor(values):
+        try:
+            expert_id = int(expert_id)
+        except (TypeError, ValueError):
+            return None
+        if expert_id < 0:
+            return None
+
+        if isinstance(values, dict):
+            value = self._get_value_by_id(values, expert_id)
+            if value is None:
+                return None
+        elif torch.is_tensor(values):
             flat_values = values.detach().cpu().flatten()
             if expert_id >= flat_values.numel():
                 return None

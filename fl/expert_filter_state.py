@@ -1,7 +1,26 @@
 import math
 
+import torch
 
-def _safe_float(value, default=0.0):
+
+def safe_float(value, default=0.0):
+    """
+    Convert value to a finite Python float.
+
+    Returns default if value is None, cannot be converted, or is not finite.
+    """
+
+    if value is None:
+        return default
+
+    if torch.is_tensor(value):
+        if value.numel() != 1:
+            return default
+        try:
+            value = value.detach().float().item()
+        except (RuntimeError, TypeError, ValueError):
+            return default
+
     try:
         value = float(value)
     except (TypeError, ValueError):
@@ -11,23 +30,157 @@ def _safe_float(value, default=0.0):
     return value
 
 
-def predict_expert_state(mu_prev, p_prev, q):
-    mu_pred = _safe_float(mu_prev)
-    p_pred = max(_safe_float(p_prev, default=1.0), 1e-12) + max(_safe_float(q), 0.0)
+def predict_expert_state(mu_prev, p_prev, q, eps=1e-12):
+    """
+    Random-walk prediction step for one expert evidence state.
+
+    mu_pred = mu_prev
+    P_pred = P_prev + q
+    """
+
+    eps = max(safe_float(eps, default=1e-12), 1e-12)
+    mu_pred = safe_float(mu_prev, default=0.0)
+    p_prev = safe_float(p_prev, default=1.0)
+    q = safe_float(q, default=0.0)
+
+    p_prev = max(p_prev, eps)
+    q = max(q, 0.0)
+    p_pred = max(p_prev + q, eps)
     return mu_pred, p_pred
 
 
+def compute_support_noise(n_active, mean_positive_n, sigma_e2, eps=1e-12):
+    """
+    Compute activation-support-derived observation noise.
+
+    n_active: activation support for client m and expert k.
+    mean_positive_n: mean positive activation support among selected clients for this expert.
+    sigma_e2: base observation noise.
+    """
+
+    eps = max(safe_float(eps, default=1e-12), 1e-12)
+    n_active = safe_float(n_active, default=None)
+    mean_positive_n = safe_float(mean_positive_n, default=0.0)
+    sigma_e2 = max(safe_float(sigma_e2, default=1.0), eps)
+
+    if n_active is None or n_active <= 0.0 or mean_positive_n <= 0.0:
+        n_rel = 0.0
+    else:
+        n_rel = n_active / (mean_positive_n + eps)
+
+    support_reliability = math.sqrt(max(n_rel, 0.0) + eps)
+    r = sigma_e2 / (support_reliability + eps)
+    if not math.isfinite(r) or r <= 0.0:
+        r = sigma_e2 / eps
+    return r, n_rel, support_reliability
+
+
+def compute_standardized_residual(observation, mu_pred, p_pred, R, eps=1e-12):
+    """
+    Compute standardized residual for robust filtering.
+
+    nu = (z - mu_pred) / sqrt(P_pred + R + eps)
+    """
+
+    eps = max(safe_float(eps, default=1e-12), 1e-12)
+    z = safe_float(observation, default=0.0)
+    mu_pred = safe_float(mu_pred, default=0.0)
+    p_pred = max(safe_float(p_pred, default=1.0), eps)
+    R = max(safe_float(R, default=1.0), eps)
+
+    denom = math.sqrt(p_pred + R + eps)
+    if not math.isfinite(denom) or denom <= 0.0:
+        return 0.0
+    nu = (z - mu_pred) / denom
+    if not math.isfinite(nu):
+        return 0.0
+    return nu
+
+
+def compute_imq_weight(standardized_residual, imq_c, eps=1e-12):
+    """
+    Compute IMQ robust weight from standardized residual.
+
+    rho = (1 + nu^2 / c^2)^(-1/2)
+    """
+
+    eps = max(safe_float(eps, default=1e-12), 1e-12)
+    nu = safe_float(standardized_residual, default=0.0)
+    c = max(safe_float(imq_c, default=1.0), eps)
+    rho = (1.0 + (nu * nu) / (c * c + eps)) ** -0.5
+    if not math.isfinite(rho):
+        return 1.0
+    return min(max(rho, 0.0), 1.0)
+
+
+def compute_filter_precision(rho, R, eps=1e-12):
+    """
+    Compute evidence reliability precision.
+
+    lambda_filter = rho^2 / (R + eps)
+    """
+
+    eps = max(safe_float(eps, default=1e-12), 1e-12)
+    rho = safe_float(rho, default=1.0)
+    rho = min(max(rho, 0.0), 1.0)
+    R = max(safe_float(R, default=1.0), eps)
+
+    lambda_filter = (rho * rho) / (R + eps)
+    if not math.isfinite(lambda_filter) or lambda_filter < 0.0:
+        return 0.0
+    return lambda_filter
+
+
+def batch_update_filter_state(mu_pred, p_pred, observations, lambda_filters, eps=1e-12):
+    """
+    Batch-form precision update for one expert evidence state.
+
+    P_new = 1 / (1 / P_pred + sum_m lambda_filter_m)
+    mu_new = P_new * (mu_pred / P_pred + sum_m lambda_filter_m * z_m)
+    """
+
+    eps = max(safe_float(eps, default=1e-12), 1e-12)
+    mu_pred = safe_float(mu_pred, default=0.0)
+    p_pred = max(safe_float(p_pred, default=1.0), eps)
+
+    valid_pairs = []
+    for observation, lambda_filter in zip(observations or [], lambda_filters or []):
+        z = safe_float(observation, default=None)
+        lam = safe_float(lambda_filter, default=0.0)
+        if z is None or lam <= 0.0:
+            continue
+        valid_pairs.append((z, lam))
+
+    if not valid_pairs:
+        return mu_pred, p_pred
+
+    prior_precision = 1.0 / (p_pred + eps)
+    posterior_precision = prior_precision + sum(lam for _, lam in valid_pairs)
+    if not math.isfinite(posterior_precision) or posterior_precision <= 0.0:
+        return mu_pred, p_pred
+
+    p_new = max(1.0 / (posterior_precision + eps), eps)
+    mu_numer = mu_pred / (p_pred + eps)
+    for z, lam in valid_pairs:
+        mu_numer += lam * z
+
+    mu_new = p_new * mu_numer
+    if not math.isfinite(mu_new) or not math.isfinite(p_new):
+        return mu_pred, p_pred
+    return mu_new, p_new
+
+
 def compute_observation_noise(score, sigma_e2, eps):
-    score = max(_safe_float(score), 0.0)
-    sigma_e2 = max(_safe_float(sigma_e2, default=1.0), 1e-12)
-    eps = max(_safe_float(eps, default=1e-8), 1e-12)
+    """Deprecated: old Fisher-score-derived observation noise.
+
+    New FedWoLF should use compute_support_noise(), which derives observation
+    noise from activation support rather than Fisher score.
+    """
+
+    score = max(safe_float(score), 0.0)
+    sigma_e2 = max(safe_float(sigma_e2, default=1.0), 1e-12)
+    eps = max(safe_float(eps, default=1e-8), 1e-12)
     return sigma_e2 / (score + eps)
-
-
-def compute_imq_weight(residual, imq_c):
-    residual = _safe_float(residual)
-    imq_c = max(_safe_float(imq_c, default=1.0), 1e-12)
-    return (1.0 + (residual * residual) / (imq_c * imq_c)) ** -0.5
 
 
 def wolf_scalar_update(
@@ -40,29 +193,16 @@ def wolf_scalar_update(
     imq_c,
     observation_reliability=None,
 ):
-    """One-dimensional WoLF-IMQ update for a scalar expert evidence state."""
+    """Deprecated sequential update wrapper.
 
-    mu = _safe_float(mu)
-    p = max(_safe_float(p, default=1.0), 1e-12)
-    observation = _safe_float(observation)
-    noise_score = score if observation_reliability is None else observation_reliability
-    noise_score = max(_safe_float(noise_score), 0.0)
-    r = compute_observation_noise(noise_score, sigma_e2, eps)
-    residual = observation - mu
-    weight = compute_imq_weight(residual, imq_c)
+    New FedWoLF should use predict_expert_state(), compute_support_noise(),
+    compute_standardized_residual(), compute_imq_weight(),
+    compute_filter_precision(), and batch_update_filter_state().
+    """
 
-    obs_precision = (weight * weight) / r
-    precision_new = 1.0 / p + obs_precision
-    p_new = 1.0 / precision_new
-    kalman_gain = p_new * obs_precision
-    mu_new = mu + kalman_gain * residual
-
-    return mu_new, max(p_new, 1e-12), {
-        "R": r,
-        "residual": residual,
-        "weight": weight,
-        "kalman_gain": kalman_gain,
-        "obs_precision": obs_precision,
-        "noise_score": noise_score,
-        "observation_reliability": noise_score,
-    }
+    raise RuntimeError(
+        "wolf_scalar_update is deprecated. Use predict_expert_state, "
+        "compute_support_noise, compute_standardized_residual, "
+        "compute_imq_weight, compute_filter_precision, and "
+        "batch_update_filter_state instead."
+    )
