@@ -185,8 +185,12 @@ class FedAvgAggregator(Aggregator):
 
         theta_old = self._to_agg_device(global_state[key])
         lambda0 = max(float(cache["lambda0"]), 0.0)
-        numerator = theta_old * lambda0
-        denominator = lambda0
+        if self.use_old_prior:
+            numerator = theta_old * lambda0
+            denominator = lambda0
+        else:
+            numerator = torch.zeros_like(theta_old)
+            denominator = 0.0
         valid_client_count = 0
 
         for update, lambda_client in zip(client_updates, cache["lambda_clients"]):
@@ -367,8 +371,16 @@ class FedAvgAggregator(Aggregator):
                     for value, is_valid in zip(lambda_raw, valid)
                 ]
 
+            sum_lambda_clients = sum(lambda_clients)
+            if self.use_old_prior:
+                old_prior_fraction = lambda0 / (lambda0 + sum_lambda_clients + self.eps)
+            else:
+                old_prior_fraction = 0.0
+
             precision_cache[(layer_id, expert_id)] = {
                 "lambda0": float(lambda0),
+                "use_old_prior": bool(self.use_old_prior),
+                "old_prior_fraction": float(old_prior_fraction),
                 "lambda_clients": lambda_clients,
                 "lambda_filter": lambda_filters,
                 "lambda_raw": lambda_raw,
@@ -513,7 +525,11 @@ class FedAvgAggregator(Aggregator):
             "num_experts": 0,
             "num_valid_experts": 0,
             "aggregation_weight_mode": self._get_aggregation_weight_mode(),
+            "use_old_prior": bool(self.use_old_prior),
             "lambda0": 0.0,
+            "mean_old_prior_fraction": 0.0,
+            "min_old_prior_fraction": 0.0,
+            "max_old_prior_fraction": 0.0,
             "mean_lambda_filter": 0.0,
             "min_lambda_filter": 0.0,
             "max_lambda_filter": 0.0,
@@ -551,6 +567,7 @@ class FedAvgAggregator(Aggregator):
         lambda_filter_values = []
         lambda_raw_values = []
         lambda_final_values = []
+        old_prior_fraction_values = []
         R_values = []
         rho_values = []
         std_residual_values = []
@@ -576,6 +593,9 @@ class FedAvgAggregator(Aggregator):
             lambda_filter_values.extend(self._finite_values(cache.get("lambda_filter"), mask=valid))
             lambda_raw_values.extend(self._finite_values(cache.get("lambda_raw"), mask=valid))
             lambda_final_values.extend(self._finite_values(cache.get("lambda_clients"), mask=valid))
+            old_prior_fraction = safe_float(cache.get("old_prior_fraction"), default=None)
+            if old_prior_fraction is not None:
+                old_prior_fraction_values.append(old_prior_fraction)
             R_values.extend(self._finite_values(cache.get("R"), mask=valid))
             n_rel_values.extend(self._finite_values(cache.get("n_rel_values"), mask=valid))
             support_reliability_values.extend(
@@ -603,6 +623,10 @@ class FedAvgAggregator(Aggregator):
             skipped_observations += int(len(valid) - sum(valid))
 
         summary["lambda0"] = self._mean_or_zero(lambda0_values)
+        summary["use_old_prior"] = bool(self.use_old_prior)
+        summary["mean_old_prior_fraction"] = self._mean_or_zero(old_prior_fraction_values)
+        summary["min_old_prior_fraction"] = self._min_or_zero(old_prior_fraction_values)
+        summary["max_old_prior_fraction"] = self._max_or_zero(old_prior_fraction_values)
         summary["mean_lambda_filter"] = self._mean_or_zero(lambda_filter_values)
         summary["min_lambda_filter"] = self._min_or_zero(lambda_filter_values)
         summary["max_lambda_filter"] = self._max_or_zero(lambda_filter_values)
@@ -738,6 +762,7 @@ class FedWoLFAggregator(FedAvgAggregator):
         self.consistency_min = float(getattr(args, "fedwolf_consistency_min", 0.05))
         self.lambda_min = float(getattr(args, "fedwolf_lambda_min", 0.05))
         self.lambda_max = float(getattr(args, "fedwolf_lambda_max", 5.0))
+        self.use_old_prior = bool(getattr(args, "fedwolf_use_old_prior", False))
         self.num_experts = getattr(args, "num_experts", None)
         self.use_wolf_filter = use_wolf_filter
         if self.imq_c <= 0:
