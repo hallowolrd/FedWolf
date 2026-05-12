@@ -151,7 +151,9 @@ train:
   # - fedavg: 全模型按客户端样本数做 FedAvg
   # - expert_fedavg: shared/router 按样本数 FedAvg，expert 按 expert usage/token usage 加权
   # - fedwolf_fisher_only: shared/router FedAvg，expert 按 raw Fisher score s 聚合，不使用 WoLF filter，作为旧 Fisher-only baseline
-  # - fedwolf: 完整 FedWoLF；expert 按 sqrt(relative Fisher) 聚合，filter R 使用 evidence active token 的 sqrt(relative usage)
+  # - fedwolf: 完整 FedWoLF；shared/router 按样本数 FedAvg，expert 使用 client-expert precision fusion：
+  #   Fisher salience × filter reliability × leave-one-out update consistency，
+  #   再 normalize + clip，并与 old global prior precision lambda0 融合。
   agg_method: fedwolf
 
   # 聚合设备：
@@ -211,4 +213,3 @@ train:
 
   # WoLF-IMQ 鲁棒权重尺度 c；越小越容易对残差大的 evidence 降权
   fedwolf_imq_c: 1.0
-

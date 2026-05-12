@@ -47,7 +47,108 @@ python train.py
 手动指定其他配置：
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 python train.py --config configs/test1/config.yaml
+请你检查当前仓库 commit 6b824106032737cfcb453afe98d18f6c625d88b0 的 fl/aggregators.py，不要凭缓存读取。
+
+目标：确认当前 FedWoLF 是否真正完全使用新版 client-expert precision fusion，并清理旧插值 / old Kalman summary 残留。
+
+请重点检查：
+
+1. agg_method=fedwolf 的 expert 参数聚合是否只使用：
+
+   lambda0 = 1 / (P_pred + eps)
+
+   theta_new =
+       (lambda0 * theta_old + sum_m lambda_m * theta_m)
+       /
+       (lambda0 + sum_m lambda_m + eps)
+
+   其中 lambda_m 来自：
+       Fisher salience a
+       lambda_filter = rho^2 / (R + eps)
+       leave-one-out update consistency c_upd
+       lambda_raw = a * lambda_filter * c_upd
+       lambda_final = normalize + clip(lambda_raw)
+
+2. 确认 fedwolf 主路径中没有：
+   旧插值式 expert update
+   旧的插值 helper
+   旧的 scalar filter helper
+   sequential client-by-client filter update
+
+3. 检查 fl/aggregators.py 中是否还有旧 summary 函数或字段：
+
+   _new_filter_stat_buffers
+   _add_filter_update_info
+   _build_filter_summary
+   mean_kalman_gain
+   max_kalman_gain
+   mean_abs_residual
+   mean_weight
+   mean_imq_weight
+   weight_sum
+   kalman_gain_sum
+
+这些旧 Kalman summary 残留应当删除；新版 summary 只从 per-expert precision_cache 构造。
+
+如果这些只是废弃残留，请删除。
+如果还在被调用，请改成从 precision_cache 构造新版 summary。
+
+4. 新版 summary 必须从 per-expert precision_cache 统计，不要按每个 expert 参数 tensor 重复统计。
+
+必须输出字段：
+
+   lambda0
+   mean_lambda_filter
+   mean_lambda_raw
+   mean_lambda_final
+   mean_R
+   mean_rho
+   mean_std_residual
+   mean_abs_standardized_residual
+   mean_fisher_salience
+   mean_update_consistency
+   mean_mu
+   mean_P
+   skipped_observations
+
+5. 修改 configs/config.yaml 里的 fedwolf 注释。
+
+把旧注释：
+
+   fedwolf: 完整 FedWoLF；expert 按 sqrt(relative Fisher) 聚合，filter R 使用 evidence active token 的 sqrt(relative usage)
+
+改成：
+
+   fedwolf: 完整 FedWoLF；shared/router 按样本数 FedAvg，expert 使用 client-expert precision fusion：
+   Fisher salience × filter reliability × leave-one-out update consistency，
+   再 normalize + clip，并与 old global prior precision lambda0 融合。
+
+6. 修改 README.md 中旧的 mean_kalman_gain 诊断建议。
+
+不要再建议看 mean_kalman_gain。
+改成看：
+
+   mean_lambda_filter
+   mean_lambda_final
+   mean_R
+   mean_rho
+   mean_abs_standardized_residual
+   mean_R
+   mean_rho
+   mean_abs_standardized_residual
+
+7. 最后运行：
+
+   python -m py_compile fl/aggregators.py fl/expert_filter_state.py fl/server.py fl/client.py fl/expert_evidence.py train.py
+
+如果 py_compile 不通过，请修到通过。
+
+完成后请明确输出：
+- fedwolf 主路径是否已经完全没有旧插值
+- expert fusion 是否使用 lambda0 + lambda_clients
+- filter summary 是否已经完全来自 precision_cache
+- 是否删除旧 Kalman/插值 summary 残留
+- py_compile 是否通过
 ```
 
 输出目录由 `config.yaml` 的 `train.save_root` 和 `train.run_name` 自动派生：
@@ -349,7 +450,7 @@ FedWoLF 日志中可观察：
 - evidence pass 不使用 `torch.no_grad()`，不执行 `optimizer.step()`，不会更新模型参数；结束后会恢复进入 evidence 前的 `model.training` 状态。
 - 当前 expert evidence 使用 supervised cross-entropy loss 计算 per-sample empirical Fisher；`router_aux_loss` / `router_z_loss` 是 batch-level auxiliary losses，不纳入 expert Fisher。直接把 batch-level scalar 加到每个 sample loss 会重复计入 batch size 次并破坏 Fisher 尺度，而且当前 evidence 只针对 `blocks.*.ffn.experts.*` expert 参数。
 - Fisher score mode 只改变客户端上传的 scalar `s` 的尺度，不改变 server-side FedWoLF 的 `R`、IMQ、`mu/P` 或 expert precision fusion。
-- 如果日志里 `mean_s` 只有 `1e-12` 到 `1e-9`、`mean_R` 达到 `1e7` 以上、`mean_kalman_gain` 接近 0、`mu` 长期接近 0，可以做 score mode 尺度消融。`trace_per_active_sample` 对 top-1 MoE 通常更适合作为优先消融，因为每个 expert 只在部分样本上被路由激活。
+- 如果日志里 `mean_lambda_filter` 很低、`mean_lambda_final` 很低、`mean_R` 达到 `1e7` 以上、`mean_rho` 长期很小、`mean_abs_standardized_residual` 很大、`mu` 长期接近 0，可以做 score mode 尺度消融。`trace_per_active_sample` 对 top-1 MoE 通常更适合作为优先消融，因为每个 expert 只在部分样本上被路由激活。
 - 某些 expert 的 Fisher score 可能为 0；此时该 expert 保留旧 global 参数。
 - `mu/P` 当前只存在内存中；断点续训如果只恢复 `server.pth`，filter state 会丢失。
 - FedWoLF 当前只输出 precision fusion 诊断字段；旧插值相关超参已经删除，当前只使用 client-expert precision fusion。

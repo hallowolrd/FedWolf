@@ -30,20 +30,6 @@ def parse_expert_ref_from_key(key):
     return parts[blocks_idx + 1], int(parts[experts_idx + 1])
 
 
-def stable_sigmoid(value):
-    value = float(value)
-    if math.isnan(value):
-        return 0.5
-    if value >= 0:
-        return 1.0 / (1.0 + math.exp(-value))
-    exp_value = math.exp(value)
-    return exp_value / (1.0 + exp_value)
-
-
-def format_scientific_list(values):
-    return [f"{float(value):.12e}" for value in values]
-
-
 def resolve_aggregation_device(args):
     raw_device = getattr(args, "aggregation_device", "cpu")
     if raw_device is None:
@@ -797,11 +783,8 @@ class FedWoLFAggregator(FedAvgAggregator):
         self.expert_filter_mu = {}
         self.expert_filter_P = {}
         self.last_filter_summary = {}
-        self.last_aggregation_weight_summary = {}
 
     def aggregate(self, client_updates, client_weights, global_model=None, **kwargs):
-        self.last_aggregation_weight_summary = {}
-
         if len(client_updates) == 0:
             raise ValueError("FedWoLF requires at least one client update")
         if len(client_updates) != len(client_weights):
@@ -897,35 +880,6 @@ class FedWoLFAggregator(FedAvgAggregator):
         self.expert_filter_mu[layer_id] = torch.cat([self.expert_filter_mu[layer_id], mu_padding])
         self.expert_filter_P[layer_id] = torch.cat([self.expert_filter_P[layer_id], p_padding])
 
-    def _new_filter_stat_buffers(self, num_experts):
-        return {
-            "count": torch.zeros(num_experts, dtype=torch.float32),
-            "score_sum": torch.zeros(num_experts, dtype=torch.float32),
-            "max_score": torch.zeros(num_experts, dtype=torch.float32),
-            "observation_sum": torch.zeros(num_experts, dtype=torch.float32),
-            "max_observation": torch.zeros(num_experts, dtype=torch.float32),
-            "R_sum": torch.zeros(num_experts, dtype=torch.float32),
-            "min_R": torch.full((num_experts,), float("inf"), dtype=torch.float32),
-            "max_R": torch.zeros(num_experts, dtype=torch.float32),
-            "weight_sum": torch.zeros(num_experts, dtype=torch.float32),
-            "min_weight": torch.full((num_experts,), float("inf"), dtype=torch.float32),
-            "max_weight": torch.zeros(num_experts, dtype=torch.float32),
-            "abs_residual_sum": torch.zeros(num_experts, dtype=torch.float32),
-            "kalman_gain_sum": torch.zeros(num_experts, dtype=torch.float32),
-            "max_kalman_gain": torch.zeros(num_experts, dtype=torch.float32),
-            "skipped_observations": torch.zeros(num_experts, dtype=torch.float32),
-            "n_active_sum": torch.zeros(num_experts, dtype=torch.float32),
-            "max_n_active": torch.zeros(num_experts, dtype=torch.float32),
-            "n_rel_sum": torch.zeros(num_experts, dtype=torch.float32),
-            "max_n_rel": torch.zeros(num_experts, dtype=torch.float32),
-            "n_reliability_sum": torch.zeros(num_experts, dtype=torch.float32),
-            "min_n_reliability": torch.full((num_experts,), float("inf"), dtype=torch.float32),
-            "max_n_reliability": torch.zeros(num_experts, dtype=torch.float32),
-            "noise_score_sum": torch.zeros(num_experts, dtype=torch.float32),
-            "s_agg_sum": torch.zeros(num_experts, dtype=torch.float32),
-            "max_s_agg": torch.zeros(num_experts, dtype=torch.float32),
-        }
-
     def _safe_nonnegative_float(self, value, default=0.0):
         try:
             value = float(value)
@@ -937,66 +891,6 @@ class FedWoLFAggregator(FedAvgAggregator):
 
     def _nonnegative_or_zero(self, value):
         return self._safe_nonnegative_float(value)
-
-    def _add_filter_update_info(
-        self,
-        stat_buffers,
-        expert_id,
-        update_info,
-        score,
-        observation,
-        n_active=None,
-        n_rel=None,
-        n_reliability=None,
-        s_agg=None,
-    ):
-        score = self._safe_nonnegative_float(score)
-        observation = self._safe_nonnegative_float(observation)
-        observation_noise = self._safe_nonnegative_float(update_info["R"])
-        weight = self._safe_nonnegative_float(update_info["weight"])
-        residual = float(update_info["residual"])
-        if not math.isfinite(residual):
-            residual = 0.0
-        kalman_gain = self._safe_nonnegative_float(update_info["kalman_gain"])
-        n_active = self._safe_nonnegative_float(n_active)
-        n_rel = self._safe_nonnegative_float(n_rel, default=1.0)
-        n_reliability = self._safe_nonnegative_float(n_reliability, default=1.0)
-        noise_score = self._safe_nonnegative_float(update_info.get("noise_score", n_reliability))
-        s_agg = self._safe_nonnegative_float(s_agg)
-
-        stat_buffers["count"][expert_id] += 1
-        stat_buffers["score_sum"][expert_id] += score
-        stat_buffers["max_score"][expert_id] = max(float(stat_buffers["max_score"][expert_id]), score)
-        stat_buffers["observation_sum"][expert_id] += observation
-        stat_buffers["max_observation"][expert_id] = max(float(stat_buffers["max_observation"][expert_id]), observation)
-        stat_buffers["R_sum"][expert_id] += observation_noise
-        stat_buffers["min_R"][expert_id] = min(float(stat_buffers["min_R"][expert_id]), observation_noise)
-        stat_buffers["max_R"][expert_id] = max(float(stat_buffers["max_R"][expert_id]), observation_noise)
-        stat_buffers["weight_sum"][expert_id] += weight
-        stat_buffers["min_weight"][expert_id] = min(float(stat_buffers["min_weight"][expert_id]), weight)
-        stat_buffers["max_weight"][expert_id] = max(float(stat_buffers["max_weight"][expert_id]), weight)
-        stat_buffers["abs_residual_sum"][expert_id] += abs(residual)
-        stat_buffers["kalman_gain_sum"][expert_id] += kalman_gain
-        stat_buffers["max_kalman_gain"][expert_id] = max(float(stat_buffers["max_kalman_gain"][expert_id]), kalman_gain)
-        stat_buffers["n_active_sum"][expert_id] += n_active
-        stat_buffers["max_n_active"][expert_id] = max(float(stat_buffers["max_n_active"][expert_id]), n_active)
-        stat_buffers["n_rel_sum"][expert_id] += n_rel
-        stat_buffers["max_n_rel"][expert_id] = max(float(stat_buffers["max_n_rel"][expert_id]), n_rel)
-        stat_buffers["n_reliability_sum"][expert_id] += n_reliability
-        stat_buffers["min_n_reliability"][expert_id] = min(
-            float(stat_buffers["min_n_reliability"][expert_id]),
-            n_reliability,
-        )
-        stat_buffers["max_n_reliability"][expert_id] = max(
-            float(stat_buffers["max_n_reliability"][expert_id]),
-            n_reliability,
-        )
-        stat_buffers["noise_score_sum"][expert_id] += noise_score
-        stat_buffers["s_agg_sum"][expert_id] += s_agg
-        stat_buffers["max_s_agg"][expert_id] = max(float(stat_buffers["max_s_agg"][expert_id]), s_agg)
-
-    def _safe_mean(self, total, count):
-        return torch.where(count > 0, total / count.clamp_min(1.0), torch.zeros_like(total))
 
     def _mean_positive(self, values):
         positives = []
@@ -1024,123 +918,8 @@ class FedWoLFAggregator(FedAvgAggregator):
         relative_score = raw_score / (positive_mean + self.eps)
         return math.sqrt(max(relative_score, 0.0) + self.eps)
 
-    def _build_filter_summary(self, round_filter_stats):
-        summary = {}
-        for layer_id in sorted(self.expert_filter_mu, key=lambda item: int(item)):
-            stats = round_filter_stats.get(layer_id)
-            if stats is None:
-                stats = self._new_filter_stat_buffers(self.expert_filter_mu[layer_id].numel())
-
-            count = stats["count"]
-            mean_s = self._safe_mean(stats["score_sum"], count)
-            mean_z = self._safe_mean(stats["observation_sum"], count)
-            mean_R = self._safe_mean(stats["R_sum"], count)
-            mean_weight = self._safe_mean(stats["weight_sum"], count)
-            mean_abs_residual = self._safe_mean(stats["abs_residual_sum"], count)
-            mean_kalman_gain = self._safe_mean(stats["kalman_gain_sum"], count)
-            mean_n_active = self._safe_mean(stats["n_active_sum"], count)
-            mean_n_rel = self._safe_mean(stats["n_rel_sum"], count)
-            mean_n_reliability = self._safe_mean(stats["n_reliability_sum"], count)
-            mean_noise_score = self._safe_mean(stats["noise_score_sum"], count)
-            mean_s_agg = self._safe_mean(stats["s_agg_sum"], count)
-            min_R = torch.where(
-                count > 0,
-                stats["min_R"],
-                torch.zeros_like(stats["min_R"]),
-            )
-            min_weight = torch.where(
-                count > 0,
-                stats["min_weight"],
-                torch.zeros_like(stats["min_weight"]),
-            )
-            min_n_reliability = torch.where(
-                count > 0,
-                stats["min_n_reliability"],
-                torch.zeros_like(stats["min_n_reliability"]),
-            )
-            summary[layer_id] = {
-                "total_fisher_weight": format_scientific_list(stats["score_sum"].tolist()),
-                "mean_s": format_scientific_list(mean_s.tolist()),
-                "max_s": format_scientific_list(stats["max_score"].tolist()),
-                "mean_s_agg": format_scientific_list(mean_s_agg.tolist()),
-                "max_s_agg": format_scientific_list(stats["max_s_agg"].tolist()),
-                "total_s_agg_weight": format_scientific_list(stats["s_agg_sum"].tolist()),
-                "mean_z": format_scientific_list(mean_z.tolist()),
-                "max_z": format_scientific_list(stats["max_observation"].tolist()),
-                "mean_n_active": format_scientific_list(mean_n_active.tolist()),
-                "max_n_active": format_scientific_list(stats["max_n_active"].tolist()),
-                "mean_n_rel": format_scientific_list(mean_n_rel.tolist()),
-                "max_n_rel": format_scientific_list(stats["max_n_rel"].tolist()),
-                "mean_n_reliability": format_scientific_list(mean_n_reliability.tolist()),
-                "min_n_reliability": format_scientific_list(min_n_reliability.tolist()),
-                "max_n_reliability": format_scientific_list(stats["max_n_reliability"].tolist()),
-                "mean_noise_score": format_scientific_list(mean_noise_score.tolist()),
-                "mean_R": format_scientific_list(mean_R.tolist()),
-                "min_R": format_scientific_list(min_R.tolist()),
-                "max_R": format_scientific_list(stats["max_R"].tolist()),
-                "mean_kalman_gain": format_scientific_list(mean_kalman_gain.tolist()),
-                "max_kalman_gain": format_scientific_list(stats["max_kalman_gain"].tolist()),
-                "mean_abs_residual": format_scientific_list(mean_abs_residual.tolist()),
-                "mean_imq_weight": format_scientific_list(mean_weight.tolist()),
-                "mean_weight": format_scientific_list(mean_weight.tolist()),
-                "min_weight": format_scientific_list(min_weight.tolist()),
-                "max_weight": format_scientific_list(stats["max_weight"].tolist()),
-                "mu": format_scientific_list(self.expert_filter_mu[layer_id].tolist()),
-                "P": format_scientific_list(self.expert_filter_P[layer_id].tolist()),
-                "skipped_observations": [int(v) for v in stats["skipped_observations"].tolist()],
-            }
-        return summary
-
     def _get_aggregation_weight_mode(self):
         return "precision_fusion" if self.use_wolf_filter else "raw_fisher"
-
-    def _ensure_summary_slot(self, values, expert_id, default):
-        while len(values) <= expert_id:
-            values.append(default)
-
-    def _record_expert_aggregation_weight_summary(self, layer_id, expert_id, weights):
-        layer_id = str(layer_id)
-        clean_weights = []
-        for weight in weights:
-            try:
-                weight = float(weight)
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(weight):
-                clean_weights.append(max(weight, 0.0))
-
-        total_weight = sum(clean_weights)
-        count = len(clean_weights)
-        mean_weight = total_weight / count if count > 0 else 0.0
-        min_weight = min(clean_weights) if clean_weights else 0.0
-        max_weight = max(clean_weights) if clean_weights else 0.0
-        positive_count = sum(1 for weight in clean_weights if weight > 0.0)
-
-        layer_summary = self.last_aggregation_weight_summary.setdefault(
-            layer_id,
-            {
-                "aggregation_weight_mode": self._get_aggregation_weight_mode(),
-                "total_s_agg_weight": [],
-                "mean_s_agg": [],
-                "min_s_agg": [],
-                "max_s_agg": [],
-                "positive_s_agg_clients": [],
-            },
-        )
-        layer_summary["aggregation_weight_mode"] = self._get_aggregation_weight_mode()
-        for key in ["total_s_agg_weight", "mean_s_agg", "min_s_agg", "max_s_agg"]:
-            self._ensure_summary_slot(layer_summary[key], expert_id, "0.000000000000e+00")
-        self._ensure_summary_slot(layer_summary["positive_s_agg_clients"], expert_id, 0)
-
-        layer_summary["total_s_agg_weight"][expert_id] = f"{total_weight:.12e}"
-        layer_summary["mean_s_agg"][expert_id] = f"{mean_weight:.12e}"
-        layer_summary["min_s_agg"][expert_id] = f"{min_weight:.12e}"
-        layer_summary["max_s_agg"][expert_id] = f"{max_weight:.12e}"
-        layer_summary["positive_s_agg_clients"][expert_id] = int(positive_count)
-
-    def _merge_aggregation_weight_summary(self):
-        for layer_id, aggregation_summary in self.last_aggregation_weight_summary.items():
-            self.last_filter_summary.setdefault(layer_id, {}).update(aggregation_summary)
 
     def _get_fisher_score(self, client_stats, layer_id, expert_id):
         score = self._get_layer_expert_value(
