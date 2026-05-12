@@ -592,70 +592,6 @@ class FedAvgAggregator(Aggregator):
         summary["skipped_observations"] = skipped_observations
         return summary
 
-    def _record_precision_summary(self, layer_id, expert_id, cache):
-        layer_id = str(layer_id)
-        layer_size = self.expert_filter_mu[layer_id].numel()
-        layer_summary = self.last_filter_summary.setdefault(
-            layer_id,
-            {
-                "lambda0": ["0.000000000000e+00"] * layer_size,
-                "mean_lambda_filter": ["0.000000000000e+00"] * layer_size,
-                "min_lambda_filter": ["0.000000000000e+00"] * layer_size,
-                "max_lambda_filter": ["0.000000000000e+00"] * layer_size,
-                "mean_lambda_raw": ["0.000000000000e+00"] * layer_size,
-                "min_lambda_raw": ["0.000000000000e+00"] * layer_size,
-                "max_lambda_raw": ["0.000000000000e+00"] * layer_size,
-                "mean_lambda_final": ["0.000000000000e+00"] * layer_size,
-                "min_lambda_final": ["0.000000000000e+00"] * layer_size,
-                "max_lambda_final": ["0.000000000000e+00"] * layer_size,
-                "mean_fisher_salience": ["0.000000000000e+00"] * layer_size,
-                "mean_update_consistency": ["0.000000000000e+00"] * layer_size,
-                "mean_R": ["0.000000000000e+00"] * layer_size,
-                "min_R": ["0.000000000000e+00"] * layer_size,
-                "max_R": ["0.000000000000e+00"] * layer_size,
-                "mean_rho": ["0.000000000000e+00"] * layer_size,
-                "mean_abs_standardized_residual": ["0.000000000000e+00"] * layer_size,
-                "mean_positive_s": ["0.000000000000e+00"] * layer_size,
-                "mean_positive_n": ["0.000000000000e+00"] * layer_size,
-                "mu": ["0.000000000000e+00"] * layer_size,
-                "P": ["0.000000000000e+00"] * layer_size,
-                "skipped_observations": [0] * layer_size,
-            },
-        )
-
-        valid = cache["valid"]
-        lambda_filter = self._finite_values(cache["lambda_filter"], mask=valid)
-        lambda_raw = self._finite_values(cache["lambda_raw"], mask=valid)
-        lambda_final = self._finite_values(cache["lambda_clients"], mask=valid)
-        fisher_salience = self._finite_values(cache["fisher_salience"], mask=valid)
-        update_consistency = self._finite_values(cache["update_consistency"], mask=valid)
-        R_values = self._finite_values(cache["R"], mask=valid)
-        rho_values = self._finite_values(cache["rho"], mask=valid)
-        abs_nu_values = [abs(value) for value in self._finite_values(cache["nu"], mask=valid)]
-
-        layer_summary["lambda0"][expert_id] = f"{cache['lambda0']:.12e}"
-        layer_summary["mean_lambda_filter"][expert_id] = f"{self._mean_or_zero(lambda_filter):.12e}"
-        layer_summary["min_lambda_filter"][expert_id] = f"{self._min_or_zero(lambda_filter):.12e}"
-        layer_summary["max_lambda_filter"][expert_id] = f"{self._max_or_zero(lambda_filter):.12e}"
-        layer_summary["mean_lambda_raw"][expert_id] = f"{self._mean_or_zero(lambda_raw):.12e}"
-        layer_summary["min_lambda_raw"][expert_id] = f"{self._min_or_zero(lambda_raw):.12e}"
-        layer_summary["max_lambda_raw"][expert_id] = f"{self._max_or_zero(lambda_raw):.12e}"
-        layer_summary["mean_lambda_final"][expert_id] = f"{self._mean_or_zero(lambda_final):.12e}"
-        layer_summary["min_lambda_final"][expert_id] = f"{self._min_or_zero(lambda_final):.12e}"
-        layer_summary["max_lambda_final"][expert_id] = f"{self._max_or_zero(lambda_final):.12e}"
-        layer_summary["mean_fisher_salience"][expert_id] = f"{self._mean_or_zero(fisher_salience):.12e}"
-        layer_summary["mean_update_consistency"][expert_id] = f"{self._mean_or_zero(update_consistency):.12e}"
-        layer_summary["mean_R"][expert_id] = f"{self._mean_or_zero(R_values):.12e}"
-        layer_summary["min_R"][expert_id] = f"{self._min_or_zero(R_values):.12e}"
-        layer_summary["max_R"][expert_id] = f"{self._max_or_zero(R_values):.12e}"
-        layer_summary["mean_rho"][expert_id] = f"{self._mean_or_zero(rho_values):.12e}"
-        layer_summary["mean_abs_standardized_residual"][expert_id] = f"{self._mean_or_zero(abs_nu_values):.12e}"
-        layer_summary["mean_positive_s"][expert_id] = f"{cache['mean_positive_s']:.12e}"
-        layer_summary["mean_positive_n"][expert_id] = f"{cache['mean_positive_n']:.12e}"
-        layer_summary["mu"][expert_id] = f"{cache['mu_new']:.12e}"
-        layer_summary["P"][expert_id] = f"{cache['P_new']:.12e}"
-        layer_summary["skipped_observations"][expert_id] = int(len(valid) - sum(valid))
-
 
 class ExpertFedAvgAggregator(Aggregator):
     # FL + MoE 专家级 FedAvg：
@@ -852,12 +788,6 @@ class FedWoLFAggregator(FedAvgAggregator):
                 precision_cache=precision_cache,
             )
         return aggregated_state
-
-    def _update_filter_state(self, state_keys, client_stats):
-        raise RuntimeError(
-            "_update_filter_state is deprecated. FedWoLF now uses "
-            "_prepare_fedwolf_precision_cache for batch-form state updates."
-        )
 
     def _ensure_filter_state_for_layer(self, layer_id, num_experts):
         layer_id = str(layer_id)

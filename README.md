@@ -44,12 +44,6 @@ conda activate fedwolf
 python train.py
 ```
 
-手动指定其他配置：
-
-```bash
-
-```
-
 输出目录由 `config.yaml` 的 `train.save_root` 和 `train.run_name` 自动派生：
 
 - `save/{run_name}/data`
@@ -89,7 +83,7 @@ python train.py
 3. 训练后额外做一次 evidence pass；默认使用 deterministic evidence loader，并以 eval-mode forward 关闭训练态随机行为。
 4. 对每层每个 expert 参数块累计梯度平方，得到 Fisher raw score `s`。
 5. 计算 `z = log(1+s)`。
-6. 将 `expert_fisher_score_by_layer` 和 `expert_fisher_log_score_by_layer` 随 `client_stats` 返回给 server。
+6. 将 `expert_fisher_score_by_layer`、`expert_fisher_log_score_by_layer`、`evidence_expert_activations_by_layer` 随 `client_stats` 返回给 server。
 
 服务端：
 
