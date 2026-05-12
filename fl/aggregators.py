@@ -189,6 +189,14 @@ class FedAvgAggregator(Aggregator):
             numerator = theta_old * lambda0
             denominator = lambda0
         else:
+            # No-prior mode intentionally removes the explicit old-global-expert
+            # term from the final fusion. This keeps the update pace closer to
+            # ExpertFedAvg. The previous global expert is still implicitly
+            # preserved because clients start local training from the previous
+            # global model, and explicit retention only happens as a fallback
+            # when no valid client update exists. Weak evidence does not trigger
+            # an extra old-prior retention term here; that is a deliberate
+            # design choice, not a bug.
             numerator = torch.zeros_like(theta_old)
             denominator = 0.0
         valid_client_count = 0
@@ -747,7 +755,11 @@ class FedWoLFAggregator(FedAvgAggregator):
     # - fedwolf_fisher_only 的 expert 参数按 raw Fisher score 做 Fisher-only baseline；
     # - fedwolf 的 expert 参数使用 client-expert precision fusion：
     #   Fisher salience × filter reliability × leave-one-out update consistency，
-    #   再 normalize + clip，并与 old global prior precision lambda0 融合。
+    #   再 normalize + clip 后用于 expert 聚合。
+    # - old global expert prior 是可选项，由 fedwolf_use_old_prior 控制：
+    #   true 时显式加入 lambda0 prior，false 时不显式加入旧 prior；
+    #   false 时旧 expert 仍通过客户端本地训练初始化被隐式保留，
+    #   且在没有有效客户端更新时仍 fallback 保留旧 global expert。
     #
     # 注意：
     # - fedwolf 不再使用旧的插值路径。
@@ -805,7 +817,7 @@ class FedWoLFAggregator(FedAvgAggregator):
         precision_cache = {}
         if self.use_wolf_filter:
             if global_state is None:
-                raise ValueError("FedWoLF precision fusion requires global_model for old global expert prior")
+                raise ValueError("FedWoLF precision fusion requires global_model for expert deltas and fallback")
             precision_cache = self._prepare_fedwolf_precision_cache(
                 expert_param_keys_by_ref=expert_param_keys_by_ref,
                 client_updates=client_updates,

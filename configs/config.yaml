@@ -152,8 +152,9 @@ train:
   # - expert_fedavg: shared/router 按样本数 FedAvg，expert 按 expert usage/token usage 加权
   # - fedwolf_fisher_only: shared/router FedAvg，expert 按 raw Fisher score s 聚合，不使用 WoLF filter，作为旧 Fisher-only baseline
   # - fedwolf: 完整 FedWoLF；shared/router 按样本数 FedAvg，expert 使用 client-expert precision fusion：
-  #   Fisher salience × filter reliability × leave-one-out update consistency，
-  #   再 normalize + clip，并与 old global prior precision lambda0 融合。
+  #   Fisher salience × support-calibrated filter reliability × leave-one-out update consistency，
+  #   再 normalize + clip 后用于 expert 聚合。old global expert prior 是可选项，
+  #   由 fedwolf_use_old_prior 控制。
   agg_method: fedwolf
 
   # 聚合设备：
@@ -222,7 +223,11 @@ train:
   fedwolf_lambda_max: 5.0
 
   # FedWoLF expert fusion 是否显式加入 old global expert prior。
-  # - true: 使用旧逻辑，将上一轮 global expert 作为 prior precision 加入最终 expert 融合。
-  # - false: 不显式加入 old prior，只用当前轮客户端 expert 按 FedWoLF precision 加权聚合；
+  # - true: 显式 old-prior fusion:
+  #         theta = (lambda0 * theta_old + sum_m lambda_m * theta_m)
+  #                 / (lambda0 + sum_m lambda_m)
+  # - false: 不显式加入 old prior:
+  #          theta = sum_m lambda_m * theta_m / sum_m lambda_m
+  #          旧 expert 仍会通过客户端本地训练初始化被隐式保留。
   #          如果某个 expert 没有有效客户端更新，则仍然 fallback 保留旧 global expert。
   fedwolf_use_old_prior: false
