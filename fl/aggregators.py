@@ -526,6 +526,12 @@ class FedAvgAggregator(Aggregator):
             "mean_R": 0.0,
             "min_R": 0.0,
             "max_R": 0.0,
+            "mean_n_rel": 0.0,
+            "min_n_rel": 0.0,
+            "max_n_rel": 0.0,
+            "mean_support_reliability": 0.0,
+            "min_support_reliability": 0.0,
+            "max_support_reliability": 0.0,
             "mean_rho": 0.0,
             "min_rho": 0.0,
             "max_rho": 0.0,
@@ -760,7 +766,7 @@ class FedWoLFAggregator(FedAvgAggregator):
         if client_stats is None:
             client_stats = kwargs.get("expert_weights")
         if client_stats is None:
-            raise ValueError("FedWoLF Fisher-only requires client_stats or expert_weights")
+            raise ValueError("FedWoLF requires client_stats or expert_weights")
         if len(client_stats) != len(client_updates):
             raise ValueError("client_stats/expert_weights and client_updates must have the same length")
 
