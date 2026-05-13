@@ -39,7 +39,7 @@ model:
   # resnet18_switch_transformer = ResNet-18 backbone + Switch Transformer
   # resnet20_switch_transformer = ResNet-20 backbone + Transformer
   # resnet32_switch_transformer = ResNet-32 backbone + Transformer
-  model_type: resnet20_switch_transformer
+  model_type: resnet18_switch_transformer
 
   # 标准 switch_transformer 的显式 patch 大小；
   # 为 null 时会回退到兼容逻辑，根据 token_grid_size 推导
@@ -184,7 +184,7 @@ train:
   # 每个 client 的 Fisher evidence pass 最多使用多少样本：
   # - null 或 0: 不限制，使用该 client 的全部 evidence 数据
   # - 正整数: 最多使用这么多样本；调试阶段可用 512/1024 加速
-  fedwolf_fisher_max_samples: 512
+  fedwolf_fisher_max_samples: 1024
 
   # 每个 client 的 Fisher evidence pass 最多处理多少 batch：
   # - null 或 0: 不限制
@@ -215,8 +215,14 @@ train:
   # WoLF-IMQ 鲁棒权重尺度 c；越小越容易对残差大的 evidence 降权
   fedwolf_imq_c: 1.0
 
+  # FedWoLF 是否启用 leave-one-out update consistency。
+  # - true: 使用当前完整逻辑，根据客户端 expert update 方向和 leave-one-out 中心方向的一致性进行降权。
+  # - false: 关闭 update consistency 消融，所有 client-expert 的 consistency 固定为 1.0，
+  #          此时 lambda_raw = fisher_salience * lambda_filter。
+  fedwolf_use_update_consistency: false
+
   # FedWoLF precision fusion: update consistency 的最低保留权重，避免 non-IID 少数派客户端被完全压成 0
-  fedwolf_consistency_min: 0.05
+  fedwolf_consistency_min: 0.1
 
   # FedWoLF precision fusion: normalized client-expert precision 的裁剪范围
   fedwolf_lambda_min: 0.05

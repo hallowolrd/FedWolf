@@ -348,13 +348,20 @@ class FedAvgAggregator(Aggregator):
                 salience * lambda_filter if is_valid else 0.0
                 for salience, lambda_filter, is_valid in zip(fisher_salience, lambda_filters, valid)
             ]
-            update_consistency = self._compute_leave_one_out_update_consistency(
-                param_keys=param_keys,
-                client_updates=client_updates,
-                global_state=global_state,
-                valid=valid,
-                w_pre=w_pre,
-            )
+            if self.use_update_consistency:
+                update_consistency = self._compute_leave_one_out_update_consistency(
+                    param_keys=param_keys,
+                    client_updates=client_updates,
+                    global_state=global_state,
+                    valid=valid,
+                    w_pre=w_pre,
+                )
+            else:
+                # Ablation: when update consistency is disabled, each valid
+                # client-expert update gets c_upd = 1.0. FedWoLF then uses only
+                # Fisher salience and filter reliability before normalize+clip.
+                # Invalid observations still get lambda_raw = 0.0.
+                update_consistency = [1.0 if is_valid else 0.0 for is_valid in valid]
             lambda_raw = [
                 salience * lambda_filter * consistency if is_valid else 0.0
                 for salience, lambda_filter, consistency, is_valid in zip(
@@ -388,6 +395,7 @@ class FedAvgAggregator(Aggregator):
             precision_cache[(layer_id, expert_id)] = {
                 "lambda0": float(lambda0),
                 "use_old_prior": bool(self.use_old_prior),
+                "use_update_consistency": bool(self.use_update_consistency),
                 "old_prior_fraction": float(old_prior_fraction),
                 "lambda_clients": lambda_clients,
                 "lambda_filter": lambda_filters,
@@ -534,6 +542,7 @@ class FedAvgAggregator(Aggregator):
             "num_valid_experts": 0,
             "aggregation_weight_mode": self._get_aggregation_weight_mode(),
             "use_old_prior": bool(self.use_old_prior),
+            "use_update_consistency": bool(self.use_update_consistency),
             "lambda0": 0.0,
             "mean_old_prior_fraction": 0.0,
             "min_old_prior_fraction": 0.0,
@@ -656,6 +665,7 @@ class FedAvgAggregator(Aggregator):
 
         summary["lambda0"] = self._mean_or_zero(lambda0_values)
         summary["use_old_prior"] = bool(self.use_old_prior)
+        summary["use_update_consistency"] = bool(self.use_update_consistency)
         summary["mean_old_prior_fraction"] = self._mean_or_zero(old_prior_fraction_values)
         summary["min_old_prior_fraction"] = self._min_or_zero(old_prior_fraction_values)
         summary["max_old_prior_fraction"] = self._max_or_zero(old_prior_fraction_values)
@@ -830,6 +840,9 @@ class FedWoLFAggregator(FedAvgAggregator):
         self.lambda_min = float(getattr(args, "fedwolf_lambda_min", 0.05))
         self.lambda_max = float(getattr(args, "fedwolf_lambda_max", 5.0))
         self.use_old_prior = bool(getattr(args, "fedwolf_use_old_prior", False))
+        self.use_update_consistency = bool(
+            getattr(args, "fedwolf_use_update_consistency", True)
+        )
         self.num_experts = getattr(args, "num_experts", None)
         self.use_wolf_filter = use_wolf_filter
         if self.imq_c <= 0:

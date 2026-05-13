@@ -398,6 +398,7 @@ class Server:
                     "num_experts",
                     "num_valid_experts",
                     "use_old_prior",
+                    "use_update_consistency",
                     "lambda0",
                     "mean_old_prior_fraction",
                     "min_old_prior_fraction",
