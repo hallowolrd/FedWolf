@@ -1,6 +1,8 @@
 import os
+import random
 
 import torch
+import numpy as np
 from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
 from torchvision.datasets import CIFAR10, CIFAR100
@@ -8,6 +10,11 @@ from torchvision.datasets import CIFAR10, CIFAR100
 
 EXPECTED_PROTOCOL = "client_train_global_test_index_partition"
 EXPECTED_VERSION = 2
+_LOADER_KIND_OFFSETS = {
+    "client_train": 1000003,
+    "client_evidence": 2000003,
+    "global_eval": 3000003,
+}
 
 
 def get_cifar_stats(data_name):
@@ -53,6 +60,53 @@ def build_transforms(data_name):
         transforms.Normalize(mean=mean, std=std),
     ])
     return train_transform, eval_transform
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def make_dataloader_seed(args, loader_kind, client_id=None, round_id=None):
+    base_seed = int(getattr(args, "seed", 0))
+    seed = base_seed + _LOADER_KIND_OFFSETS.get(str(loader_kind), 0)
+
+    if client_id is not None:
+        seed += int(client_id) * 10007
+
+    if round_id is not None:
+        seed += int(round_id) * 1000003
+
+    return int(seed) % (2**63 - 1)
+
+
+def build_dataloader_seed_kwargs(args, loader_kind, client_id=None, round_id=None):
+    mode = str(getattr(args, "dataloader_seed_mode", "legacy")).strip().lower()
+
+    if mode in {"legacy", "none", "off", "false", "0"}:
+        return {}
+
+    if mode not in {"round_client", "deterministic"}:
+        raise ValueError(
+            "dataloader_seed_mode must be one of: legacy, round_client, deterministic; "
+            f"got {mode!r}"
+        )
+
+    generator = torch.Generator()
+    generator.manual_seed(
+        make_dataloader_seed(
+            args=args,
+            loader_kind=loader_kind,
+            client_id=client_id,
+            round_id=round_id,
+        )
+    )
+
+    return {
+        "worker_init_fn": seed_worker,
+        "generator": generator,
+    }
 
 
 def load_partition_meta(args):
@@ -258,7 +312,7 @@ def build_index_dataset(args, split, client_id=None, meta=None):
     return Subset(dataset, indices)
 
 
-def build_client_train_loader(args, client_id, meta=None):
+def build_client_train_loader(args, client_id, meta=None, round_id=None):
     """ 构造某个客户端的训练 DataLoader。 """
 
     dataset = build_index_dataset(
@@ -273,10 +327,16 @@ def build_client_train_loader(args, client_id, meta=None):
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,
+        **build_dataloader_seed_kwargs(
+            args=args,
+            loader_kind="client_train",
+            client_id=client_id,
+            round_id=round_id,
+        ),
     )
 
 
-def build_client_evidence_loader(args, client_id, meta=None):
+def build_client_evidence_loader(args, client_id, meta=None, round_id=None):
     """构造某个客户端用于 Fisher evidence 的确定性 DataLoader。"""
 
     meta = meta or load_partition_meta(args)
@@ -294,10 +354,16 @@ def build_client_evidence_loader(args, client_id, meta=None):
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,
+        **build_dataloader_seed_kwargs(
+            args=args,
+            loader_kind="client_evidence",
+            client_id=client_id,
+            round_id=round_id,
+        ),
     )
 
 
-def build_global_eval_loader(args, split, meta=None):
+def build_global_eval_loader(args, split, meta=None, round_id=None):
     """ 构造全局测试 DataLoader。 """
 
     if split != "global_test":
@@ -310,6 +376,11 @@ def build_global_eval_loader(args, split, meta=None):
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,
+        **build_dataloader_seed_kwargs(
+            args=args,
+            loader_kind="global_eval",
+            round_id=round_id,
+        ),
     )
 
 

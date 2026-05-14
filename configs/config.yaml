@@ -147,6 +147,11 @@ train:
   # true: 调试/兼容旧流程时保存客户端模型。
   save_client_models: false
 
+  # DataLoader 随机流控制模式：
+  # - legacy: 保持旧行为，不显式传 generator / worker_init_fn
+  # - round_client: 为 client / round 构造可复现但不同的随机流，正式复现实验建议使用
+  dataloader_seed_mode: legacy
+
   # 聚合方法：
   # - fedavg: 全模型按客户端样本数做 FedAvg
   # - expert_fedavg: shared/router 按样本数 FedAvg，expert 按 expert usage/token usage 加权

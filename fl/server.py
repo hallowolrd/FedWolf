@@ -108,6 +108,8 @@ class Server:
         self.device = self.args.device
         self.logger = logger
         self.logger.info(f"--aggregation_device : {getattr(self.aggregator, 'aggregation_device', 'cpu')}\n")
+        self.logger.info(f"--dataloader_seed_mode : {getattr(self.args, 'dataloader_seed_mode', 'legacy')}\n")
+        self.logger.info(f"--dataloader_base_seed : {getattr(self.args, 'seed', None)}\n")
         os.makedirs(self.args.model_save_path, exist_ok=True)
         self.partition_meta = load_partition_meta(self.args)
         self.global_test_loader = build_global_eval_loader(

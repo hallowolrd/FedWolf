@@ -120,6 +120,7 @@ class Client:
                     args=self.args,
                     client_id=self.client_id,
                     meta=self.partition_meta,
+                    round_id=self.c_T,
                 )
             return self.evidence_loader
         if evidence_loader_mode == "train_loader":
@@ -191,6 +192,7 @@ class Client:
             args=self.args,
             client_id=self.client_id,
             meta=self.partition_meta,
+            round_id=self.c_T,
         )
         self.evidence_loader = None
 
@@ -206,6 +208,7 @@ class Client:
                 args=self.args,
                 client_id=self.client_id,
                 meta=self.partition_meta,
+                round_id=self.c_T,
             )
             return
 
