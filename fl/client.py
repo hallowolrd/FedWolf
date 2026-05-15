@@ -52,7 +52,7 @@ class Client:
         # 分类任务常用交叉熵损失。
         self.criterion = nn.CrossEntropyLoss()
         self.current_lr = self.get_current_learning_rate()
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.current_lr)
+        self.optimizer = self.build_optimizer()
 
         self.batch_size = self.args.batch_size
         self.partition_meta = partition_meta
@@ -65,6 +65,78 @@ class Client:
         self.router_aux_loss_coef = self.args.router_aux_loss_coef
         self.router_z_loss_coef = self.args.router_z_loss_coef
 
+    def _cosine_learning_rate(self, base_lr: float, min_lr: float, progress: float) -> float:
+        progress = min(max(float(progress), 0.0), 1.0)
+        cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr + (base_lr - min_lr) * cosine_factor
+
+    def build_weight_decay_param_groups(self, weight_decay: float):
+        if weight_decay <= 0.0:
+            return [{"params": [p for p in self.model.parameters() if p.requires_grad], "weight_decay": 0.0}]
+
+        decay_params = []
+        no_decay_params = []
+
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            name_lower = name.lower()
+            if (
+                name_lower.endswith(".bias")
+                or "bn" in name_lower
+                or "norm" in name_lower
+                or "layernorm" in name_lower
+            ):
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
+        param_groups = []
+        if decay_params:
+            param_groups.append({"params": decay_params, "weight_decay": weight_decay})
+        if no_decay_params:
+            param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
+
+        return param_groups
+
+    def build_optimizer(self):
+        optimizer_name = str(getattr(self.args, "optimizer", "adam")).strip().lower()
+        weight_decay = float(getattr(self.args, "weight_decay", 0.0))
+        momentum = float(getattr(self.args, "momentum", 0.9))
+
+        if weight_decay < 0.0:
+            raise ValueError("weight_decay must be non-negative.")
+        if momentum < 0.0:
+            raise ValueError("momentum must be non-negative.")
+
+        if optimizer_name == "adam":
+            return optim.Adam(
+                self.model.parameters(),
+                lr=self.current_lr,
+                weight_decay=weight_decay,
+            )
+
+        if optimizer_name == "adamw":
+            param_groups = self.build_weight_decay_param_groups(weight_decay)
+            return optim.AdamW(
+                param_groups,
+                lr=self.current_lr,
+            )
+
+        if optimizer_name == "sgd":
+            return optim.SGD(
+                self.model.parameters(),
+                lr=self.current_lr,
+                momentum=momentum,
+                weight_decay=weight_decay,
+            )
+
+        raise ValueError(
+            f"Unsupported optimizer: {optimizer_name!r}. "
+            "Expected 'adam', 'adamw', or 'sgd'."
+        )
+
     def get_current_learning_rate(self) -> float:
         """Return learning rate for the current global communication round.
 
@@ -76,29 +148,63 @@ class Client:
         schedule = str(getattr(self.args, "lr_schedule", "constant")).strip().lower()
         base_lr = float(self.args.learning_rate)
 
+        if base_lr <= 0.0:
+            raise ValueError("learning_rate must be positive.")
+
         if schedule in {"constant", "none"}:
             return base_lr
 
-        if schedule == "cosine":
-            min_lr = float(getattr(self.args, "min_learning_rate", 0.0))
-            if min_lr < 0.0:
-                raise ValueError("min_learning_rate must be non-negative.")
-            if min_lr > base_lr:
-                raise ValueError(
-                    "min_learning_rate must be <= learning_rate for cosine schedule."
-                )
+        min_lr = float(getattr(self.args, "min_learning_rate", 0.0))
+        if min_lr < 0.0:
+            raise ValueError("min_learning_rate must be non-negative.")
+        if min_lr > base_lr:
+            raise ValueError("min_learning_rate must be <= learning_rate.")
 
-            total_rounds = int(getattr(self.args, "server_epochs", 1))
+        total_rounds = int(getattr(self.args, "server_epochs", 1))
+        if total_rounds <= 0:
+            raise ValueError("server_epochs must be positive.")
+
+        if schedule == "cosine":
             denominator = max(total_rounds - 1, 1)
             progress = float(self.c_T) / float(denominator)
-            progress = min(max(progress, 0.0), 1.0)
+            return self._cosine_learning_rate(base_lr, min_lr, progress)
 
-            cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
-            return min_lr + (base_lr - min_lr) * cosine_factor
+        if schedule in {"warmup_cosine", "cosine_warmup", "linear_warmup_cosine"}:
+            warmup_rounds = int(getattr(self.args, "warmup_rounds", 0))
+            if warmup_rounds < 0:
+                raise ValueError("warmup_rounds must be non-negative.")
+
+            warmup_start_lr = getattr(self.args, "warmup_start_learning_rate", None)
+            if warmup_start_lr is None:
+                warmup_start_lr = min_lr if min_lr > 0.0 else base_lr * 0.2
+            warmup_start_lr = float(warmup_start_lr)
+            if warmup_start_lr < 0.0:
+                raise ValueError("warmup_start_learning_rate must be non-negative.")
+            if warmup_start_lr > base_lr:
+                raise ValueError("warmup_start_learning_rate must be <= learning_rate.")
+
+            if warmup_rounds <= 0:
+                denominator = max(total_rounds - 1, 1)
+                progress = float(self.c_T) / float(denominator)
+                return self._cosine_learning_rate(base_lr, min_lr, progress)
+
+            if warmup_rounds >= total_rounds:
+                raise ValueError(
+                    "warmup_rounds must be smaller than server_epochs for warmup_cosine."
+                )
+
+            if self.c_T < warmup_rounds:
+                progress = float(self.c_T) / float(max(warmup_rounds - 1, 1))
+                return warmup_start_lr + (base_lr - warmup_start_lr) * min(max(progress, 0.0), 1.0)
+
+            cosine_round = self.c_T - warmup_rounds
+            cosine_total = max(total_rounds - warmup_rounds - 1, 1)
+            progress = float(cosine_round) / float(cosine_total)
+            return self._cosine_learning_rate(base_lr, min_lr, progress)
 
         raise ValueError(
             f"Unsupported lr_schedule: {schedule!r}. "
-            "Expected 'constant', 'none', or 'cosine'."
+            "Expected 'constant', 'none', 'cosine', 'warmup_cosine', 'cosine_warmup', or 'linear_warmup_cosine'."
         )
 
     def should_compute_fisher_evidence(self):

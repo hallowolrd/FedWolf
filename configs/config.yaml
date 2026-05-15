@@ -55,13 +55,37 @@ model:
   # 优化器学习率
   learning_rate: 0.0005
 
+  # 优化器类型：
+  # - adam: 旧默认行为，使用 torch.optim.Adam
+  # - adamw: 推荐用于 ResNet/MoE 训练，配合 weight_decay 提高泛化
+  # - sgd: 可选消融，使用 momentum SGD
+  optimizer: adam
+
+  # 权重衰减系数：
+  # - adam 默认可以设 0.0 保持旧行为
+  # - adamw 推荐先试 0.0001
+  # - sgd 可试 0.0005
+  weight_decay: 0.0
+
+  # SGD momentum，仅当 optimizer=sgd 时使用
+  momentum: 0.9
+
   # 学习率调度方式：
   # - constant: 全程固定 learning_rate
   # - cosine: 按 server round 做全局余弦退火，不是按 local epoch 或 batch
+  # - warmup_cosine: 前 warmup_rounds 个 server round 线性升温，然后余弦退火
   lr_schedule: cosine
 
   # cosine 退火的最低学习率；建议先用初始学习率的 1/10，不要直接退到 0
   min_learning_rate: 0.00005
+
+  # warmup 轮数，仅当 lr_schedule=warmup_cosine/cosine_warmup/linear_warmup_cosine 时使用。
+  # 推荐 CIFAR10 + ResNet/MoE 先试 5；如果前期收敛太慢可试 3。
+  warmup_rounds: 5
+
+  # warmup 初始学习率，仅当 warmup_cosine 生效。
+  # 推荐先用 base learning_rate 的 20%，例如 learning_rate=0.0005 时设为 0.0001。
+  warmup_start_learning_rate: 0.0001
 
   # token / hidden 的嵌入维度
   embed_dim: 128

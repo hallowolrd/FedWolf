@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -111,6 +112,101 @@ def _raise_if_missing_required_keys(merged_config: dict) -> None:
             f"Missing required config keys: {missing_keys}. "
             "Please check the config.yaml passed by --config."
         )
+
+
+def _validate_training_hparams(merged_config: dict) -> None:
+    try:
+        learning_rate = float(merged_config["learning_rate"])
+    except (TypeError, ValueError, KeyError) as exc:
+        raise ValueError("learning_rate must be a positive number.") from exc
+    if not math.isfinite(learning_rate) or learning_rate <= 0.0:
+        raise ValueError("learning_rate must be a positive number.")
+    merged_config["learning_rate"] = learning_rate
+
+    min_learning_rate = merged_config.get("min_learning_rate", None)
+    if min_learning_rate is not None:
+        try:
+            min_learning_rate = float(min_learning_rate)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("min_learning_rate must be a non-negative number.") from exc
+        if not math.isfinite(min_learning_rate) or min_learning_rate < 0.0:
+            raise ValueError("min_learning_rate must be non-negative.")
+        if min_learning_rate > learning_rate:
+            raise ValueError("min_learning_rate must be <= learning_rate.")
+        merged_config["min_learning_rate"] = min_learning_rate
+
+    optimizer = str(merged_config.get("optimizer", "adam")).strip().lower()
+    if optimizer not in {"adam", "adamw", "sgd"}:
+        raise ValueError(
+            "optimizer must be one of {'adam', 'adamw', 'sgd'}, "
+            f"got {optimizer!r}."
+        )
+    merged_config["optimizer"] = optimizer
+
+    try:
+        weight_decay = float(merged_config.get("weight_decay", 0.0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("weight_decay must be a non-negative number.") from exc
+    if not math.isfinite(weight_decay) or weight_decay < 0.0:
+        raise ValueError("weight_decay must be non-negative.")
+    merged_config["weight_decay"] = weight_decay
+
+    try:
+        momentum = float(merged_config.get("momentum", 0.9))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("momentum must be a non-negative number.") from exc
+    if not math.isfinite(momentum) or momentum < 0.0:
+        raise ValueError("momentum must be non-negative.")
+    merged_config["momentum"] = momentum
+
+    warmup_rounds = merged_config.get("warmup_rounds", 0)
+    if isinstance(warmup_rounds, bool) or not isinstance(warmup_rounds, int):
+        raise ValueError("warmup_rounds must be an int.")
+    if warmup_rounds < 0:
+        raise ValueError("warmup_rounds must be non-negative.")
+    merged_config["warmup_rounds"] = warmup_rounds
+
+    warmup_start_learning_rate = merged_config.get("warmup_start_learning_rate", None)
+    if warmup_start_learning_rate is not None:
+        try:
+            warmup_start_learning_rate = float(warmup_start_learning_rate)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "warmup_start_learning_rate must be a non-negative number or None."
+            ) from exc
+        if not math.isfinite(warmup_start_learning_rate) or warmup_start_learning_rate < 0.0:
+            raise ValueError("warmup_start_learning_rate must be non-negative.")
+        if warmup_start_learning_rate > learning_rate:
+            raise ValueError("warmup_start_learning_rate must be <= learning_rate.")
+        merged_config["warmup_start_learning_rate"] = warmup_start_learning_rate
+
+    schedule = str(merged_config.get("lr_schedule", "constant")).strip().lower()
+    if schedule not in {
+        "constant",
+        "none",
+        "cosine",
+        "warmup_cosine",
+        "cosine_warmup",
+        "linear_warmup_cosine",
+    }:
+        raise ValueError(
+            "lr_schedule must be one of {'constant', 'none', 'cosine', "
+            "'warmup_cosine', 'cosine_warmup', 'linear_warmup_cosine'}, "
+            f"got {schedule!r}."
+        )
+    merged_config["lr_schedule"] = schedule
+
+    if schedule in {"warmup_cosine", "cosine_warmup", "linear_warmup_cosine"}:
+        try:
+            total_rounds = int(merged_config["server_epochs"])
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ValueError("server_epochs must be a positive integer.") from exc
+        if total_rounds <= 0:
+            raise ValueError("server_epochs must be positive.")
+        if warmup_rounds >= total_rounds:
+            raise ValueError(
+                "warmup_rounds must be smaller than server_epochs for warmup_cosine."
+            )
 
 
 def _sanitize_run_name(run_name: object) -> str:
@@ -236,6 +332,12 @@ def load_args(config_path: str):
         merged_config.update(section_config)
 
     _raise_if_missing_required_keys(merged_config)
+    merged_config.setdefault("optimizer", "adam")
+    merged_config.setdefault("weight_decay", 0.0)
+    merged_config.setdefault("momentum", 0.9)
+    merged_config.setdefault("warmup_rounds", 0)
+    merged_config.setdefault("warmup_start_learning_rate", None)
+    _validate_training_hparams(merged_config)
     _derive_output_paths(merged_config)
 
     return SimpleNamespace(**merged_config)
