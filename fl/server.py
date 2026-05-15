@@ -270,24 +270,28 @@ class Server:
 
         self.model.to(self.device)
         self.model.eval()
-        running_loss = 0.0
-        running_corrects = 0
+        running_loss = torch.zeros((), device=self.device)
+        running_corrects = torch.zeros((), device=self.device, dtype=torch.long)
+        total_samples = 0
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for inputs, labels in data_loader:
                 inputs, labels = self._move_batch_to_device(inputs, labels)
                 result = self.model(inputs)
-                outputs = result["logits"]
+                outputs = result["logits"] if isinstance(result, dict) else result
                 loss = self.criterion(outputs, labels)
 
-                running_loss += loss.item() * inputs.size(0)
-                _, preds = torch.max(outputs, 1)
-                running_corrects += torch.sum(preds == labels.data)
+                batch_size = labels.size(0)
+                running_loss += loss.detach() * batch_size
+                running_corrects += (outputs.argmax(dim=1) == labels).sum()
+                total_samples += batch_size
 
-        eval_loss = running_loss / len(data_loader.dataset)
-        eval_acc = running_corrects.double() / len(data_loader.dataset)
-        self.model.to("cpu")
-        return eval_loss, eval_acc.item()
+        if total_samples <= 0:
+            raise ValueError("Evaluation data_loader has no samples")
+
+        eval_loss = (running_loss / total_samples).item()
+        eval_acc = (running_corrects.float() / total_samples).item()
+        return eval_loss, eval_acc
 
     def _move_batch_to_device(self, inputs, labels):
         non_blocking = (
