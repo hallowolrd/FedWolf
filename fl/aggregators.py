@@ -277,6 +277,7 @@ class FedAvgAggregator(Aggregator):
             n_rel_values = []
             support_values = []
             nu_values = []
+            rho_residual_values = []
             rho_values = []
             lambda_filters = []
             # Diagnostic only: n_rel/support_values explain the support-derived
@@ -288,6 +289,7 @@ class FedAvgAggregator(Aggregator):
                     n_rel_values.append(0.0)
                     support_values.append(0.0)
                     nu_values.append(0.0)
+                    rho_residual_values.append(0.0)
                     rho_values.append(0.0)
                     lambda_filters.append(0.0)
                     continue
@@ -305,8 +307,17 @@ class FedAvgAggregator(Aggregator):
                     R=R,
                     eps=self.eps,
                 )
+                if self.rho_residual_mode == "two_sided":
+                    rho_residual = nu
+                elif self.rho_residual_mode == "low_only":
+                    rho_residual = max(0.0, -float(nu))
+                else:
+                    raise ValueError(
+                        "fedwolf_rho_residual_mode must be one of {'two_sided', 'low_only'}, "
+                        f"got {self.rho_residual_mode!r}."
+                    )
                 rho = compute_imq_weight(
-                    standardized_residual=nu,
+                    standardized_residual=rho_residual,
                     imq_c=self.imq_c,
                     eps=self.eps,
                 )
@@ -315,6 +326,7 @@ class FedAvgAggregator(Aggregator):
                 n_rel_values.append(n_rel)
                 support_values.append(support_reliability)
                 nu_values.append(nu)
+                rho_residual_values.append(rho_residual)
                 rho_values.append(rho)
                 lambda_filters.append(lambda_filter)
 
@@ -405,6 +417,9 @@ class FedAvgAggregator(Aggregator):
                 "R": R_values,
                 "rho": rho_values,
                 "nu": nu_values,
+                "rho_residual_mode": self.rho_residual_mode,
+                "rho_low_only_mode": 1.0 if self.rho_residual_mode == "low_only" else 0.0,
+                "rho_residual_values": rho_residual_values,
                 "valid": valid,
                 "mu_pred": float(mu_pred),
                 "P_pred": float(p_pred),
@@ -570,10 +585,15 @@ class FedAvgAggregator(Aggregator):
             "mean_rho": 0.0,
             "min_rho": 0.0,
             "max_rho": 0.0,
+            "rho_low_only_mode": 0.0,
+            "mean_rho_residual": 0.0,
+            "max_rho_residual": 0.0,
             "mean_std_residual": 0.0,
             "mean_abs_standardized_residual": 0.0,
             "min_abs_standardized_residual": 0.0,
             "max_abs_standardized_residual": 0.0,
+            "low_evidence_fraction": 0.0,
+            "high_evidence_fraction": 0.0,
             "mean_fisher_salience": 0.0,
             "min_fisher_salience": 0.0,
             "max_fisher_salience": 0.0,
@@ -605,6 +625,7 @@ class FedAvgAggregator(Aggregator):
         mean_positive_n_values = []
         R_values = []
         rho_values = []
+        rho_residual_values = []
         std_residual_values = []
         abs_std_residual_values = []
         n_rel_values = []
@@ -637,6 +658,9 @@ class FedAvgAggregator(Aggregator):
                 self._finite_values(cache.get("support_values"), mask=valid)
             )
             rho_values.extend(self._finite_values(cache.get("rho"), mask=valid))
+            rho_residual_values.extend(
+                self._finite_values(cache.get("rho_residual_values"), mask=valid)
+            )
             std_residual_values.extend(self._finite_values(cache.get("nu"), mask=valid))
             abs_std_residual_values.extend(
                 abs(value) for value in self._finite_values(cache.get("nu"), mask=valid)
@@ -696,6 +720,9 @@ class FedAvgAggregator(Aggregator):
         summary["mean_rho"] = self._mean_or_zero(rho_values)
         summary["min_rho"] = self._min_or_zero(rho_values)
         summary["max_rho"] = self._max_or_zero(rho_values)
+        summary["rho_low_only_mode"] = 1.0 if self.rho_residual_mode == "low_only" else 0.0
+        summary["mean_rho_residual"] = self._mean_or_zero(rho_residual_values)
+        summary["max_rho_residual"] = self._max_or_zero(rho_residual_values)
         summary["rho_low_fraction"] = self._fraction_or_zero(
             rho_values, lambda value: value < 0.5
         )
@@ -703,6 +730,12 @@ class FedAvgAggregator(Aggregator):
         summary["mean_abs_standardized_residual"] = self._mean_or_zero(abs_std_residual_values)
         summary["min_abs_standardized_residual"] = self._min_or_zero(abs_std_residual_values)
         summary["max_abs_standardized_residual"] = self._max_or_zero(abs_std_residual_values)
+        summary["low_evidence_fraction"] = self._fraction_or_zero(
+            std_residual_values, lambda value: value < 0.0
+        )
+        summary["high_evidence_fraction"] = self._fraction_or_zero(
+            std_residual_values, lambda value: value > 0.0
+        )
         summary["mean_fisher_salience"] = self._mean_or_zero(fisher_salience_values)
         summary["min_fisher_salience"] = self._min_or_zero(fisher_salience_values)
         summary["max_fisher_salience"] = self._max_or_zero(fisher_salience_values)
@@ -836,6 +869,9 @@ class FedWoLFAggregator(FedAvgAggregator):
         self.process_noise_q = float(getattr(args, "fedwolf_process_noise_q", 0.01))
         self.sigma_e2 = float(getattr(args, "fedwolf_sigma_e2", 1.0))
         self.imq_c = float(getattr(args, "fedwolf_imq_c", 1.0))
+        self.rho_residual_mode = str(
+            getattr(args, "fedwolf_rho_residual_mode", "two_sided")
+        ).strip().lower()
         self.consistency_min = float(getattr(args, "fedwolf_consistency_min", 0.05))
         self.lambda_min = float(getattr(args, "fedwolf_lambda_min", 0.05))
         self.lambda_max = float(getattr(args, "fedwolf_lambda_max", 5.0))
@@ -851,6 +887,11 @@ class FedWoLFAggregator(FedAvgAggregator):
             raise ValueError("fedwolf_sigma_e2 must be positive")
         if self.process_noise_q < 0:
             raise ValueError("fedwolf_process_noise_q must be non-negative")
+        if self.rho_residual_mode not in {"two_sided", "low_only"}:
+            raise ValueError(
+                "fedwolf_rho_residual_mode must be one of {'two_sided', 'low_only'}, "
+                f"got {self.rho_residual_mode!r}."
+            )
         if self.consistency_min < 0.0 or self.consistency_min >= 1.0:
             raise ValueError("fedwolf_consistency_min must satisfy 0 <= value < 1")
         if self.lambda_min <= 0.0:

@@ -150,7 +150,7 @@ train:
   # DataLoader 随机流控制模式：
   # - legacy: 保持旧行为，不显式传 generator / worker_init_fn
   # - round_client: 为 client / round 构造可复现但不同的随机流，正式复现实验建议使用
-  dataloader_seed_mode: legacy
+  dataloader_seed_mode: round_client
 
   # 聚合方法：
   # - fedavg: 全模型按客户端样本数做 FedAvg
@@ -218,7 +218,17 @@ train:
   fedwolf_sigma_e2: 1e-4
 
   # WoLF-IMQ 鲁棒权重尺度 c；越小越容易对残差大的 evidence 降权
-  fedwolf_imq_c: 1.0
+  fedwolf_imq_c: 0.1
+
+  # FedWoLF IMQ rho 使用的 residual 模式。
+  # - two_sided: 原始 WoLF-IMQ，对 signed standardized residual 的正负偏离都降权：
+  #              rho = (1 + nu^2 / c^2)^(-1/2)
+  # - low_only: 只惩罚低于历史预测的 Fisher evidence：
+  #             nu_low = max(0, -nu)
+  #             rho = (1 + nu_low^2 / c^2)^(-1/2)
+  #             其中 nu = (z - mu_pred) / sqrt(P_pred + R + eps)。
+  #             这样高 Fisher evidence 不会被 rho 当成 outlier 惩罚。
+  fedwolf_rho_residual_mode: low_only
 
   # FedWoLF 是否启用 leave-one-out update consistency。
   # - true: 使用当前完整逻辑，根据客户端 expert update 方向和 leave-one-out 中心方向的一致性进行降权。
