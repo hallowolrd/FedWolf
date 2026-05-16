@@ -67,7 +67,13 @@ from data.loader import build_global_eval_loader, get_client_train_size, load_pa
 from fl.aggregators import build_aggregator
 from fl.client import Client
 from model import build_model_from_args
-from utils.utils import init_result_csv, init_server_result_csv, record_server_result
+from utils.utils import (
+    init_result_csv,
+    init_server_result_csv,
+    init_timing_csv,
+    record_server_result,
+    record_timing_result,
+)
 
 
 def _format_fedwolf_summary_value(value, integer=False):
@@ -123,6 +129,7 @@ class Server:
         # 初始化 CSV 结果文件，后续客户端训练会不断追加记录。
         init_result_csv(self.args)
         init_server_result_csv(self.args)
+        init_timing_csv(self.args)
 
 
     def init_global_model(self):
@@ -157,6 +164,9 @@ class Server:
         4. 保存 server.pth,供下一轮客户端同步
         5. 所有轮次结束后，在 global_test 上评估最终模型 """
 
+        train_start_time = time.perf_counter()
+        round_total_sec_acc = 0.0
+
         num_clients = len(self.clientsID_list)
         steps_per_round = num_clients + 2
         total_steps = self.server_epochs * steps_per_round + 1
@@ -171,7 +181,9 @@ class Server:
         try:
             # 外层循环是一轮轮服务端通信，也就是联邦学习中的 global round。
             for c_T in range(self.server_epochs):
-                self.logger.info(f"============================== T:{c_T+1} start !!! ===============================\n")
+                round_id = c_T + 1
+                round_start_time = time.perf_counter()
+                self.logger.info(f"============================== T:{round_id} start !!! ===============================\n")
                 server_state_dict = {
                     key: value.detach().cpu().clone()
                     for key, value in self.model.state_dict().items()
@@ -181,6 +193,7 @@ class Server:
                 round_client_expert_usages = []
                 round_client_states = []
                 round_client_sizes = []
+                client_loop_start = time.perf_counter()
                 for id in self.clientsID_list:
                     # 每个客户端执行本地训练，并返回本轮信息。
                     client_stats = Client(
@@ -231,29 +244,89 @@ class Server:
                 }
                 self.logger.info(f"--client_expert_usage_summary : {client_usage_list}\n")
                 self.logger.info(f"--round_expert_stats_by_layer : {layer_stats_log}\n")
+                client_loop_sec = time.perf_counter() - client_loop_start
                 # 所有客户端本地训练完成后，服务端通过聚合器更新全局模型。
+                aggregation_start = time.perf_counter()
                 self.aggregation(
                     client_states=round_client_states,
                     client_sizes=round_client_sizes,
                 )
+                aggregation_sec = time.perf_counter() - aggregation_start
 
                 # 每轮结束保存当前服务端模型，供下一轮客户端同步。
+                save_server_start = time.perf_counter()
                 self.save_server_model()
+                save_server_sec = time.perf_counter() - save_server_start
                 progress_bar.update(1)
                 progress_bar.set_postfix({
-                    "round": f"{c_T + 1}/{self.server_epochs}",
+                    "round": f"{round_id}/{self.server_epochs}",
                     "stage": "aggregation",
                 })
 
-                self.evaluate_round_on_global_test(round_id=c_T + 1)
+                round_eval_start = time.perf_counter()
+                self.evaluate_round_on_global_test(round_id=round_id)
+                round_eval_sec = time.perf_counter() - round_eval_start
                 progress_bar.update(1)
                 progress_bar.set_postfix({
-                    "round": f"{c_T + 1}/{self.server_epochs}",
+                    "round": f"{round_id}/{self.server_epochs}",
                     "stage": "round_eval",
                 })
                 torch.cuda.empty_cache()
 
+                round_total_sec = time.perf_counter() - round_start_time
+                round_total_sec_acc += round_total_sec
+                cumulative_train_sec = time.perf_counter() - train_start_time
+                avg_round_sec = round_total_sec_acc / round_id if round_id > 0 else 0.0
+                eta_sec = avg_round_sec * max(self.server_epochs - round_id, 0)
+                record_timing_result(
+                    {
+                        "phase": "round",
+                        "round": round_id,
+                        "num_clients": num_clients,
+                        "client_loop_sec": client_loop_sec,
+                        "aggregation_sec": aggregation_sec,
+                        "save_server_sec": save_server_sec,
+                        "round_eval_sec": round_eval_sec,
+                        "final_eval_sec": 0.0,
+                        "round_total_sec": round_total_sec,
+                        "cumulative_train_sec": cumulative_train_sec,
+                        "avg_round_sec": avg_round_sec,
+                        "eta_sec": eta_sec,
+                    },
+                    self.args,
+                )
+                self.logger.info(
+                    f"--round_timing : round={round_id} "
+                    f"client_loop_sec={client_loop_sec:.2f} "
+                    f"aggregation_sec={aggregation_sec:.2f} "
+                    f"save_server_sec={save_server_sec:.2f} "
+                    f"round_eval_sec={round_eval_sec:.2f} "
+                    f"round_total_sec={round_total_sec:.2f} "
+                    f"eta_sec={eta_sec:.2f}\n"
+                )
+
+            final_eval_start = time.perf_counter()
             self.evaluate_final_on_global_test()
+            final_eval_sec = time.perf_counter() - final_eval_start
+            cumulative_train_sec = time.perf_counter() - train_start_time
+            avg_round_sec = round_total_sec_acc / self.server_epochs if self.server_epochs > 0 else 0.0
+            record_timing_result(
+                {
+                    "phase": "final_eval",
+                    "round": self.server_epochs,
+                    "num_clients": num_clients,
+                    "client_loop_sec": 0.0,
+                    "aggregation_sec": 0.0,
+                    "save_server_sec": 0.0,
+                    "round_eval_sec": 0.0,
+                    "final_eval_sec": final_eval_sec,
+                    "round_total_sec": final_eval_sec,
+                    "cumulative_train_sec": cumulative_train_sec,
+                    "avg_round_sec": avg_round_sec,
+                    "eta_sec": 0.0,
+                },
+                self.args,
+            )
             progress_bar.update(1)
             progress_bar.set_postfix({
                 "round": f"{self.server_epochs}/{self.server_epochs}",

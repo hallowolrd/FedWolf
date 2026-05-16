@@ -51,6 +51,12 @@ def get_server_csv_path(args):
     filename = f"{get_experiment_stem(args)}.csv"
     return os.path.join(server_dir, filename)
 
+
+def get_timing_csv_path(args):
+    timing_dir = os.path.join(args.save_result, "timing")
+    filename = f"{get_experiment_stem(args)}.csv"
+    return os.path.join(timing_dir, filename)
+
 def init_result_csv(args):
     """初始化结果 CSV，写入表头。
 
@@ -91,6 +97,56 @@ def init_server_result_csv(args):
         ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
+
+def init_timing_csv(args):
+    """初始化每轮耗时 CSV，写入表头。
+
+    记录每轮 client loop、aggregation、server save、round eval 和总耗时。
+    """
+
+    csv_path = get_timing_csv_path(args)
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    with open(csv_path, 'w', newline='') as csvfile:
+        fieldnames = [
+            'phase',
+            'round',
+            'num_clients',
+            'client_loop_sec',
+            'aggregation_sec',
+            'save_server_sec',
+            'round_eval_sec',
+            'final_eval_sec',
+            'round_total_sec',
+            'cumulative_train_sec',
+            'avg_round_sec',
+            'eta_sec',
+        ]
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+
+
+def record_timing_result(record_dic: dict, args):
+    """追加写入一条 timing 记录。"""
+
+    csv_path = get_timing_csv_path(args)
+    with open(csv_path, 'a', newline='') as csvfile:
+        fieldnames = [
+            'phase',
+            'round',
+            'num_clients',
+            'client_loop_sec',
+            'aggregation_sec',
+            'save_server_sec',
+            'round_eval_sec',
+            'final_eval_sec',
+            'round_total_sec',
+            'cumulative_train_sec',
+            'avg_round_sec',
+            'eta_sec',
+        ]
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writerow(record_dic)
+
 
 def record_result(record_dic:dict, args):
     """追加写入一条客户端训练记录。"""
