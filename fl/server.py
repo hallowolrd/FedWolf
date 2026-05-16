@@ -318,7 +318,6 @@ class Server:
                 "round": round_id,
                 "test_loss": test_loss,
                 "test_acc": test_acc,
-                "selected_round": round_id,
             },
             self.args,
         )
@@ -329,8 +328,7 @@ class Server:
         test_loss, test_acc = self.evaluate_global_model(self.global_test_loader)
         self.logger.info(
             f"--final_global_test_loss : {test_loss:.4f} "
-            f"--final_global_test_acc : {test_acc:.4f} "
-            f"--selected_round : {self.server_epochs}\n"
+            f"--final_global_test_acc : {test_acc:.4f}\n"
         )
         record_server_result(
             {
@@ -338,7 +336,6 @@ class Server:
                 "round": self.server_epochs,
                 "test_loss": test_loss,
                 "test_acc": test_acc,
-                "selected_round": self.server_epochs,
             },
             self.args,
         )

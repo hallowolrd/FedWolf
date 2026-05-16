@@ -77,7 +77,8 @@ def init_result_csv(args):
 def init_server_result_csv(args):
     """初始化服务端结果 CSV。
 
-    当前协议不再记录逐轮验证集结果，只保留最终 global_test 评估。"""
+    记录每轮 round_test global_test 监控结果，以及训练结束后的 final_test。
+    """
 
     csv_path = get_server_csv_path(args)
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
@@ -87,7 +88,6 @@ def init_server_result_csv(args):
             'round',
             'test_loss',
             'test_acc',
-            'selected_round',
         ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
@@ -121,7 +121,6 @@ def record_server_result(record_dic:dict, args):
             'round',
             'test_loss',
             'test_acc',
-            'selected_round',
         ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writerow(record_dic)

@@ -507,7 +507,7 @@ class Client:
                 self.logger.info(f"--client: {self.client_id} --layer_expert_stats : {layer_usage_log}")
 
             record_dic = {
-                'T': self.c_T,
+                'T': self.c_T + 1,
                 'client_epoch': epoch + 1,
                 'client_id': self.client_id,
                 "learning_rate": self.current_lr,
@@ -576,6 +576,11 @@ class Client:
                 self.logger.info(
                     f"--client: {self.client_id} "
                     f"--expert_fisher_diagnostics_full : {fisher_diagnostics}"
+                )
+            else:
+                self.logger.info(
+                    f"--client: {self.client_id} "
+                    f"--expert_fisher_diagnostics_full_skipped : fedwolf_fisher_debug=False"
                 )
         else:
             self.logger.info(
