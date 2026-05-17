@@ -258,6 +258,11 @@ class Client:
             "effective_num_batches",
             "auxiliary_loss_used_for_fisher",
             "zero_score_reason",
+            "expert_block_fisher_matched_block_count",
+            "expert_block_fisher_positive_block_count",
+            "expert_block_fisher_mean_positive",
+            "expert_block_fisher_max_positive",
+            "unmatched_block_name_count",
             "num_samples_with_grad_by_layer",
             "score_scientific_by_layer",
             "score_mean_diag_by_layer",
@@ -520,6 +525,7 @@ class Client:
 
         fisher_score_by_layer = {}
         fisher_log_score_by_layer = {}
+        fisher_block_score_by_layer = {}
         fisher_diagnostics = None
 
         if self.should_compute_fisher_evidence():
@@ -566,6 +572,10 @@ class Client:
                 f"--expert_fisher_score_by_layer : {fisher_score_log} "
                 f"--expert_fisher_log_score_by_layer : {fisher_log_score_log}"
             )
+            fisher_block_score_by_layer = fisher_diagnostics.get(
+                "expert_block_fisher_score_by_layer",
+                {},
+            )
             fisher_debug = bool(getattr(self.args, "fedwolf_fisher_debug", False))
             fisher_diagnostics_summary = self.summarize_fisher_diagnostics(fisher_diagnostics)
             self.logger.info(
@@ -573,9 +583,14 @@ class Client:
                 f"--expert_fisher_diagnostics_summary : {fisher_diagnostics_summary}"
             )
             if fisher_debug:
+                fisher_diagnostics_for_log = dict(fisher_diagnostics)
+                if "expert_block_fisher_score_by_layer" in fisher_diagnostics_for_log:
+                    fisher_diagnostics_for_log["expert_block_fisher_score_by_layer"] = (
+                        "<omitted from log; returned in client_stats>"
+                    )
                 self.logger.info(
                     f"--client: {self.client_id} "
-                    f"--expert_fisher_diagnostics_full : {fisher_diagnostics}"
+                    f"--expert_fisher_diagnostics_full : {fisher_diagnostics_for_log}"
                 )
             else:
                 self.logger.info(
@@ -608,6 +623,7 @@ class Client:
             },
             "expert_fisher_score_by_layer": fisher_score_by_layer,
             "expert_fisher_log_score_by_layer": fisher_log_score_by_layer,
+            "expert_block_fisher_score_by_layer": fisher_block_score_by_layer,
             "evidence_expert_stats_by_layer": (
                 fisher_diagnostics.get("evidence_expert_stats_by_layer", {})
                 if fisher_diagnostics else {}

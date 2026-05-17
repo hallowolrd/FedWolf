@@ -116,6 +116,9 @@ class Server:
         self.logger.info(f"--aggregation_device : {getattr(self.aggregator, 'aggregation_device', 'cpu')}\n")
         self.logger.info(f"--dataloader_seed_mode : {getattr(self.args, 'dataloader_seed_mode', 'legacy')}\n")
         self.logger.info(f"--dataloader_base_seed : {getattr(self.args, 'seed', None)}\n")
+        self.logger.info(f"--fedwolf_precision_granularity : {getattr(self.args, 'fedwolf_precision_granularity', 'scalar')}\n")
+        self.logger.info(f"--fedwolf_block_fisher_power : {getattr(self.args, 'fedwolf_block_fisher_power', 0.25)}\n")
+        self.logger.info(f"--fedwolf_support_gate_mode : {getattr(self.args, 'fedwolf_support_gate_mode', 'cap_one')}\n")
         os.makedirs(self.args.model_save_path, exist_ok=True)
         self.partition_meta = load_partition_meta(self.args)
         self.global_test_loader = build_global_eval_loader(
@@ -475,6 +478,30 @@ class Server:
                     "num_valid_experts",
                     "use_old_prior",
                     "use_update_consistency",
+                    "precision_granularity_is_block",
+                    "block_precision_cache_enabled",
+                    "block_aggregation_enabled",
+                    "block_aggregation_fallback_fraction",
+                    "block_fisher_power",
+                    "support_gate_cap_one",
+                    "mean_support_gate",
+                    "min_support_gate",
+                    "max_support_gate",
+                    "mean_reliability_gate",
+                    "min_reliability_gate",
+                    "max_reliability_gate",
+                    "block_valid_fraction",
+                    "mean_block_fisher_positive",
+                    "min_block_fisher_positive",
+                    "max_block_fisher_positive",
+                    "mean_block_lambda_raw",
+                    "min_block_lambda_raw",
+                    "max_block_lambda_raw",
+                    "mean_block_lambda_final",
+                    "min_block_lambda_final",
+                    "max_block_lambda_final",
+                    "block_lambda_at_min_clip_fraction",
+                    "block_lambda_at_max_clip_fraction",
                     "lambda0",
                     "mean_old_prior_fraction",
                     "min_old_prior_fraction",

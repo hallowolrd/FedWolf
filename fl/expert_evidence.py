@@ -61,6 +61,21 @@ def parse_expert_param_ref(name):
     return str(parts[blocks_idx + 1]), int(parts[experts_idx + 1])
 
 
+def parse_expert_param_block_ref(name):
+    expert_ref = parse_expert_param_ref(name)
+    if expert_ref is None:
+        return None
+
+    parts = name.split(".")
+    experts_idx = parts.index("experts")
+    block_parts = parts[experts_idx + 2:]
+    if not block_parts:
+        return None
+
+    layer_id, expert_id = expert_ref
+    return layer_id, expert_id, ".".join(block_parts)
+
+
 def _collect_expert_parameter_entries(model, num_experts):
     expert_entries = {}
     param_counts = {}
@@ -456,11 +471,35 @@ def compute_expert_fisher_evidence(
         "score_trace_per_sample_by_layer": {},
         "score_trace_per_active_sample_by_layer": {},
         "score_trace_raw_by_layer": {},
+        "expert_block_fisher_score_by_layer": {},
+        "expert_block_fisher_matched_block_count": 0,
+        "expert_block_fisher_positive_block_count": 0,
+        "expert_block_fisher_mean_positive": 0.0,
+        "expert_block_fisher_max_positive": 0.0,
+        "unmatched_block_name_count": 0,
         "evidence_expert_stats_by_layer": {},
         "evidence_expert_activations_by_layer": {},
         "evidence_selected_counts_by_layer": {},
         "evidence_overflow_counts_by_layer": {},
     }
+
+    block_param_counts = {}
+    unmatched_block_name_count = 0
+    for layer_id, experts in expert_entries.items():
+        layer_key = str(layer_id)
+        for expert_id, entries in experts.items():
+            expert_key = str(expert_id)
+            for param_name, param in entries:
+                block_ref = parse_expert_param_block_ref(param_name)
+                if block_ref is None:
+                    unmatched_block_name_count += 1
+                    continue
+                _, _, block_name = block_ref
+                block_param_counts.setdefault(layer_key, {}).setdefault(expert_key, {})[block_name] = (
+                    block_param_counts.setdefault(layer_key, {}).setdefault(expert_key, {}).get(block_name, 0)
+                    + int(param.numel())
+                )
+    diagnostics["unmatched_block_name_count"] = int(unmatched_block_name_count)
 
     if not expert_entries:
         diagnostics["zero_score_reason"] = "No trainable expert parameters matched blocks.*.ffn.experts.* names."
@@ -475,6 +514,26 @@ def compute_expert_fisher_evidence(
     samples_with_grad = {
         layer_id: torch.zeros(num_experts, dtype=torch.long, device=device)
         for layer_id in expert_entries
+    }
+    block_score_sums = {
+        layer_id: {
+            expert_id: {
+                block_name: torch.zeros((), dtype=torch.float64, device=device)
+                for block_name in block_param_counts.get(str(layer_id), {}).get(str(expert_id), {})
+            }
+            for expert_id in experts
+        }
+        for layer_id, experts in expert_entries.items()
+    }
+    block_samples_with_grad = {
+        layer_id: {
+            expert_id: {
+                block_name: 0
+                for block_name in block_param_counts.get(str(layer_id), {}).get(str(expert_id), {})
+            }
+            for expert_id in experts
+        }
+        for layer_id, experts in expert_entries.items()
     }
 
     was_training = model.training
@@ -547,12 +606,21 @@ def compute_expert_fisher_evidence(
                 for layer_id, experts in expert_entries.items():
                     for expert_id, entries in experts.items():
                         grad_square_sum = None
+                        block_grad_square_sums = {}
                         has_grad_param_count = 0
                         none_grad_param_count = 0
-                        for _, param in entries:
+                        for param_name, param in entries:
                             if param.grad is not None:
                                 value = param.grad.detach().pow(2).sum().to(dtype=torch.float64)
                                 grad_square_sum = value if grad_square_sum is None else grad_square_sum + value
+                                block_ref = parse_expert_param_block_ref(param_name)
+                                if block_ref is not None:
+                                    _, _, block_name = block_ref
+                                    block_grad_square_sums[block_name] = (
+                                        value
+                                        if block_name not in block_grad_square_sums
+                                        else block_grad_square_sums[block_name] + value
+                                    )
                                 has_grad_param_count += 1
                             else:
                                 none_grad_param_count += 1
@@ -560,6 +628,10 @@ def compute_expert_fisher_evidence(
                         if has_grad_param_count > 0:
                             samples_with_grad[layer_id][expert_id] += 1
                             score_sums[layer_id][expert_id] += grad_square_sum
+                            for block_name, block_grad_square_sum in block_grad_square_sums.items():
+                                if block_name in block_score_sums.get(layer_id, {}).get(expert_id, {}):
+                                    block_samples_with_grad[layer_id][expert_id][block_name] += 1
+                                    block_score_sums[layer_id][expert_id][block_name] += block_grad_square_sum
 
             if num_batches <= debug_batches:
                 diagnostics["batch_grad_status"].append(
@@ -600,6 +672,48 @@ def compute_expert_fisher_evidence(
 
     score_by_layer = {}
     log_score_by_layer = {}
+    expert_block_fisher_score_by_layer = {}
+    positive_block_scores = []
+    matched_block_count = 0
+
+    for layer_id, experts in block_param_counts.items():
+        layer_key = str(layer_id)
+        layer_block_scores = {}
+        for expert_id, blocks in experts.items():
+            expert_key = str(expert_id)
+            expert_block_scores = {}
+            for block_name, block_param_count in blocks.items():
+                matched_block_count += 1
+                grad_square_sum = block_score_sums.get(layer_id, {}).get(int(expert_id), {}).get(block_name)
+                if grad_square_sum is None:
+                    grad_square_sum_value = 0.0
+                else:
+                    grad_square_sum_value = float(grad_square_sum.detach().cpu().item())
+                num_samples_with_grad = int(
+                    block_samples_with_grad.get(layer_id, {}).get(int(expert_id), {}).get(block_name, 0)
+                )
+                block_score = compute_fisher_scalar_from_sums(
+                    grad_square_sum=grad_square_sum_value,
+                    param_count=int(block_param_count),
+                    total_samples=total_samples,
+                    num_samples_with_grad=num_samples_with_grad,
+                    mode=canonical_score_mode,
+                )
+                expert_block_scores[str(block_name)] = float(block_score)
+                if block_score > 0.0:
+                    positive_block_scores.append(float(block_score))
+            if expert_block_scores:
+                layer_block_scores[expert_key] = expert_block_scores
+        if layer_block_scores:
+            expert_block_fisher_score_by_layer[layer_key] = layer_block_scores
+
+    diagnostics["expert_block_fisher_score_by_layer"] = expert_block_fisher_score_by_layer
+    diagnostics["expert_block_fisher_matched_block_count"] = int(matched_block_count)
+    diagnostics["expert_block_fisher_positive_block_count"] = int(len(positive_block_scores))
+    diagnostics["expert_block_fisher_mean_positive"] = (
+        sum(positive_block_scores) / len(positive_block_scores) if positive_block_scores else 0.0
+    )
+    diagnostics["expert_block_fisher_max_positive"] = max(positive_block_scores) if positive_block_scores else 0.0
 
     for layer_id, scores in score_sums.items():
         scores_cpu = scores.detach().cpu()

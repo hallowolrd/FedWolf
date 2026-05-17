@@ -30,6 +30,23 @@ def parse_expert_ref_from_key(key):
     return parts[blocks_idx + 1], int(parts[experts_idx + 1])
 
 
+def parse_expert_block_ref_from_key(key):
+    expert_ref = parse_expert_ref_from_key(key)
+    if expert_ref is None:
+        return None
+
+    parts = key.split(".")
+    experts_idx = parts.index("experts")
+    if experts_idx + 2 >= len(parts):
+        return None
+
+    layer_id, expert_id = expert_ref
+    block_name = ".".join(parts[experts_idx + 2:])
+    if not block_name:
+        return None
+    return int(layer_id), int(expert_id), block_name
+
+
 def resolve_aggregation_device(args):
     raw_device = getattr(args, "aggregation_device", "cpu")
     if raw_device is None:
@@ -121,6 +138,9 @@ class FedAvgAggregator(Aggregator):
             return None
         layer_id, expert_id = expert_ref
         return int(layer_id), int(expert_id)
+
+    def _parse_expert_block_ref_from_key(self, key):
+        return parse_expert_block_ref_from_key(key)
 
     def _collect_expert_param_keys_by_ref(self, state_keys):
         expert_param_keys_by_ref = {}
@@ -214,6 +234,71 @@ class FedAvgAggregator(Aggregator):
 
         return self._to_output_device(numerator / (denominator + self.eps))
 
+    def _aggregate_block_precision_fusion_expert_param(
+        self,
+        key,
+        first_value,
+        expert_ref,
+        block_name,
+        client_updates,
+        global_state,
+        precision_cache,
+    ):
+        self._block_aggregation_param_count = getattr(
+            self,
+            "_block_aggregation_param_count",
+            0,
+        ) + 1
+
+        def fallback_to_global():
+            self._block_aggregation_fallback_count = getattr(
+                self,
+                "_block_aggregation_fallback_count",
+                0,
+            ) + 1
+            if global_state is not None and key in global_state:
+                return global_state[key].detach().cpu().clone()
+            return first_value.cpu().clone()
+
+        if global_state is None or key not in global_state:
+            return fallback_to_global()
+
+        cache = precision_cache.get(expert_ref)
+        if cache is None:
+            return fallback_to_global()
+
+        block_weights_by_key = cache.get("block_lambda_final_by_param_key", {})
+        if not isinstance(block_weights_by_key, dict):
+            return fallback_to_global()
+
+        weights = block_weights_by_key.get(block_name)
+        if weights is None:
+            return fallback_to_global()
+        if len(weights) != len(client_updates):
+            raise ValueError(
+                "block_lambda_final_by_param_key weight length must match client_updates; "
+                f"got {len(weights)} weights for {len(client_updates)} clients "
+                f"at expert_ref={expert_ref}, block_name={block_name!r}."
+            )
+
+        theta_old = self._to_agg_device(global_state[key])
+        numerator = torch.zeros_like(theta_old)
+        denominator = 0.0
+        valid_client_count = 0
+
+        for update, weight in zip(client_updates, weights):
+            weight = safe_float(weight, default=0.0)
+            if weight <= 0.0 or key not in update:
+                continue
+            numerator += self._to_agg_device(update[key]) * weight
+            denominator += weight
+            valid_client_count += 1
+
+        if valid_client_count == 0 or denominator <= self.eps:
+            return fallback_to_global()
+
+        return self._to_output_device(numerator / (denominator + self.eps))
+
     def _prepare_fedwolf_precision_cache(
         self,
         expert_param_keys_by_ref,
@@ -247,11 +332,17 @@ class FedAvgAggregator(Aggregator):
             raw_scores = []
             observations = []
             active_tokens = []
+            block_fisher_by_client = []
             valid = []
             for update, client_stat in zip(client_updates, client_stats):
                 s_value = self._get_fisher_score(client_stat, layer_id, expert_id)
                 z_value = self._get_fisher_log_score(client_stat, layer_id, expert_id)
                 n_value = self._get_evidence_active_tokens(client_stat, layer_id, expert_id)
+                block_fisher_scores = self._get_block_fisher_scores(
+                    client_stat,
+                    layer_id,
+                    expert_id,
+                )
                 has_client_params = self._client_has_all_expert_params(update, param_keys)
                 is_valid = (
                     has_global_params
@@ -264,6 +355,7 @@ class FedAvgAggregator(Aggregator):
                 raw_scores.append(s_value)
                 observations.append(z_value)
                 active_tokens.append(n_value)
+                block_fisher_by_client.append(block_fisher_scores)
                 valid.append(bool(is_valid))
 
             positive_ns = [
@@ -329,6 +421,34 @@ class FedAvgAggregator(Aggregator):
                 rho_residual_values.append(rho_residual)
                 rho_values.append(rho)
                 lambda_filters.append(lambda_filter)
+
+            support_gate_clients = []
+            reliability_gate_clients = []
+            for is_valid, rho, n_rel in zip(valid, rho_values, n_rel_values):
+                if not is_valid:
+                    support_gate_clients.append(0.0)
+                    reliability_gate_clients.append(0.0)
+                    continue
+
+                if self.support_gate_mode == "cap_one":
+                    support_gate = min(
+                        1.0,
+                        math.sqrt(max(safe_float(n_rel, default=0.0), 0.0)),
+                    )
+                else:
+                    raise ValueError(
+                        "fedwolf_support_gate_mode must be one of {'cap_one'}, "
+                        f"got {self.support_gate_mode!r}."
+                    )
+                reliability_gate = max(safe_float(rho, default=0.0), 0.0) ** 2 * support_gate
+                support_gate_clients.append(float(support_gate))
+                reliability_gate_clients.append(float(reliability_gate))
+
+            block_precision_cache = self._compute_block_precision_cache(
+                block_fisher_by_client=block_fisher_by_client,
+                valid=valid,
+                reliability_gate_clients=reliability_gate_clients,
+            )
 
             valid_observations = [
                 z_value for z_value, is_valid in zip(observations, valid) if is_valid
@@ -420,6 +540,20 @@ class FedAvgAggregator(Aggregator):
                 "rho_residual_mode": self.rho_residual_mode,
                 "rho_low_only_mode": 1.0 if self.rho_residual_mode == "low_only" else 0.0,
                 "rho_residual_values": rho_residual_values,
+                "support_gate_clients": support_gate_clients,
+                "reliability_gate_clients": reliability_gate_clients,
+                "block_lambda_raw_by_param_key": block_precision_cache[
+                    "block_lambda_raw_by_param_key"
+                ],
+                "block_lambda_final_by_param_key": block_precision_cache[
+                    "block_lambda_final_by_param_key"
+                ],
+                "block_fisher_by_param_key": block_precision_cache[
+                    "block_fisher_by_param_key"
+                ],
+                "block_valid_by_param_key": block_precision_cache[
+                    "block_valid_by_param_key"
+                ],
                 "valid": valid,
                 "mu_pred": float(mu_pred),
                 "P_pred": float(p_pred),
@@ -450,6 +584,86 @@ class FedAvgAggregator(Aggregator):
             }
 
         return precision_cache
+
+    def _compute_block_precision_cache(
+        self,
+        block_fisher_by_client,
+        valid,
+        reliability_gate_clients,
+    ):
+        block_lambda_raw_by_param_key = {}
+        block_lambda_final_by_param_key = {}
+        block_fisher_by_param_key = {}
+        block_valid_by_param_key = {}
+
+        all_block_names = sorted(
+            {
+                str(block_name)
+                for client_blocks in block_fisher_by_client or []
+                if isinstance(client_blocks, dict)
+                for block_name in client_blocks.keys()
+            }
+        )
+        num_clients = len(block_fisher_by_client or [])
+
+        for block_name in all_block_names:
+            fisher_values = []
+            for client_blocks in block_fisher_by_client:
+                value = 0.0
+                if isinstance(client_blocks, dict):
+                    value = safe_float(client_blocks.get(block_name), default=0.0)
+                fisher_values.append(max(float(value), 0.0))
+
+            valid_positive_fisher = [
+                value
+                for value, is_valid, reliability_gate in zip(
+                    fisher_values,
+                    valid,
+                    reliability_gate_clients,
+                )
+                if is_valid and reliability_gate > 0.0 and value > 0.0
+            ]
+            mean_valid_fisher = self._mean_or_zero(valid_positive_fisher)
+
+            raw_values = [0.0 for _ in range(num_clients)]
+            block_valid_values = [False for _ in range(num_clients)]
+            if mean_valid_fisher > 0.0:
+                for idx, (value, is_valid, reliability_gate) in enumerate(
+                    zip(fisher_values, valid, reliability_gate_clients)
+                ):
+                    if not is_valid or reliability_gate <= 0.0 or value <= 0.0:
+                        continue
+                    relative_fisher = (value + self.eps) / (mean_valid_fisher + self.eps)
+                    raw_precision = reliability_gate * (
+                        max(relative_fisher, 0.0) ** float(self.block_fisher_power)
+                    )
+                    raw_precision = safe_float(raw_precision, default=0.0)
+                    if raw_precision <= 0.0:
+                        continue
+                    raw_values[idx] = float(raw_precision)
+                    block_valid_values[idx] = True
+
+            positive_raw_values = [value for value in raw_values if value > 0.0]
+            mean_positive_raw = self._mean_or_zero(positive_raw_values)
+            final_values = []
+            for raw_precision in raw_values:
+                if raw_precision <= 0.0 or mean_positive_raw <= 0.0:
+                    final_values.append(0.0)
+                    continue
+                normalized_precision = raw_precision / (mean_positive_raw + self.eps)
+                final_values.append(float(self._clip_lambda(normalized_precision)))
+
+            block_fisher_by_param_key[block_name] = [float(value) for value in fisher_values]
+            block_lambda_raw_by_param_key[block_name] = [float(value) for value in raw_values]
+            block_lambda_final_by_param_key[block_name] = [float(value) for value in final_values]
+            block_valid_by_param_key[block_name] = [bool(value) for value in block_valid_values]
+
+        return {
+            "block_lambda_raw_by_param_key": block_lambda_raw_by_param_key,
+            "block_lambda_final_by_param_key": block_lambda_final_by_param_key,
+            "block_fisher_by_param_key": block_fisher_by_param_key,
+            "block_valid_by_param_key": block_valid_by_param_key,
+        }
 
     def _client_has_all_expert_params(self, client_update, param_keys):
         return all(key in client_update for key in param_keys)
@@ -558,6 +772,32 @@ class FedAvgAggregator(Aggregator):
             "aggregation_weight_mode": self._get_aggregation_weight_mode(),
             "use_old_prior": bool(self.use_old_prior),
             "use_update_consistency": bool(self.use_update_consistency),
+            "precision_granularity_is_block": (
+                1.0 if self.precision_granularity == "block" else 0.0
+            ),
+            "block_fisher_power": float(self.block_fisher_power),
+            "support_gate_cap_one": 1.0 if self.support_gate_mode == "cap_one" else 0.0,
+            "block_precision_cache_enabled": 0.0,
+            "block_aggregation_enabled": 0.0,
+            "block_aggregation_fallback_fraction": 0.0,
+            "mean_support_gate": 0.0,
+            "min_support_gate": 0.0,
+            "max_support_gate": 0.0,
+            "mean_reliability_gate": 0.0,
+            "min_reliability_gate": 0.0,
+            "max_reliability_gate": 0.0,
+            "block_valid_fraction": 0.0,
+            "mean_block_fisher_positive": 0.0,
+            "min_block_fisher_positive": 0.0,
+            "max_block_fisher_positive": 0.0,
+            "mean_block_lambda_raw": 0.0,
+            "min_block_lambda_raw": 0.0,
+            "max_block_lambda_raw": 0.0,
+            "mean_block_lambda_final": 0.0,
+            "min_block_lambda_final": 0.0,
+            "max_block_lambda_final": 0.0,
+            "block_lambda_at_min_clip_fraction": 0.0,
+            "block_lambda_at_max_clip_fraction": 0.0,
             "lambda0": 0.0,
             "mean_old_prior_fraction": 0.0,
             "min_old_prior_fraction": 0.0,
@@ -630,6 +870,14 @@ class FedAvgAggregator(Aggregator):
         abs_std_residual_values = []
         n_rel_values = []
         support_reliability_values = []
+        support_gate_values = []
+        reliability_gate_values = []
+        block_fisher_positive_values = []
+        block_lambda_raw_values = []
+        block_lambda_final_values = []
+        block_final_values_for_positive_raw = []
+        block_raw_total_count = 0
+        block_raw_positive_count = 0
         fisher_salience_values = []
         update_consistency_values = []
         mu_values = []
@@ -657,6 +905,41 @@ class FedAvgAggregator(Aggregator):
             support_reliability_values.extend(
                 self._finite_values(cache.get("support_values"), mask=valid)
             )
+            support_gate_values.extend(
+                self._finite_values(cache.get("support_gate_clients"), mask=valid)
+            )
+            reliability_gate_values.extend(
+                self._finite_values(cache.get("reliability_gate_clients"), mask=valid)
+            )
+            block_fisher_by_param_key = cache.get("block_fisher_by_param_key", {})
+            if isinstance(block_fisher_by_param_key, dict):
+                for block_values in block_fisher_by_param_key.values():
+                    block_fisher_positive_values.extend(
+                        self._finite_values(block_values, positive_only=True)
+                    )
+
+            block_lambda_raw_by_param_key = cache.get("block_lambda_raw_by_param_key", {})
+            block_lambda_final_by_param_key = cache.get("block_lambda_final_by_param_key", {})
+            if isinstance(block_lambda_raw_by_param_key, dict):
+                for block_name, raw_values in block_lambda_raw_by_param_key.items():
+                    if raw_values is None:
+                        continue
+                    final_values = []
+                    if isinstance(block_lambda_final_by_param_key, dict):
+                        final_values = block_lambda_final_by_param_key.get(block_name, []) or []
+                    for idx, raw_value in enumerate(raw_values):
+                        raw_value = safe_float(raw_value, default=0.0)
+                        block_raw_total_count += 1
+                        if raw_value <= 0.0:
+                            continue
+                        block_raw_positive_count += 1
+                        block_lambda_raw_values.append(raw_value)
+                        final_value = 0.0
+                        if idx < len(final_values):
+                            final_value = safe_float(final_values[idx], default=0.0)
+                        block_final_values_for_positive_raw.append(final_value)
+                        if final_value > 0.0:
+                            block_lambda_final_values.append(final_value)
             rho_values.extend(self._finite_values(cache.get("rho"), mask=valid))
             rho_residual_values.extend(
                 self._finite_values(cache.get("rho_residual_values"), mask=valid)
@@ -690,6 +973,50 @@ class FedAvgAggregator(Aggregator):
         summary["lambda0"] = self._mean_or_zero(lambda0_values)
         summary["use_old_prior"] = bool(self.use_old_prior)
         summary["use_update_consistency"] = bool(self.use_update_consistency)
+        summary["precision_granularity_is_block"] = (
+            1.0 if self.precision_granularity == "block" else 0.0
+        )
+        summary["block_fisher_power"] = float(self.block_fisher_power)
+        summary["support_gate_cap_one"] = (
+            1.0 if self.support_gate_mode == "cap_one" else 0.0
+        )
+        summary["block_precision_cache_enabled"] = (
+            1.0 if block_raw_positive_count > 0 else 0.0
+        )
+        summary["mean_support_gate"] = self._mean_or_zero(support_gate_values)
+        summary["min_support_gate"] = self._min_or_zero(support_gate_values)
+        summary["max_support_gate"] = self._max_or_zero(support_gate_values)
+        summary["mean_reliability_gate"] = self._mean_or_zero(reliability_gate_values)
+        summary["min_reliability_gate"] = self._min_or_zero(reliability_gate_values)
+        summary["max_reliability_gate"] = self._max_or_zero(reliability_gate_values)
+        summary["block_valid_fraction"] = (
+            block_raw_positive_count / float(block_raw_total_count)
+            if block_raw_total_count > 0 else 0.0
+        )
+        summary["mean_block_fisher_positive"] = self._mean_or_zero(
+            block_fisher_positive_values
+        )
+        summary["min_block_fisher_positive"] = self._min_or_zero(
+            block_fisher_positive_values
+        )
+        summary["max_block_fisher_positive"] = self._max_or_zero(
+            block_fisher_positive_values
+        )
+        summary["mean_block_lambda_raw"] = self._mean_or_zero(block_lambda_raw_values)
+        summary["min_block_lambda_raw"] = self._min_or_zero(block_lambda_raw_values)
+        summary["max_block_lambda_raw"] = self._max_or_zero(block_lambda_raw_values)
+        summary["mean_block_lambda_final"] = self._mean_or_zero(block_lambda_final_values)
+        summary["min_block_lambda_final"] = self._min_or_zero(block_lambda_final_values)
+        summary["max_block_lambda_final"] = self._max_or_zero(block_lambda_final_values)
+        block_clip_tol = 1e-12
+        summary["block_lambda_at_min_clip_fraction"] = self._fraction_or_zero(
+            block_final_values_for_positive_raw,
+            lambda value: value <= self.lambda_min + block_clip_tol,
+        )
+        summary["block_lambda_at_max_clip_fraction"] = self._fraction_or_zero(
+            block_final_values_for_positive_raw,
+            lambda value: value >= self.lambda_max - block_clip_tol,
+        )
         summary["mean_old_prior_fraction"] = self._mean_or_zero(old_prior_fraction_values)
         summary["min_old_prior_fraction"] = self._min_or_zero(old_prior_fraction_values)
         summary["max_old_prior_fraction"] = self._max_or_zero(old_prior_fraction_values)
@@ -872,6 +1199,15 @@ class FedWoLFAggregator(FedAvgAggregator):
         self.rho_residual_mode = str(
             getattr(args, "fedwolf_rho_residual_mode", "two_sided")
         ).strip().lower()
+        self.precision_granularity = str(
+            getattr(args, "fedwolf_precision_granularity", "scalar")
+        ).strip().lower()
+        self.block_fisher_power = float(
+            getattr(args, "fedwolf_block_fisher_power", 0.25)
+        )
+        self.support_gate_mode = str(
+            getattr(args, "fedwolf_support_gate_mode", "cap_one")
+        ).strip().lower()
         self.consistency_min = float(getattr(args, "fedwolf_consistency_min", 0.05))
         self.lambda_min = float(getattr(args, "fedwolf_lambda_min", 0.05))
         self.lambda_max = float(getattr(args, "fedwolf_lambda_max", 5.0))
@@ -891,6 +1227,21 @@ class FedWoLFAggregator(FedAvgAggregator):
             raise ValueError(
                 "fedwolf_rho_residual_mode must be one of {'two_sided', 'low_only'}, "
                 f"got {self.rho_residual_mode!r}."
+            )
+        if self.precision_granularity not in {"scalar", "block"}:
+            raise ValueError(
+                "fedwolf_precision_granularity must be one of {'scalar', 'block'}, "
+                f"got {self.precision_granularity!r}."
+            )
+        if not (0.0 <= self.block_fisher_power <= 1.0):
+            raise ValueError(
+                "fedwolf_block_fisher_power must be in [0, 1], "
+                f"got {self.block_fisher_power!r}."
+            )
+        if self.support_gate_mode not in {"cap_one"}:
+            raise ValueError(
+                "fedwolf_support_gate_mode must be one of {'cap_one'}, "
+                f"got {self.support_gate_mode!r}."
             )
         if self.consistency_min < 0.0 or self.consistency_min >= 1.0:
             raise ValueError("fedwolf_consistency_min must satisfy 0 <= value < 1")
@@ -937,6 +1288,9 @@ class FedWoLFAggregator(FedAvgAggregator):
         else:
             self.last_filter_summary = {}
 
+        self._block_aggregation_param_count = 0
+        self._block_aggregation_fallback_count = 0
+
         aggregated_state = collections.OrderedDict()
         for key in client_updates[0].keys():
             first_value = client_updates[0][key].detach()
@@ -966,13 +1320,55 @@ class FedWoLFAggregator(FedAvgAggregator):
                 )
                 continue
 
-            aggregated_state[key] = self._aggregate_precision_fusion_expert_param(
-                key=key,
-                first_value=first_value,
-                expert_ref=expert_ref,
-                client_updates=client_updates,
-                global_state=global_state,
-                precision_cache=precision_cache,
+            if self.precision_granularity == "scalar":
+                aggregated_state[key] = self._aggregate_precision_fusion_expert_param(
+                    key=key,
+                    first_value=first_value,
+                    expert_ref=expert_ref,
+                    client_updates=client_updates,
+                    global_state=global_state,
+                    precision_cache=precision_cache,
+                )
+                continue
+
+            if self.precision_granularity == "block":
+                expert_block_ref = self._parse_expert_block_ref_from_key(key)
+                if expert_block_ref is None:
+                    aggregated_state[key] = global_state[key].detach().cpu().clone()
+                    self._block_aggregation_param_count += 1
+                    self._block_aggregation_fallback_count += 1
+                    continue
+                block_layer_id, block_expert_id, block_name = expert_block_ref
+                if (block_layer_id, block_expert_id) != expert_ref:
+                    raise ValueError(
+                        "Expert block ref mismatch while aggregating block precision: "
+                        f"expert_ref={expert_ref}, expert_block_ref={expert_block_ref}."
+                    )
+                aggregated_state[key] = self._aggregate_block_precision_fusion_expert_param(
+                    key=key,
+                    first_value=first_value,
+                    expert_ref=expert_ref,
+                    block_name=block_name,
+                    client_updates=client_updates,
+                    global_state=global_state,
+                    precision_cache=precision_cache,
+                )
+                continue
+
+            raise ValueError(
+                "fedwolf_precision_granularity must be one of {'scalar', 'block'}, "
+                f"got {self.precision_granularity!r}."
+            )
+
+        if self.use_wolf_filter and isinstance(self.last_filter_summary, dict):
+            block_param_count = getattr(self, "_block_aggregation_param_count", 0)
+            block_fallback_count = getattr(self, "_block_aggregation_fallback_count", 0)
+            self.last_filter_summary["block_aggregation_enabled"] = (
+                1.0 if self.precision_granularity == "block" and block_param_count > 0 else 0.0
+            )
+            self.last_filter_summary["block_aggregation_fallback_fraction"] = (
+                block_fallback_count / float(block_param_count)
+                if block_param_count > 0 else 0.0
             )
         return aggregated_state
 
@@ -1089,6 +1485,30 @@ class FedWoLFAggregator(FedAvgAggregator):
         if value is None:
             return None
         return max(value, 0.0)
+
+    def _get_block_fisher_scores(self, client_stats, layer_id, expert_id):
+        if not isinstance(client_stats, dict):
+            return {}
+
+        block_by_layer = client_stats.get("expert_block_fisher_score_by_layer", {})
+        if not isinstance(block_by_layer, dict):
+            return {}
+
+        layer_dict = self._get_value_by_id(block_by_layer, layer_id)
+        if not isinstance(layer_dict, dict):
+            return {}
+
+        expert_dict = self._get_value_by_id(layer_dict, expert_id)
+        if not isinstance(expert_dict, dict):
+            return {}
+
+        block_scores = {}
+        for block_name, value in expert_dict.items():
+            value = safe_float(value, default=None)
+            if value is None or value <= 0.0:
+                continue
+            block_scores[str(block_name)] = float(value)
+        return block_scores
 
     def _get_layer_expert_value(self, client_stats, field_name, layer_id, expert_id):
         if not isinstance(client_stats, dict):

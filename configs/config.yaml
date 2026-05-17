@@ -254,6 +254,22 @@ train:
   #             这样高 Fisher evidence 不会被 rho 当成 outlier 惩罚。
   fedwolf_rho_residual_mode: low_only
 
+  # FedWoLF precision granularity.
+  # - scalar: current FedWoLF behavior, one scalar precision per client-expert.
+  # - block: reserved for future Block-wise Fisher-WoLF, one precision per client-expert-parameter-block.
+  fedwolf_precision_granularity: block
+
+  # Power used for future block-wise Fisher precision.
+  # Only used when fedwolf_precision_granularity == block in future implementation.
+  # alpha=0 disables block Fisher difference; alpha=1 uses raw relative Fisher precision.
+  # We use 0.25 as a conservative default because empirical Fisher can be noisy.
+  fedwolf_block_fisher_power: 0.25
+
+  # Support gate mode for future Block-wise Fisher-WoLF.
+  # - cap_one: use min(1, sqrt(n_rel)) so support shortage down-weights evidence,
+  #            but high support does not get unlimited reward.
+  fedwolf_support_gate_mode: cap_one
+
   # FedWoLF 是否启用 leave-one-out update consistency。
   # - true: 使用当前完整逻辑，根据客户端 expert update 方向和 leave-one-out 中心方向的一致性进行降权。
   # - false: 关闭 update consistency 消融，所有 client-expert 的 consistency 固定为 1.0，
