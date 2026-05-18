@@ -103,12 +103,9 @@ class Client:
     def build_optimizer(self):
         optimizer_name = str(getattr(self.args, "optimizer", "adam")).strip().lower()
         weight_decay = float(getattr(self.args, "weight_decay", 0.0))
-        momentum = float(getattr(self.args, "momentum", 0.9))
 
         if weight_decay < 0.0:
             raise ValueError("weight_decay must be non-negative.")
-        if momentum < 0.0:
-            raise ValueError("momentum must be non-negative.")
 
         if optimizer_name == "adam":
             return optim.Adam(
@@ -124,17 +121,9 @@ class Client:
                 lr=self.current_lr,
             )
 
-        if optimizer_name == "sgd":
-            return optim.SGD(
-                self.model.parameters(),
-                lr=self.current_lr,
-                momentum=momentum,
-                weight_decay=weight_decay,
-            )
-
         raise ValueError(
             f"Unsupported optimizer: {optimizer_name!r}. "
-            "Expected 'adam', 'adamw', or 'sgd'."
+            "Expected 'adam' or 'adamw'."
         )
 
     def get_current_learning_rate(self) -> float:

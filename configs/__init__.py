@@ -136,9 +136,9 @@ def _validate_training_hparams(merged_config: dict) -> None:
         merged_config["min_learning_rate"] = min_learning_rate
 
     optimizer = str(merged_config.get("optimizer", "adam")).strip().lower()
-    if optimizer not in {"adam", "adamw", "sgd"}:
+    if optimizer not in {"adam", "adamw"}:
         raise ValueError(
-            "optimizer must be one of {'adam', 'adamw', 'sgd'}, "
+            "optimizer must be one of {'adam', 'adamw'}, "
             f"got {optimizer!r}."
         )
     merged_config["optimizer"] = optimizer
@@ -150,14 +150,6 @@ def _validate_training_hparams(merged_config: dict) -> None:
     if not math.isfinite(weight_decay) or weight_decay < 0.0:
         raise ValueError("weight_decay must be non-negative.")
     merged_config["weight_decay"] = weight_decay
-
-    try:
-        momentum = float(merged_config.get("momentum", 0.9))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("momentum must be a non-negative number.") from exc
-    if not math.isfinite(momentum) or momentum < 0.0:
-        raise ValueError("momentum must be non-negative.")
-    merged_config["momentum"] = momentum
 
     warmup_rounds = merged_config.get("warmup_rounds", 0)
     if isinstance(warmup_rounds, bool) or not isinstance(warmup_rounds, int):
@@ -334,7 +326,6 @@ def load_args(config_path: str):
     _raise_if_missing_required_keys(merged_config)
     merged_config.setdefault("optimizer", "adam")
     merged_config.setdefault("weight_decay", 0.0)
-    merged_config.setdefault("momentum", 0.9)
     merged_config.setdefault("warmup_rounds", 0)
     merged_config.setdefault("warmup_start_learning_rate", None)
     _validate_training_hparams(merged_config)
