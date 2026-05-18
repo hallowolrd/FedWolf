@@ -471,12 +471,11 @@ class Server:
         self.logger.info(f"--client_train_sizes : {client_sizes}\n")
         filter_summary = getattr(self.aggregator, "last_filter_summary", None)
         if filter_summary:
-            if isinstance(filter_summary, dict) and "lambda0" in filter_summary:
+            if isinstance(filter_summary, dict) and "aggregation_weight_mode" in filter_summary:
                 summary_keys = [
                     "aggregation_weight_mode",
                     "num_experts",
                     "num_valid_experts",
-                    "use_old_prior",
                     "use_update_consistency",
                     "precision_granularity_is_block",
                     "block_precision_cache_enabled",
@@ -502,10 +501,6 @@ class Server:
                     "max_block_lambda_final",
                     "block_lambda_at_min_clip_fraction",
                     "block_lambda_at_max_clip_fraction",
-                    "lambda0",
-                    "mean_old_prior_fraction",
-                    "min_old_prior_fraction",
-                    "max_old_prior_fraction",
                     "mean_lambda_filter",
                     "min_lambda_filter",
                     "max_lambda_filter",

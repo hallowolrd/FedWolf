@@ -93,7 +93,7 @@ python train.py
    - 用 activation support 计算 `R`
    - 用 `z = log1p(s)` 和 `R` 做 standardized residual / IMQ / filter precision update
    - 用 Fisher salience、leave-one-out consistency 得到 `lambda_clients`
-   - 用 `lambda0` 和 `lambda_clients` 做 client-expert precision fusion
+   - 用 `lambda_clients` 做 no-prior client-expert precision fusion
 3. 如果某个 expert 本轮没有有效 evidence，则保留旧 global expert。
 
 ## FedWoLF 配置
@@ -312,7 +312,6 @@ FedWoLF 日志中可观察：
   - `aggregation_weight_mode`
   - `num_experts`
   - `num_valid_experts`
-  - `lambda0`
   - `mean_lambda_filter`
   - `mean_lambda_raw`
   - `mean_lambda_final`

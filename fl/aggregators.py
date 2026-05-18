@@ -204,18 +204,10 @@ class FedAvgAggregator(Aggregator):
             return global_state[key].detach().cpu().clone()
 
         theta_old = self._to_agg_device(global_state[key])
-        lambda0 = max(float(cache["lambda0"]), 0.0)
-        if self.use_old_prior:
-            numerator = theta_old * lambda0
-            denominator = lambda0
-        else:
-            # No-prior 模式会有意移除最终 fusion 中显式的 old-global-expert 项。
-            # 这样更新节奏更接近 ExpertFedAvg。上一轮 global expert 仍会被隐式保留，
-            # 因为 client 从上一轮 global model 开始本地训练；只有没有有效 client update 时，
-            # 才会作为 fallback 显式保留。弱 evidence 不会在这里触发额外 old-prior retention 项；
-            # 这是有意的设计选择，不是 bug。
-            numerator = torch.zeros_like(theta_old)
-            denominator = 0.0
+        # 固定 no-prior fusion：只融合有效 client expert 参数。
+        # 无有效 client update 时仍 fallback 保留旧 global expert。
+        numerator = torch.zeros_like(theta_old)
+        denominator = 0.0
         valid_client_count = 0
 
         for update, lambda_client in zip(client_updates, cache["lambda_clients"]):
@@ -323,7 +315,6 @@ class FedAvgAggregator(Aggregator):
                 self.process_noise_q,
                 eps=self.eps,
             )
-            lambda0 = 1.0 / (p_pred + self.eps)
             has_global_params = all(key in global_state for key in param_keys)
 
             raw_scores = []
@@ -513,17 +504,8 @@ class FedAvgAggregator(Aggregator):
                     for value, is_valid in zip(lambda_raw, valid)
                 ]
 
-            sum_lambda_clients = sum(lambda_clients)
-            if self.use_old_prior:
-                old_prior_fraction = lambda0 / (lambda0 + sum_lambda_clients + self.eps)
-            else:
-                old_prior_fraction = 0.0
-
             precision_cache[(layer_id, expert_id)] = {
-                "lambda0": float(lambda0),
-                "use_old_prior": bool(self.use_old_prior),
                 "use_update_consistency": bool(self.use_update_consistency),
-                "old_prior_fraction": float(old_prior_fraction),
                 "lambda_clients": lambda_clients,
                 "lambda_filter": lambda_filters,
                 "lambda_raw": lambda_raw,
@@ -765,7 +747,6 @@ class FedAvgAggregator(Aggregator):
             "num_experts": 0,
             "num_valid_experts": 0,
             "aggregation_weight_mode": self._get_aggregation_weight_mode(),
-            "use_old_prior": bool(self.use_old_prior),
             "use_update_consistency": bool(self.use_update_consistency),
             "precision_granularity_is_block": (
                 1.0 if self.precision_granularity == "block" else 0.0
@@ -793,10 +774,6 @@ class FedAvgAggregator(Aggregator):
             "max_block_lambda_final": 0.0,
             "block_lambda_at_min_clip_fraction": 0.0,
             "block_lambda_at_max_clip_fraction": 0.0,
-            "lambda0": 0.0,
-            "mean_old_prior_fraction": 0.0,
-            "min_old_prior_fraction": 0.0,
-            "max_old_prior_fraction": 0.0,
             "mean_lambda_filter": 0.0,
             "min_lambda_filter": 0.0,
             "max_lambda_filter": 0.0,
@@ -851,11 +828,9 @@ class FedAvgAggregator(Aggregator):
         if not precision_cache:
             return summary
 
-        lambda0_values = []
         lambda_filter_values = []
         lambda_raw_values = []
         lambda_final_values = []
-        old_prior_fraction_values = []
         mean_positive_s_values = []
         mean_positive_n_values = []
         R_values = []
@@ -885,16 +860,9 @@ class FedAvgAggregator(Aggregator):
             if any(valid):
                 summary["num_valid_experts"] += 1
 
-            lambda0 = safe_float(cache.get("lambda0"), default=None)
-            if lambda0 is not None:
-                lambda0_values.append(lambda0)
-
             lambda_filter_values.extend(self._finite_values(cache.get("lambda_filter"), mask=valid))
             lambda_raw_values.extend(self._finite_values(cache.get("lambda_raw"), mask=valid))
             lambda_final_values.extend(self._finite_values(cache.get("lambda_clients"), mask=valid))
-            old_prior_fraction = safe_float(cache.get("old_prior_fraction"), default=None)
-            if old_prior_fraction is not None:
-                old_prior_fraction_values.append(old_prior_fraction)
             R_values.extend(self._finite_values(cache.get("R"), mask=valid))
             n_rel_values.extend(self._finite_values(cache.get("n_rel_values"), mask=valid))
             support_reliability_values.extend(
@@ -965,8 +933,6 @@ class FedAvgAggregator(Aggregator):
 
             skipped_observations += int(len(valid) - sum(valid))
 
-        summary["lambda0"] = self._mean_or_zero(lambda0_values)
-        summary["use_old_prior"] = bool(self.use_old_prior)
         summary["use_update_consistency"] = bool(self.use_update_consistency)
         summary["precision_granularity_is_block"] = (
             1.0 if self.precision_granularity == "block" else 0.0
@@ -1012,9 +978,6 @@ class FedAvgAggregator(Aggregator):
             block_final_values_for_positive_raw,
             lambda value: value >= self.lambda_max - block_clip_tol,
         )
-        summary["mean_old_prior_fraction"] = self._mean_or_zero(old_prior_fraction_values)
-        summary["min_old_prior_fraction"] = self._min_or_zero(old_prior_fraction_values)
-        summary["max_old_prior_fraction"] = self._max_or_zero(old_prior_fraction_values)
         summary["mean_lambda_filter"] = self._mean_or_zero(lambda_filter_values)
         summary["min_lambda_filter"] = self._min_or_zero(lambda_filter_values)
         summary["max_lambda_filter"] = self._max_or_zero(lambda_filter_values)
@@ -1176,9 +1139,8 @@ class FedWoLFAggregator(FedAvgAggregator):
     # - fedwolf 的 expert 参数使用 client-expert precision fusion：
     #   Fisher salience × filter reliability × leave-one-out update consistency，
     #   再 normalize + clip 后用于 expert 聚合。
-    # - old global expert prior 是可选项，由 fedwolf_use_old_prior 控制：
-    #   true 时显式加入 lambda0 prior，false 时不显式加入旧 prior；
-    #   false 时旧 expert 仍通过客户端本地训练初始化被隐式保留，
+    # - expert fusion 固定不显式加入 old global expert prior；
+    #   旧 expert 仍通过客户端本地训练初始化被隐式保留，
     #   且在没有有效客户端更新时仍 fallback 保留旧 global expert。
     #
     # 注意：
@@ -1206,7 +1168,6 @@ class FedWoLFAggregator(FedAvgAggregator):
         self.consistency_min = float(getattr(args, "fedwolf_consistency_min", 0.05))
         self.lambda_min = float(getattr(args, "fedwolf_lambda_min", 0.05))
         self.lambda_max = float(getattr(args, "fedwolf_lambda_max", 5.0))
-        self.use_old_prior = bool(getattr(args, "fedwolf_use_old_prior", False))
         self.use_update_consistency = bool(
             getattr(args, "fedwolf_use_update_consistency", True)
         )
