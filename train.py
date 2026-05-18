@@ -131,7 +131,7 @@ def main():
     )
     cli_args = cli_parser.parse_args()
 
-    # Read experiment settings from the config.yaml passed by --config.
+    # 从 --config 指定的 config.yaml 读取实验设置。
     args = load_args(config_path=cli_args.config)
     validate_output_paths(args, stage="train")
     set_seed(args.seed)

@@ -190,7 +190,7 @@ if __name__ == '__main__':
     add_config_path_arguments(cli_parser)
     cli_args = cli_parser.parse_args()
 
-    # Load partition settings from the config.yaml passed by --config.
+    # 从 --config 指定的 config.yaml 读取划分设置。
     args = load_args(config_path=cli_args.config)
     validate_output_paths(args, stage="data")
     set_seed(args.seed)

@@ -1,1 +1,1 @@
-"""Federated learning package."""
+"""联邦学习包。"""

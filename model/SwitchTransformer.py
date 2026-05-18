@@ -6,7 +6,7 @@ from torch import nn
 
 
 class PatchEmbedding(nn.Module):
-    """Patchify a CIFAR-sized image into transformer tokens."""
+    """将 CIFAR 尺寸图像切成 Transformer token。"""
 
     def __init__(self, image_size=32, patch_size=4, embed_dim=128):
         super(PatchEmbedding, self).__init__()
@@ -41,7 +41,7 @@ class PatchEmbedding(nn.Module):
 
 
 class DenseFFN(nn.Module):
-    """Standard dense FFN used by non-MoE transformer blocks."""
+    """非 MoE Transformer block 使用的标准 dense FFN。"""
 
     def __init__(self, embed_dim, mlp_ratio=4.0, dropout_rate=0.1):
         super(DenseFFN, self).__init__()
@@ -59,7 +59,7 @@ class DenseFFN(nn.Module):
 
 
 class SwitchFFNExpert(nn.Module):
-    """Single expert inside the token-level Switch FFN."""
+    """Token-level Switch FFN 内的单个 expert。"""
 
     def __init__(self, embed_dim, hidden_dim, dropout_rate=0.1):
         super(SwitchFFNExpert, self).__init__()
@@ -76,7 +76,7 @@ class SwitchFFNExpert(nn.Module):
 
 
 class TokenSwitchFFN(nn.Module):
-    """Token-level top-1 Switch FFN with Hybrid-compatible stats."""
+    """带 Hybrid 兼容统计信息的 token-level top-1 Switch FFN。"""
 
     def __init__(
         self,
@@ -177,7 +177,7 @@ class TokenSwitchFFN(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """Pre-norm transformer block with dense or switch FFN."""
+    """使用 dense 或 switch FFN 的 pre-norm Transformer block。"""
 
     def __init__(
         self,
@@ -250,10 +250,10 @@ class TransformerBlock(nn.Module):
 
 
 class SwitchTransformer(nn.Module):
-    """Standard patch-based Switch Transformer.
+    """标准 patch-based Switch Transformer。
 
-    Explicit patch_size takes priority. Internally, token_grid_size is kept in
-    sync with the true patch grid side length for analysis/logging use.
+    显式 patch_size 优先。内部会让 token_grid_size 与真实 patch 网格边长保持同步，
+    用于分析/日志。
     """
 
     def __init__(
@@ -282,7 +282,7 @@ class SwitchTransformer(nn.Module):
         if embed_dim % num_heads != 0:
             raise ValueError("embed_dim must be divisible by num_heads")
 
-        _ = stem_channels  # Reserved for future builder compatibility.
+        _ = stem_channels  # 预留给未来 builder 兼容。
         self.num_experts = num_experts
         self.embed_dim = embed_dim
         self.depth = depth

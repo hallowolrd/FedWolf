@@ -56,7 +56,7 @@ class ResNetBasicBlock(nn.Module):
 
 
 class ResNet32Backbone(nn.Module):
-    """CIFAR ResNet-32 feature extractor without a classification head."""
+    """不含分类头的 CIFAR ResNet-32 特征提取器。"""
 
     def __init__(self):
         super(ResNet32Backbone, self).__init__()
@@ -283,7 +283,7 @@ class ResNet32TransformerBlock(nn.Module):
 
 
 class ResNet32SwitchTransformer(nn.Module):
-    """ResNet-32 feature extractor followed by Switch Transformer blocks."""
+    """ResNet-32 特征提取器后接 Switch Transformer blocks。"""
 
     def __init__(
         self,

@@ -8,7 +8,7 @@ import torch
 
 
 def set_seed(seed:int):
-    """Set Python, NumPy, Torch, and CUDA seeds from one project-level value."""
+    """根据项目级 seed 设置 Python、NumPy、Torch 和 CUDA 随机种子。"""
 
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)

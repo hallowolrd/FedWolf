@@ -56,7 +56,7 @@ class ResNetBasicBlock(nn.Module):
 
 
 class ResNet20Backbone(nn.Module):
-    """CIFAR ResNet-20 feature extractor without a classification head."""
+    """不含分类头的 CIFAR ResNet-20 特征提取器。"""
 
     def __init__(self):
         super(ResNet20Backbone, self).__init__()
@@ -286,7 +286,7 @@ class ResNet20TransformerBlock(nn.Module):
 
 
 class ResNet20SwitchTransformer(nn.Module):
-    """ResNet-20 feature extractor followed by Switch Transformer blocks."""
+    """ResNet-20 特征提取器后接 Switch Transformer blocks。"""
 
     def __init__(
         self,
@@ -313,7 +313,7 @@ class ResNet20SwitchTransformer(nn.Module):
         if embed_dim % num_heads != 0:
             raise ValueError("embed_dim must be divisible by num_heads")
 
-        _ = stem_channels  # Kept for builder compatibility; ResNet-20 channels are fixed.
+        _ = stem_channels  # 为兼容 builder 保留该参数；ResNet-20 通道数是固定的。
         self.num_experts = num_experts
         self.embed_dim = embed_dim
         self.depth = depth

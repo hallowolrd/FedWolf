@@ -130,7 +130,7 @@ class TokenSwitchFFN(nn.Module):
         usage_fraction = selected_counts.float() / float(total_tokens)
         avg_router_probs = router_probs.float().mean(dim=(0, 1))
 
-        # Switch Transformer load-balancing auxiliary loss:
+        # Switch Transformer 的 load-balancing auxiliary loss:
         # aux = E * sum_e(f_e * p_e)
         # f_e 是 top-1 路由到 expert e 的 token 比例，p_e 是 router 对 expert e 的平均概率。
         # f_e 是离散选择，不参与梯度；p_e 保留梯度，推动 router 更均衡地使用专家。

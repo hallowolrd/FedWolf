@@ -1,4 +1,4 @@
-"""Model package."""
+"""模型包。"""
 
 from model.HybridSwitchTransformer import HybridSwitchTransformer
 from model.ResNet18SwitchTransformer import ResNet18SwitchTransformer
@@ -32,7 +32,7 @@ def parse_moe_layers(moe_layers, depth):
 
 
 def build_model_from_args(args):
-    """Build the project model from a single shared args-based code path."""
+    """通过统一的 args 代码路径构建项目模型。"""
 
     depth = args.num_layers if args.num_layers is not None else args.depth
     common_kwargs = dict(

@@ -209,14 +209,11 @@ class FedAvgAggregator(Aggregator):
             numerator = theta_old * lambda0
             denominator = lambda0
         else:
-            # No-prior mode intentionally removes the explicit old-global-expert
-            # term from the final fusion. This keeps the update pace closer to
-            # ExpertFedAvg. The previous global expert is still implicitly
-            # preserved because clients start local training from the previous
-            # global model, and explicit retention only happens as a fallback
-            # when no valid client update exists. Weak evidence does not trigger
-            # an extra old-prior retention term here; that is a deliberate
-            # design choice, not a bug.
+            # No-prior 模式会有意移除最终 fusion 中显式的 old-global-expert 项。
+            # 这样更新节奏更接近 ExpertFedAvg。上一轮 global expert 仍会被隐式保留，
+            # 因为 client 从上一轮 global model 开始本地训练；只有没有有效 client update 时，
+            # 才会作为 fallback 显式保留。弱 evidence 不会在这里触发额外 old-prior retention 项；
+            # 这是有意的设计选择，不是 bug。
             numerator = torch.zeros_like(theta_old)
             denominator = 0.0
         valid_client_count = 0
@@ -372,9 +369,8 @@ class FedAvgAggregator(Aggregator):
             rho_residual_values = []
             rho_values = []
             lambda_filters = []
-            # Diagnostic only: n_rel/support_values explain the support-derived
-            # observation noise R. Do not multiply them into lambda_raw again,
-            # otherwise activation support would be counted twice.
+            # 仅诊断用：n_rel/support_values 解释由 support 得到的 observation noise R。
+            # 不要再把它们乘进 lambda_raw，否则 activation support 会被重复计入。
             for is_valid, z_value, n_value in zip(valid, observations, active_tokens):
                 if not is_valid:
                     R_values.append(0.0)
@@ -489,10 +485,9 @@ class FedAvgAggregator(Aggregator):
                     w_pre=w_pre,
                 )
             else:
-                # Ablation: when update consistency is disabled, each valid
-                # client-expert update gets c_upd = 1.0. FedWoLF then uses only
-                # Fisher salience and filter reliability before normalize+clip.
-                # Invalid observations still get lambda_raw = 0.0.
+                # 消融：关闭 update consistency 时，每个有效 client-expert update 的 c_upd = 1.0。
+                # FedWoLF 随后只使用 Fisher salience 和 filter reliability，再 normalize+clip。
+                # 无效 observation 仍会得到 lambda_raw = 0.0。
                 update_consistency = [1.0 if is_valid else 0.0 for is_valid in valid]
             lambda_raw = [
                 salience * lambda_filter * consistency if is_valid else 0.0

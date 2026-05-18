@@ -1,4 +1,4 @@
-"""Project configuration loader backed by PyYAML."""
+"""基于 PyYAML 的项目配置加载器。"""
 
 from __future__ import annotations
 
@@ -64,7 +64,7 @@ def _resolve_config_path(path_str: str) -> Path:
 
 
 def _load_yaml_mapping(config_path: str | Path) -> dict:
-    """Load one YAML file and require a top-level mapping."""
+    """加载一个 YAML 文件，并要求顶层是 mapping。"""
 
     config_path = _resolve_config_path(str(config_path))
     if not config_path.exists():
@@ -235,7 +235,7 @@ def _coerce_bool(value: object, field_name: str) -> bool:
 
 
 def _derive_output_paths(merged_config: dict) -> None:
-    """Derive all experiment outputs from save_root/run_name."""
+    """根据 save_root/run_name 派生所有实验输出路径。"""
 
     run_name = _sanitize_run_name(merged_config["run_name"])
     save_root = str(merged_config.get("save_root", _DEFAULT_SAVE_ROOT)).strip() or _DEFAULT_SAVE_ROOT
@@ -258,7 +258,7 @@ def _is_nonempty_dir(path: Path) -> bool:
 
 
 def validate_output_paths(args: SimpleNamespace, stage: str) -> None:
-    """Fail fast before a stage writes into non-empty experiment outputs."""
+    """在某个阶段写入非空实验输出目录前快速失败。"""
 
     if args.allow_overwrite:
         return
@@ -280,7 +280,7 @@ def validate_output_paths(args: SimpleNamespace, stage: str) -> None:
 
 
 def add_config_path_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    """Add the single experiment config path used by the entrypoints."""
+    """添加入口使用的单个实验配置路径参数。"""
 
     parser.add_argument(
         "--config",
@@ -295,7 +295,7 @@ def add_config_path_arguments(parser: argparse.ArgumentParser) -> argparse.Argum
 
 
 def load_args(config_path: str):
-    """Load one nested config.yaml and return a flat args-like namespace."""
+    """加载一个嵌套 config.yaml，并返回扁平 args 风格 namespace。"""
 
     try:
         resolved_path = _resolve_config_path(config_path)

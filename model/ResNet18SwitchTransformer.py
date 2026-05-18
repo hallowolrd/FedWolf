@@ -186,7 +186,7 @@ class TokenSwitchFFN(nn.Module):
 
 
 class ResNet18Backbone(nn.Module):
-    """CIFAR ResNet-18 feature extractor without a classification head."""
+    """不含分类头的 CIFAR ResNet-18 特征提取器。"""
 
     def __init__(self):
         super(ResNet18Backbone, self).__init__()
@@ -289,7 +289,7 @@ class ResNet18TransformerBlock(nn.Module):
 
 
 class ResNet18SwitchTransformer(nn.Module):
-    """ResNet-18 feature extractor followed by Switch Transformer blocks."""
+    """ResNet-18 特征提取器后接 Switch Transformer blocks。"""
 
     def __init__(
         self,

@@ -304,7 +304,7 @@ def _get_result_layer_stats(result):
 
 
 def _accumulate_evidence_expert_stats(total_stats, result, num_experts, device):
-    """Accumulate expert token usage observed during the evidence forward pass."""
+    """累计 evidence forward pass 中观测到的 expert token usage。"""
 
     for layer_id, stats in _get_result_layer_stats(result).items():
         layer_key = str(layer_id)
@@ -404,13 +404,12 @@ def compute_expert_fisher_evidence(
     max_batches=None,
     pin_memory=False,
 ):
-    """Compute per-sample empirical diagonal Fisher scalar evidence for experts.
+    """计算 expert 的逐样本 empirical diagonal Fisher 标量 evidence。
 
-    For each expert parameter block Theta_k with d_k parameters, this computes:
+    对于包含 d_k 个参数的每个 expert 参数 block Theta_k，计算：
         1 / (|D_m| * d_k) * sum_i ||grad_{Theta_k} loss_i||^2
 
-    This pass only reads gradients from the trained local model. It does not
-    update parameters or optimizer state.
+    该 pass 只从训练后的 local model 读取梯度，不更新参数或 optimizer state。
     """
 
     if model_mode not in {"eval", "train"}:

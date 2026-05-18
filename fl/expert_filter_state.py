@@ -5,9 +5,9 @@ import torch
 
 def safe_float(value, default=0.0):
     """
-    Convert value to a finite Python float.
+    将 value 转成有限 Python float。
 
-    Returns default if value is None, cannot be converted, or is not finite.
+    如果 value 为 None、不能转换或不是有限值，则返回 default。
     """
 
     if value is None:
@@ -32,7 +32,7 @@ def safe_float(value, default=0.0):
 
 def predict_expert_state(mu_prev, p_prev, q, eps=1e-12):
     """
-    Random-walk prediction step for one expert evidence state.
+    单个 expert evidence state 的 random-walk predict step。
 
     mu_pred = mu_prev
     P_pred = P_prev + q
@@ -51,11 +51,11 @@ def predict_expert_state(mu_prev, p_prev, q, eps=1e-12):
 
 def compute_support_noise(n_active, mean_positive_n, sigma_e2, eps=1e-12):
     """
-    Compute activation-support-derived observation noise.
+    计算由 activation support 得到的 observation noise。
 
-    n_active: activation support for client m and expert k.
-    mean_positive_n: mean positive activation support among selected clients for this expert.
-    sigma_e2: base observation noise.
+    n_active: client m 和 expert k 的 activation support。
+    mean_positive_n: 该 expert 已选 client 中正 activation support 的均值。
+    sigma_e2: 基础 observation noise。
     """
 
     eps = max(safe_float(eps, default=1e-12), 1e-12)
@@ -77,7 +77,7 @@ def compute_support_noise(n_active, mean_positive_n, sigma_e2, eps=1e-12):
 
 def compute_standardized_residual(observation, mu_pred, p_pred, R, eps=1e-12):
     """
-    Compute standardized residual for robust filtering.
+    计算 robust filtering 的 standardized residual。
 
     nu = (z - mu_pred) / sqrt(P_pred + R + eps)
     """
@@ -99,7 +99,7 @@ def compute_standardized_residual(observation, mu_pred, p_pred, R, eps=1e-12):
 
 def compute_imq_weight(standardized_residual, imq_c, eps=1e-12):
     """
-    Compute IMQ robust weight from standardized residual.
+    根据 standardized residual 计算 IMQ robust weight。
 
     rho = (1 + nu^2 / c^2)^(-1/2)
     """
@@ -115,7 +115,7 @@ def compute_imq_weight(standardized_residual, imq_c, eps=1e-12):
 
 def compute_filter_precision(rho, R, eps=1e-12):
     """
-    Compute evidence reliability precision.
+    计算 evidence reliability precision。
 
     lambda_filter = rho^2 / (R + eps)
     """
@@ -133,7 +133,7 @@ def compute_filter_precision(rho, R, eps=1e-12):
 
 def batch_update_filter_state(mu_pred, p_pred, observations, lambda_filters, eps=1e-12):
     """
-    Batch-form precision update for one expert evidence state.
+    单个 expert evidence state 的 batch 形式 precision update。
 
     P_new = 1 / (1 / P_pred + sum_m lambda_filter_m)
     mu_new = P_new * (mu_pred / P_pred + sum_m lambda_filter_m * z_m)

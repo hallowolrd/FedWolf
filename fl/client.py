@@ -138,11 +138,11 @@ class Client:
         )
 
     def get_current_learning_rate(self) -> float:
-        """Return learning rate for the current global communication round.
+        """返回当前 global communication round 的学习率。
 
-        This schedule is based on server round c_T, not local epoch or batch.
-        Client objects and Adam optimizers are recreated every server round,
-        so using a PyTorch local scheduler here would restart every round.
+        该调度基于 server round c_T，而不是 local epoch 或 batch。
+        Client 对象和 Adam optimizer 会在每个 server round 重新创建，
+        所以在这里使用 PyTorch local scheduler 会每轮重启。
         """
 
         schedule = str(getattr(self.args, "lr_schedule", "constant")).strip().lower()
