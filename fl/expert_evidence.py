@@ -179,7 +179,7 @@ def _flatten_linear_hook_tensor(value, module_name, tensor_name):
     return value.reshape(-1, value.shape[-1])
 
 
-def _compute_sample_grouped_linear_fisher_scalars(x_flat, delta_flat, sample_ids):
+def _prepare_sample_grouped_linear_fisher_inputs(x_flat, delta_flat, sample_ids):
     x_work = x_flat.detach()
     delta_work = delta_flat.detach()
     if x_work.dtype in {torch.float16, torch.bfloat16}:
@@ -190,6 +190,35 @@ def _compute_sample_grouped_linear_fisher_scalars(x_flat, delta_flat, sample_ids
     x_work = x_work.reshape(-1, x_work.shape[-1])
     delta_work = delta_work.reshape(-1, delta_work.shape[-1])
     sample_ids = sample_ids.detach().reshape(-1).to(device=x_work.device, dtype=torch.long)
+
+    if x_work.shape[0] != delta_work.shape[0] or sample_ids.numel() != x_work.shape[0]:
+        raise RuntimeError(
+            "linear_hook_sample_fast expected Linear input, grad_output, and accepted sample ids "
+            "to have matching token counts; "
+            f"x_flat shape={tuple(x_work.shape)}, delta_flat shape={tuple(delta_work.shape)}, "
+            f"sample_ids shape={tuple(sample_ids.shape)}."
+        )
+
+    return x_work, delta_work, sample_ids
+
+
+def _zero_sample_grouped_linear_fisher_scalars(device):
+    return (
+        torch.zeros((), dtype=torch.float64, device=device),
+        torch.zeros((), dtype=torch.float64, device=device),
+        0,
+        0,
+    )
+
+
+def _compute_sample_grouped_linear_fisher_scalars_loop(x_flat, delta_flat, sample_ids):
+    x_work, delta_work, sample_ids = _prepare_sample_grouped_linear_fisher_inputs(
+        x_flat=x_flat,
+        delta_flat=delta_flat,
+        sample_ids=sample_ids,
+    )
+    if sample_ids.numel() == 0:
+        return _zero_sample_grouped_linear_fisher_scalars(x_work.device)
 
     weight_grad_square_sum = torch.zeros((), dtype=torch.float64, device=x_work.device)
     bias_grad_square_sum = torch.zeros((), dtype=torch.float64, device=x_work.device)
@@ -210,6 +239,73 @@ def _compute_sample_grouped_linear_fisher_scalars(x_flat, delta_flat, sample_ids
         int(unique_sample_ids.numel()),
         int(sample_ids.numel()),
     )
+
+
+def _compute_sample_grouped_linear_fisher_scalars_vectorized(x_flat, delta_flat, sample_ids):
+    x_work, delta_work, sample_ids = _prepare_sample_grouped_linear_fisher_inputs(
+        x_flat=x_flat,
+        delta_flat=delta_flat,
+        sample_ids=sample_ids,
+    )
+    if sample_ids.numel() == 0:
+        return _zero_sample_grouped_linear_fisher_scalars(x_work.device)
+
+    unique_sample_ids, inverse = torch.unique(
+        sample_ids,
+        sorted=True,
+        return_inverse=True,
+    )
+    active_sample_count = int(unique_sample_ids.numel())
+    active_token_count = int(sample_ids.numel())
+
+    sample_mask = F.one_hot(
+        inverse,
+        num_classes=active_sample_count,
+    ).to(dtype=x_work.dtype, device=x_work.device).transpose(0, 1)
+
+    sample_grad_w = torch.einsum(
+        "st,to,ti->soi",
+        sample_mask,
+        delta_work,
+        x_work,
+    )
+    sample_grad_b = torch.einsum(
+        "st,to->so",
+        sample_mask,
+        delta_work,
+    )
+
+    return (
+        sample_grad_w.pow(2).sum().to(dtype=torch.float64),
+        sample_grad_b.pow(2).sum().to(dtype=torch.float64),
+        active_sample_count,
+        active_token_count,
+    )
+
+
+def _compute_sample_grouped_linear_fisher_scalars(x_flat, delta_flat, sample_ids):
+    try:
+        return _compute_sample_grouped_linear_fisher_scalars_vectorized(
+            x_flat=x_flat,
+            delta_flat=delta_flat,
+            sample_ids=sample_ids,
+        )
+    except RuntimeError as exc:
+        is_oom = "out of memory" in str(exc).lower()
+        is_cuda_tensor = torch.is_tensor(x_flat) and x_flat.is_cuda
+        if not is_oom or not is_cuda_tensor:
+            raise
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        _compute_sample_grouped_linear_fisher_scalars.vectorized_fallback_count += 1
+        return _compute_sample_grouped_linear_fisher_scalars_loop(
+            x_flat=x_flat,
+            delta_flat=delta_flat,
+            sample_ids=sample_ids,
+        )
+
+
+_compute_sample_grouped_linear_fisher_scalars.vectorized_fallback_count = 0
 
 
 def _collect_expert_parameter_entries(model, num_experts):
@@ -301,6 +397,40 @@ def parse_optional_positive_int_limit(value, field_name):
     if value <= 0:
         return None
     return int(value)
+
+
+TRUE_BOOL_STRINGS = {"true", "1", "yes", "y", "on"}
+FALSE_BOOL_STRINGS = {"false", "0", "no", "n", "off", "none", "null", ""}
+
+
+def _parse_bool_flag(value, default=False):
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in TRUE_BOOL_STRINGS:
+            return True
+        if normalized in FALSE_BOOL_STRINGS:
+            return False
+        raise ValueError(f"Expected a boolean flag value, got {value!r}.")
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return bool(value)
+
+
+def _should_cache_evidence_batches(*, cache_requested, evidence_loader_mode, device):
+    device_obj = torch.device(device)
+    if not cache_requested:
+        return False, "disabled_by_config", device_obj
+    if evidence_loader_mode != "deterministic":
+        return False, "disabled_because_evidence_loader_mode_is_not_deterministic", device_obj
+    if device_obj.type != "cuda":
+        return False, "disabled_because_device_is_not_cuda", device_obj
+    if not torch.cuda.is_available():
+        return False, "disabled_because_cuda_is_not_available", device_obj
+    return True, "enabled_for_deterministic_evidence_loader", device_obj
 
 
 def compute_fisher_scalar_from_sums(
@@ -408,6 +538,90 @@ def _move_batch_to_device(inputs, labels, device, pin_memory=False):
         inputs.to(device, non_blocking=non_blocking),
         labels.to(device, non_blocking=non_blocking),
     )
+
+
+def _estimate_tensor_tree_bytes(value):
+    if torch.is_tensor(value):
+        return int(value.numel() * value.element_size())
+    if isinstance(value, dict):
+        return sum(_estimate_tensor_tree_bytes(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_estimate_tensor_tree_bytes(item) for item in value)
+    return 0
+
+
+def _detach_tensor_tree(value):
+    if torch.is_tensor(value):
+        return value.detach()
+    if isinstance(value, tuple):
+        return tuple(_detach_tensor_tree(item) for item in value)
+    if isinstance(value, list):
+        return [_detach_tensor_tree(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _detach_tensor_tree(item) for key, item in value.items()}
+    return value
+
+
+def _build_cached_evidence_batches(*, data_loader, device, max_samples, max_batches, pin_memory):
+    cached_batches = []
+    num_batches = 0
+    total_samples = 0
+    limit_reached = False
+    stop_reason = None
+    estimated_bytes = 0
+
+    for inputs, labels in data_loader:
+        if max_batches is not None and num_batches >= max_batches:
+            limit_reached = True
+            stop_reason = "max_batches"
+            break
+        if max_samples is not None and total_samples >= max_samples:
+            limit_reached = True
+            stop_reason = "max_samples"
+            break
+
+        if max_samples is not None:
+            remaining = max_samples - total_samples
+            if remaining <= 0:
+                limit_reached = True
+                stop_reason = "max_samples"
+                break
+            if labels.size(0) > remaining:
+                inputs = inputs[:remaining]
+                labels = labels[:remaining]
+
+        if labels.size(0) <= 0:
+            continue
+
+        inputs, labels = _move_batch_to_device(
+            inputs=inputs,
+            labels=labels,
+            device=device,
+            pin_memory=pin_memory,
+        )
+        inputs = _detach_tensor_tree(inputs)
+        labels = _detach_tensor_tree(labels)
+        cached_batches.append((inputs, labels))
+        num_batches += 1
+        total_samples += labels.size(0)
+        estimated_bytes += _estimate_tensor_tree_bytes(inputs) + _estimate_tensor_tree_bytes(labels)
+
+        if max_samples is not None and total_samples >= max_samples:
+            limit_reached = True
+            stop_reason = "max_samples"
+            break
+        if max_batches is not None and num_batches >= max_batches:
+            limit_reached = True
+            stop_reason = "max_batches"
+            break
+
+    return cached_batches, {
+        "num_batches": int(num_batches),
+        "total_samples": int(total_samples),
+        "limit_reached": bool(limit_reached),
+        "stop_reason": stop_reason,
+        "estimated_bytes": int(estimated_bytes),
+    }
 
 
 def _zeros_for_experts(num_experts, dtype=torch.float64, device="cpu"):
@@ -592,6 +806,9 @@ def _ensure_default_fast_diagnostics(diagnostics, canonical_estimator):
         "fast_fisher_active_token_count_by_layer": {},
         "fast_fisher_note": None,
         "fast_fisher_unmatched_linear_block_count": 0,
+        "fast_fisher_sample_grouped_compute": None,
+        "fast_fisher_sample_vectorized_enabled": False,
+        "fast_fisher_sample_vectorized_fallback_count": 0,
     }
 
     if canonical_estimator == "linear_hook_token_fast":
@@ -612,6 +829,8 @@ def _ensure_default_fast_diagnostics(diagnostics, canonical_estimator):
                 "fast_fisher_sample_grouped": True,
                 "fast_fisher_count_unit": "active_original_samples",
                 "fast_fisher_token_count_unit": "accepted_routed_tokens",
+                "fast_fisher_sample_grouped_compute": "vectorized_compact_one_hot",
+                "fast_fisher_sample_vectorized_enabled": True,
                 "fast_fisher_note": (
                     "linear_hook_sample_fast groups routed token gradient contributions by original "
                     "sample before squaring: sum_sample (sum_token grad_token)^2."
@@ -851,6 +1070,8 @@ def compute_expert_fisher_evidence(
     model_mode="eval",
     score_mode="mean_diag",
     fisher_estimator="per_sample_backward",
+    evidence_loader_mode=None,
+    cache_evidence_gpu=False,
     debug_batches=0,
     max_samples=None,
     max_batches=None,
@@ -870,6 +1091,21 @@ def compute_expert_fisher_evidence(
     debug_batches = max(int(debug_batches), 0)
     max_samples = parse_optional_positive_int_limit(max_samples, "fedwolf_fisher_max_samples")
     max_batches = parse_optional_positive_int_limit(max_batches, "fedwolf_fisher_max_batches")
+    loader_mode_raw = evidence_loader_mode
+    loader_mode = (
+        "deterministic"
+        if evidence_loader_mode is None
+        else str(evidence_loader_mode).strip().lower()
+    )
+    cache_requested = _parse_bool_flag(cache_evidence_gpu, default=False)
+    cache_allowed, cache_reason, device_obj = _should_cache_evidence_batches(
+        cache_requested=cache_requested,
+        evidence_loader_mode=loader_mode,
+        device=device,
+    )
+    if data_loader is None:
+        cache_allowed = False
+        cache_reason = "disabled_because_data_loader_is_none"
 
     expert_entries, param_counts, matched_param_names = _collect_expert_parameter_entries(
         model=model,
@@ -916,6 +1152,16 @@ def compute_expert_fisher_evidence(
         "fisher_score_mode": canonical_score_mode,
         "fisher_score_mode_raw": score_mode,
         "normalization": FISHER_SCORE_NORMALIZATION[canonical_score_mode],
+        "evidence_loader_mode": loader_mode,
+        "evidence_loader_mode_raw": loader_mode_raw,
+        "fisher_evidence_cache_requested": bool(cache_requested),
+        "fisher_evidence_cache_enabled": False,
+        "fisher_evidence_cache_device": None,
+        "fisher_evidence_cache_reason": cache_reason,
+        "fisher_evidence_cache_batch_count": 0,
+        "fisher_evidence_cache_sample_count": 0,
+        "fisher_evidence_cache_estimated_bytes": 0,
+        "fisher_evidence_cache_fallback_reason": None,
         "model_mode": model_mode,
         "debug_batches": int(debug_batches),
         "max_samples": max_samples,
@@ -1021,6 +1267,47 @@ def compute_expert_fisher_evidence(
     fast_fisher_has_net0 = set()
     fast_active_token_counts = {}
     fast_active_sample_counts = {}
+    sample_vectorized_fallback_start = int(
+        getattr(_compute_sample_grouped_linear_fisher_scalars, "vectorized_fallback_count", 0)
+    )
+    cached_batches = None
+    cache_enabled = False
+
+    if cache_allowed:
+        try:
+            cached_batches, cache_stats = _build_cached_evidence_batches(
+                data_loader=data_loader,
+                device=device_obj,
+                max_samples=max_samples,
+                max_batches=max_batches,
+                pin_memory=pin_memory,
+            )
+            if cache_stats["num_batches"] > 0:
+                cache_enabled = True
+                limit_reached = bool(cache_stats["limit_reached"])
+                stop_reason = cache_stats["stop_reason"]
+                diagnostics["fisher_evidence_cache_enabled"] = True
+                diagnostics["fisher_evidence_cache_device"] = str(device_obj)
+                diagnostics["fisher_evidence_cache_reason"] = cache_reason
+                diagnostics["fisher_evidence_cache_batch_count"] = int(cache_stats["num_batches"])
+                diagnostics["fisher_evidence_cache_sample_count"] = int(cache_stats["total_samples"])
+                diagnostics["fisher_evidence_cache_estimated_bytes"] = int(cache_stats["estimated_bytes"])
+            else:
+                cached_batches = None
+                diagnostics["fisher_evidence_cache_reason"] = "disabled_because_data_loader_is_empty"
+        except RuntimeError as exc:
+            if "out of memory" not in str(exc).lower():
+                raise
+            cached_batches = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            diagnostics["fisher_evidence_cache_enabled"] = False
+            diagnostics["fisher_evidence_cache_device"] = None
+            diagnostics["fisher_evidence_cache_reason"] = "disabled_after_cuda_oom_fallback"
+            diagnostics["fisher_evidence_cache_batch_count"] = 0
+            diagnostics["fisher_evidence_cache_sample_count"] = 0
+            diagnostics["fisher_evidence_cache_estimated_bytes"] = 0
+            diagnostics["fisher_evidence_cache_fallback_reason"] = "cuda_out_of_memory"
 
     if is_linear_hook_estimator:
         fast_active_token_counts = {
@@ -1189,35 +1476,38 @@ def compute_expert_fisher_evidence(
                 hook_handles.append(module.register_forward_hook(make_forward_hook(info["name"])))
                 hook_handles.append(module.register_full_backward_hook(make_backward_hook(info)))
 
-        for inputs, labels in data_loader:
-            if max_batches is not None and num_batches >= max_batches:
-                limit_reached = True
-                stop_reason = "max_batches"
-                break
-            if max_samples is not None and total_samples >= max_samples:
-                limit_reached = True
-                stop_reason = "max_samples"
-                break
-
-            if max_samples is not None:
-                remaining = max_samples - total_samples
-                if remaining <= 0:
+        batch_iterable = cached_batches if cache_enabled else data_loader
+        for inputs, labels in batch_iterable:
+            if not cache_enabled:
+                if max_batches is not None and num_batches >= max_batches:
+                    limit_reached = True
+                    stop_reason = "max_batches"
+                    break
+                if max_samples is not None and total_samples >= max_samples:
                     limit_reached = True
                     stop_reason = "max_samples"
                     break
-                if labels.size(0) > remaining:
-                    inputs = inputs[:remaining]
-                    labels = labels[:remaining]
+
+                if max_samples is not None:
+                    remaining = max_samples - total_samples
+                    if remaining <= 0:
+                        limit_reached = True
+                        stop_reason = "max_samples"
+                        break
+                    if labels.size(0) > remaining:
+                        inputs = inputs[:remaining]
+                        labels = labels[:remaining]
 
             if labels.size(0) <= 0:
                 continue
 
-            inputs, labels = _move_batch_to_device(
-                inputs=inputs,
-                labels=labels,
-                device=device,
-                pin_memory=pin_memory,
-            )
+            if not cache_enabled:
+                inputs, labels = _move_batch_to_device(
+                    inputs=inputs,
+                    labels=labels,
+                    device=device,
+                    pin_memory=pin_memory,
+                )
 
             model.zero_grad(set_to_none=True)
             result = model(inputs)
@@ -1307,18 +1597,21 @@ def compute_expert_fisher_evidence(
                     )
                 diagnostics["batch_grad_status"].append(batch_grad_status)
 
-            if max_samples is not None and total_samples >= max_samples:
-                limit_reached = True
-                stop_reason = "max_samples"
-                break
-            if max_batches is not None and num_batches >= max_batches:
-                limit_reached = True
-                stop_reason = "max_batches"
-                break
+            if not cache_enabled:
+                if max_samples is not None and total_samples >= max_samples:
+                    limit_reached = True
+                    stop_reason = "max_samples"
+                    break
+                if max_batches is not None and num_batches >= max_batches:
+                    limit_reached = True
+                    stop_reason = "max_batches"
+                    break
     finally:
         for handle in hook_handles:
             handle.remove()
         activation_cache.clear()
+        cached_batches = None
+        batch_iterable = None
         model.zero_grad(set_to_none=True)
         if was_training:
             model.train()
@@ -1339,6 +1632,10 @@ def compute_expert_fisher_evidence(
     ) = _finalize_evidence_expert_stats(evidence_expert_stats_by_layer)
 
     if canonical_estimator == "linear_hook_sample_fast":
+        diagnostics["fast_fisher_sample_vectorized_fallback_count"] = int(
+            getattr(_compute_sample_grouped_linear_fisher_scalars, "vectorized_fallback_count", 0)
+            - sample_vectorized_fallback_start
+        )
         for layer_id in score_sums:
             layer_key = str(layer_id)
             token_counts = _get_layer_mapping(fast_active_token_counts, layer_id, default=None)

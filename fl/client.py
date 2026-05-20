@@ -13,6 +13,27 @@ from utils.utils import record_result
 FISHER_EVIDENCE_AGG_METHODS = {"fedwolf", "fedwolf_fisher_only"}
 
 
+_TRUE_BOOL_STRINGS = {"true", "1", "yes", "y", "on"}
+_FALSE_BOOL_STRINGS = {"false", "0", "no", "n", "off", "none", "null", ""}
+
+
+def _parse_bool_flag(value, default=False):
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _TRUE_BOOL_STRINGS:
+            return True
+        if normalized in _FALSE_BOOL_STRINGS:
+            return False
+        raise ValueError(f"Expected a boolean flag value, got {value!r}.")
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return bool(value)
+
+
 class Client:
     """ Client 表示联邦学习中的一个客户端。
     每个客户端：
@@ -239,6 +260,15 @@ class Client:
             "fisher_score_mode",
             "fisher_score_mode_raw",
             "normalization",
+            "evidence_loader_mode",
+            "fisher_evidence_cache_requested",
+            "fisher_evidence_cache_enabled",
+            "fisher_evidence_cache_device",
+            "fisher_evidence_cache_reason",
+            "fisher_evidence_cache_batch_count",
+            "fisher_evidence_cache_sample_count",
+            "fisher_evidence_cache_estimated_bytes",
+            "fisher_evidence_cache_fallback_reason",
             "num_samples_with_grad_semantics",
             "fast_fisher_sample_grouped",
             "fast_fisher_count_unit",
@@ -534,6 +564,10 @@ class Client:
             evidence_model_mode = getattr(self.args, "fedwolf_evidence_model_mode", "eval")
             fisher_score_mode = getattr(self.args, "fedwolf_fisher_score_mode", "mean_diag")
             fisher_estimator = getattr(self.args, "fedwolf_fisher_estimator", "per_sample_backward")
+            fisher_cache_evidence_gpu = _parse_bool_flag(
+                getattr(self.args, "fedwolf_fisher_cache_evidence_gpu", False),
+                default=False,
+            )
             fisher_debug_batches = getattr(self.args, "fedwolf_fisher_debug_batches", 0)
             fisher_max_samples = getattr(self.args, "fedwolf_fisher_max_samples", None)
             fisher_max_batches = getattr(self.args, "fedwolf_fisher_max_batches", None)
@@ -544,6 +578,7 @@ class Client:
                 f"--fedwolf_evidence_model_mode : {evidence_model_mode} "
                 f"--fedwolf_fisher_score_mode : {fisher_score_mode} "
                 f"--fedwolf_fisher_estimator : {fisher_estimator} "
+                f"--fedwolf_fisher_cache_evidence_gpu : {fisher_cache_evidence_gpu} "
                 f"--fedwolf_fisher_max_samples : {fisher_max_samples} "
                 f"--fedwolf_fisher_max_batches : {fisher_max_batches}"
             )
@@ -558,6 +593,8 @@ class Client:
                 model_mode=evidence_model_mode,
                 score_mode=fisher_score_mode,
                 fisher_estimator=fisher_estimator,
+                evidence_loader_mode=evidence_loader_mode,
+                cache_evidence_gpu=fisher_cache_evidence_gpu,
                 debug_batches=fisher_debug_batches,
                 max_samples=fisher_max_samples,
                 max_batches=fisher_max_batches,
