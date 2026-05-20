@@ -34,6 +34,22 @@ FISHER_SCORE_NORMALIZATION = {
     "trace_raw": "raw_grad_square_sum",
 }
 
+FISHER_ESTIMATOR_ALIASES = {
+    "per_sample_backward": "per_sample_backward",
+    "per_sample": "per_sample_backward",
+    "per_sample_empirical_diagonal_fisher": "per_sample_backward",
+    "linear_hook_token_fast": "linear_hook_token_fast",
+    "token_fast": "linear_hook_token_fast",
+    "linear_hook_sample_fast": "linear_hook_sample_fast",
+    "sample_fast": "linear_hook_sample_fast",
+}
+
+FISHER_ESTIMATORS = (
+    "per_sample_backward",
+    "linear_hook_token_fast",
+    "linear_hook_sample_fast",
+)
+
 
 def parse_expert_param_ref(name):
     """ 解析 expert 参数名。
@@ -74,6 +90,122 @@ def parse_expert_param_block_ref(name):
 
     layer_id, expert_id = expert_ref
     return layer_id, expert_id, ".".join(block_parts)
+
+
+def parse_expert_linear_module_ref(module_name):
+    parts = module_name.split(".")
+    if "blocks" not in parts or "experts" not in parts:
+        return None
+
+    blocks_idx = parts.index("blocks")
+    experts_idx = parts.index("experts")
+    if blocks_idx + 1 >= len(parts) or experts_idx + 1 >= len(parts):
+        return None
+    if not parts[blocks_idx + 1].isdigit() or not parts[experts_idx + 1].isdigit():
+        return None
+
+    block_parts = parts[experts_idx + 2:]
+    if not block_parts:
+        return None
+
+    return str(parts[blocks_idx + 1]), int(parts[experts_idx + 1]), ".".join(block_parts)
+
+
+def _collect_expert_linear_modules(model, num_experts, block_param_counts):
+    linear_modules = []
+    module_lookup = dict(model.named_modules())
+
+    for module_name, module in module_lookup.items():
+        if not isinstance(module, torch.nn.Linear):
+            continue
+
+        module_ref = parse_expert_linear_module_ref(module_name)
+        if module_ref is None:
+            continue
+
+        layer_id, expert_id, block_prefix = module_ref
+        if expert_id >= num_experts:
+            continue
+
+        parts = module_name.split(".")
+        experts_idx = parts.index("experts")
+        expert_module_name = ".".join(parts[:experts_idx + 2])
+        expert_module = module_lookup.get(expert_module_name)
+
+        layer_key = str(layer_id)
+        expert_key = str(expert_id)
+        expert_blocks = block_param_counts.get(layer_key, {}).get(expert_key, {})
+        weight_block_name = f"{block_prefix}.weight"
+        bias_block_name = f"{block_prefix}.bias"
+        has_weight_block = weight_block_name in expert_blocks
+        has_bias_block = bias_block_name in expert_blocks
+        if not has_weight_block and not has_bias_block:
+            continue
+
+        linear_modules.append(
+            {
+                "name": module_name,
+                "module": module,
+                "expert_module": expert_module,
+                "expert_module_name": expert_module_name,
+                "layer_id": layer_key,
+                "expert_id": expert_id,
+                "block_prefix": block_prefix,
+                "weight_block_name": weight_block_name,
+                "bias_block_name": bias_block_name,
+                "has_weight_block": has_weight_block,
+                "has_bias_block": has_bias_block,
+            }
+        )
+
+    return linear_modules
+
+
+def _flatten_linear_hook_tensor(value, module_name, tensor_name):
+    if not torch.is_tensor(value):
+        raise RuntimeError(
+            "linear hook Fisher expected tensor "
+            f"{tensor_name} for expert Linear module {module_name!r}."
+        )
+    if value.ndim == 0:
+        raise RuntimeError(
+            "linear hook Fisher expected non-scalar "
+            f"{tensor_name} for expert Linear module {module_name!r}."
+        )
+    return value.reshape(-1, value.shape[-1])
+
+
+def _compute_sample_grouped_linear_fisher_scalars(x_flat, delta_flat, sample_ids):
+    x_work = x_flat.detach()
+    delta_work = delta_flat.detach()
+    if x_work.dtype in {torch.float16, torch.bfloat16}:
+        x_work = x_work.to(dtype=torch.float32)
+    if delta_work.dtype in {torch.float16, torch.bfloat16}:
+        delta_work = delta_work.to(dtype=torch.float32)
+
+    x_work = x_work.reshape(-1, x_work.shape[-1])
+    delta_work = delta_work.reshape(-1, delta_work.shape[-1])
+    sample_ids = sample_ids.detach().reshape(-1).to(device=x_work.device, dtype=torch.long)
+
+    weight_grad_square_sum = torch.zeros((), dtype=torch.float64, device=x_work.device)
+    bias_grad_square_sum = torch.zeros((), dtype=torch.float64, device=x_work.device)
+    unique_sample_ids = torch.unique(sample_ids, sorted=True)
+
+    for sample_id in unique_sample_ids:
+        mask = sample_ids == sample_id
+        x_s = x_work[mask]
+        delta_s = delta_work[mask]
+        sample_grad_w = torch.einsum("to,ti->oi", delta_s, x_s)
+        sample_grad_b = delta_s.sum(dim=0)
+        weight_grad_square_sum += sample_grad_w.pow(2).sum().to(dtype=torch.float64)
+        bias_grad_square_sum += sample_grad_b.pow(2).sum().to(dtype=torch.float64)
+
+    return (
+        weight_grad_square_sum,
+        bias_grad_square_sum,
+        int(unique_sample_ids.numel()),
+        int(sample_ids.numel()),
+    )
 
 
 def _collect_expert_parameter_entries(model, num_experts):
@@ -126,6 +258,18 @@ def canonicalize_fisher_score_mode(score_mode):
             f"Got {score_mode!r}."
         )
     return canonical_mode
+
+
+def canonicalize_fisher_estimator(estimator):
+    raw_estimator = "per_sample_backward" if estimator is None else str(estimator).strip().lower()
+    canonical_estimator = FISHER_ESTIMATOR_ALIASES.get(raw_estimator)
+    if canonical_estimator is None:
+        supported = ", ".join(FISHER_ESTIMATORS)
+        raise ValueError(
+            f"fedwolf_fisher_estimator must be one of: {supported}. "
+            f"Got {estimator!r}."
+        )
+    return canonical_estimator
 
 
 def parse_optional_positive_int_limit(value, field_name):
@@ -356,6 +500,301 @@ def _accumulate_evidence_expert_stats(total_stats, result, num_experts, device):
             pass
 
 
+def _tensor_scalar_to_float(value):
+    if value is None:
+        return 0.0
+    if torch.is_tensor(value):
+        if value.numel() == 0:
+            return 0.0
+        return float(value.detach().cpu().item())
+    return float(value)
+
+
+def _count_to_int(value):
+    if value is None:
+        return 0
+    if torch.is_tensor(value):
+        if value.numel() == 0:
+            return 0
+        return int(value.detach().cpu().item())
+    return int(value)
+
+
+def _key_candidates(value):
+    candidates = []
+    for candidate in (value, str(value)):
+        if candidate not in candidates:
+            candidates.append(candidate)
+    try:
+        int_value = int(value)
+    except (TypeError, ValueError):
+        int_value = None
+    if int_value is not None and int_value not in candidates:
+        candidates.append(int_value)
+    return candidates
+
+
+def _get_layer_mapping(mapping, layer_id):
+    if not isinstance(mapping, dict):
+        return {}
+    for layer_key in _key_candidates(layer_id):
+        value = mapping.get(layer_key)
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def _get_expert_mapping(mapping, layer_id, expert_id):
+    layer_mapping = _get_layer_mapping(mapping, layer_id)
+    for expert_key in _key_candidates(expert_id):
+        value = layer_mapping.get(expert_key)
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def _get_param_count(param_counts, layer_id, expert_id):
+    for layer_key in _key_candidates(layer_id):
+        for expert_key in _key_candidates(expert_id):
+            value = param_counts.get((layer_key, expert_key))
+            if value is not None:
+                return int(value)
+    return 0
+
+
+def _sum_numeric_tree(value):
+    if value is None:
+        return 0.0
+    if torch.is_tensor(value):
+        if value.numel() == 0:
+            return 0.0
+        return float(value.detach().cpu().sum().item())
+    if isinstance(value, dict):
+        return sum(_sum_numeric_tree(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_sum_numeric_tree(item) for item in value)
+    return float(value)
+
+
+def _ensure_default_fast_diagnostics(diagnostics, canonical_estimator):
+    defaults = {
+        "fast_fisher_sample_grouped": False,
+        "fast_fisher_count_unit": None,
+        "fast_fisher_token_count_unit": None,
+        "fast_fisher_hooked_linear_count": 0,
+        "fast_fisher_hooked_linear_names": [],
+        "fast_fisher_token_count_by_layer": {},
+        "fast_fisher_active_sample_count_by_layer": {},
+        "fast_fisher_active_token_count_by_layer": {},
+        "fast_fisher_note": None,
+        "fast_fisher_unmatched_linear_block_count": 0,
+    }
+
+    if canonical_estimator == "linear_hook_token_fast":
+        defaults.update(
+            {
+                "fast_fisher_sample_grouped": False,
+                "fast_fisher_count_unit": "routed_tokens",
+                "fast_fisher_token_count_unit": "accepted_routed_tokens",
+                "fast_fisher_note": (
+                    "linear_hook_token_fast uses token-level diagonal Fisher approximation: "
+                    "sum_token grad_token^2, not sample-grouped (sum_token grad_token)^2."
+                ),
+            }
+        )
+    elif canonical_estimator == "linear_hook_sample_fast":
+        defaults.update(
+            {
+                "fast_fisher_sample_grouped": True,
+                "fast_fisher_count_unit": "active_original_samples",
+                "fast_fisher_token_count_unit": "accepted_routed_tokens",
+                "fast_fisher_note": (
+                    "linear_hook_sample_fast groups routed token gradient contributions by original "
+                    "sample before squaring: sum_sample (sum_token grad_token)^2."
+                ),
+            }
+        )
+
+    for key, value in defaults.items():
+        diagnostics.setdefault(key, value)
+
+
+def _infer_zero_score_reason(*, canonical_estimator, diagnostics, all_scores):
+    if all_scores and any(float(score) != 0.0 for score in all_scores):
+        return diagnostics.get("zero_score_reason")
+
+    total_grad_square_sum = _sum_numeric_tree(diagnostics.get("grad_square_sum_by_layer", {}))
+
+    if canonical_estimator == "linear_hook_token_fast":
+        if int(diagnostics.get("fast_fisher_hooked_linear_count", 0)) == 0:
+            return "No expert Linear modules were hooked for linear_hook_token_fast."
+        active_token_count = _sum_numeric_tree(
+            diagnostics.get("fast_fisher_active_token_count_by_layer")
+            or diagnostics.get("num_samples_with_grad_by_layer", {})
+        )
+        if active_token_count == 0:
+            return "No accepted routed tokens reached hooked expert Linear modules during evidence forward."
+        if total_grad_square_sum == 0.0:
+            return (
+                "Accepted routed tokens reached hooked expert Linear modules, but token-level Fisher "
+                "grad_square_sum was exactly 0."
+            )
+        return "Token-level Fisher grad_square_sum was non-zero before normalization, but final scores became 0."
+
+    if canonical_estimator == "linear_hook_sample_fast":
+        if int(diagnostics.get("fast_fisher_hooked_linear_count", 0)) == 0:
+            return "No expert Linear modules were hooked for linear_hook_sample_fast."
+        active_sample_count = _sum_numeric_tree(diagnostics.get("fast_fisher_active_sample_count_by_layer", {}))
+        active_token_count = _sum_numeric_tree(diagnostics.get("fast_fisher_active_token_count_by_layer", {}))
+        if active_sample_count == 0 and active_token_count == 0:
+            return "No accepted routed tokens reached hooked expert Linear modules during evidence forward."
+        if active_sample_count > 0 and total_grad_square_sum == 0.0:
+            return (
+                "Accepted routed tokens reached hooked expert Linear modules, but sample-grouped Fisher "
+                "grad_square_sum was exactly 0."
+            )
+        return "Sample-grouped Fisher grad_square_sum was non-zero before normalization, but final scores became 0."
+
+    total_samples_with_grad = _sum_numeric_tree(diagnostics.get("num_samples_with_grad_by_layer", {}))
+    if total_samples_with_grad == 0:
+        return "All matched expert parameters had grad=None for every sample after per-sample backward."
+    if total_grad_square_sum == 0.0:
+        return (
+            "Matched expert parameters received gradients, but accumulated per-sample "
+            "grad_square_sum was exactly 0."
+        )
+    return "Per-sample grad_square_sum was non-zero before normalization, but final scores became 0."
+
+
+def _finalize_expert_fisher_outputs(
+    *,
+    score_sums,
+    samples_with_grad,
+    block_score_sums,
+    block_samples_with_grad,
+    param_counts,
+    block_param_counts,
+    num_experts,
+    total_samples,
+    canonical_score_mode,
+    diagnostics,
+):
+    canonical_estimator = diagnostics.get("fisher_estimator", "per_sample_backward")
+    score_by_layer = {}
+    log_score_by_layer = {}
+    expert_block_fisher_score_by_layer = {}
+    positive_block_scores = []
+    matched_block_count = 0
+
+    for layer_id, experts in block_param_counts.items():
+        layer_key = str(layer_id)
+        layer_block_scores = {}
+        for expert_id, blocks in experts.items():
+            expert_key = str(expert_id)
+            expert_block_scores = {}
+            expert_block_score_sums = _get_expert_mapping(block_score_sums, layer_key, expert_id)
+            expert_block_samples = _get_expert_mapping(block_samples_with_grad, layer_key, expert_id)
+            for block_name, block_param_count in blocks.items():
+                matched_block_count += 1
+                grad_square_sum_value = _tensor_scalar_to_float(expert_block_score_sums.get(block_name))
+                num_samples_with_grad = _count_to_int(expert_block_samples.get(block_name, 0))
+                block_score = compute_fisher_scalar_from_sums(
+                    grad_square_sum=grad_square_sum_value,
+                    param_count=int(block_param_count),
+                    total_samples=total_samples,
+                    num_samples_with_grad=num_samples_with_grad,
+                    mode=canonical_score_mode,
+                )
+                expert_block_scores[str(block_name)] = float(block_score)
+                if block_score > 0.0:
+                    positive_block_scores.append(float(block_score))
+            layer_block_scores[expert_key] = expert_block_scores
+        expert_block_fisher_score_by_layer[layer_key] = layer_block_scores
+
+    diagnostics["expert_block_fisher_score_by_layer"] = expert_block_fisher_score_by_layer
+    diagnostics["expert_block_fisher_matched_block_count"] = int(matched_block_count)
+    diagnostics["expert_block_fisher_positive_block_count"] = int(len(positive_block_scores))
+    diagnostics["expert_block_fisher_mean_positive"] = (
+        sum(positive_block_scores) / len(positive_block_scores) if positive_block_scores else 0.0
+    )
+    diagnostics["expert_block_fisher_max_positive"] = max(positive_block_scores) if positive_block_scores else 0.0
+
+    for layer_id, scores in score_sums.items():
+        layer_key = str(layer_id)
+        scores_cpu = scores.detach().cpu() if torch.is_tensor(scores) else torch.as_tensor(scores, dtype=torch.float64)
+        raw_samples_with_grad = samples_with_grad.get(layer_id)
+        if raw_samples_with_grad is None:
+            raw_samples_with_grad = samples_with_grad.get(layer_key)
+        if raw_samples_with_grad is None:
+            samples_with_grad_cpu = torch.zeros(num_experts, dtype=torch.long)
+        elif torch.is_tensor(raw_samples_with_grad):
+            samples_with_grad_cpu = raw_samples_with_grad.detach().cpu()
+        else:
+            samples_with_grad_cpu = torch.as_tensor(raw_samples_with_grad, dtype=torch.long)
+
+        mode_scores_by_layer = {
+            mode: torch.zeros(num_experts, dtype=torch.float64)
+            for mode in FISHER_SCORE_MODES
+        }
+        layer_scores = torch.zeros(num_experts, dtype=torch.float64)
+        for expert_id in range(num_experts):
+            param_count = _get_param_count(param_counts, layer_key, expert_id)
+            num_samples_with_grad = int(samples_with_grad_cpu[expert_id].item())
+            grad_square_sum = float(scores_cpu[expert_id].item())
+            for mode in FISHER_SCORE_MODES:
+                mode_scores_by_layer[mode][expert_id] = compute_fisher_scalar_from_sums(
+                    grad_square_sum=grad_square_sum,
+                    param_count=param_count,
+                    total_samples=total_samples,
+                    num_samples_with_grad=num_samples_with_grad,
+                    mode=mode,
+                )
+            layer_scores[expert_id] = mode_scores_by_layer[canonical_score_mode][expert_id]
+
+        layer_scores = torch.nan_to_num(layer_scores, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+        score_by_layer[layer_key] = layer_scores.cpu()
+        log_score_by_layer[layer_key] = torch.log1p(layer_scores).cpu()
+        diagnostics["param_count_by_layer"][layer_key] = {
+            str(expert_id): int(_get_param_count(param_counts, layer_key, expert_id))
+            for expert_id in range(num_experts)
+        }
+        diagnostics["grad_square_sum_by_layer"][layer_key] = _scientific_list(scores_cpu.tolist())
+        num_samples_with_grad_list = [int(value) for value in samples_with_grad_cpu.tolist()]
+        diagnostics["num_samples_with_grad_by_layer"][layer_key] = num_samples_with_grad_list
+        if canonical_estimator == "linear_hook_token_fast":
+            diagnostics["fast_fisher_token_count_by_layer"][layer_key] = list(num_samples_with_grad_list)
+            diagnostics["fast_fisher_active_token_count_by_layer"][layer_key] = list(num_samples_with_grad_list)
+        diagnostics["score_scientific_by_layer"][layer_key] = _scientific_list(layer_scores.tolist())
+        diagnostics["score_mean_diag_by_layer"][layer_key] = _scientific_list(
+            mode_scores_by_layer["mean_diag"].tolist()
+        )
+        diagnostics["score_mean_diag_active_by_layer"][layer_key] = _scientific_list(
+            mode_scores_by_layer["mean_diag_active"].tolist()
+        )
+        diagnostics["score_trace_per_sample_by_layer"][layer_key] = _scientific_list(
+            mode_scores_by_layer["trace_per_sample"].tolist()
+        )
+        diagnostics["score_trace_per_active_sample_by_layer"][layer_key] = _scientific_list(
+            mode_scores_by_layer["trace_per_active_sample"].tolist()
+        )
+        diagnostics["score_trace_raw_by_layer"][layer_key] = _scientific_list(
+            mode_scores_by_layer["trace_raw"].tolist()
+        )
+
+    all_scores = [
+        float(value)
+        for scores in score_by_layer.values()
+        for value in scores.tolist()
+    ]
+    diagnostics["zero_score_reason"] = _infer_zero_score_reason(
+        canonical_estimator=canonical_estimator,
+        diagnostics=diagnostics,
+        all_scores=all_scores,
+    )
+
+    return score_by_layer, log_score_by_layer
+
+
 def _finalize_evidence_expert_stats(total_stats):
     stats_by_layer = {}
     activations_by_layer = {}
@@ -399,23 +838,23 @@ def compute_expert_fisher_evidence(
     return_diagnostics=False,
     model_mode="eval",
     score_mode="mean_diag",
+    fisher_estimator="per_sample_backward",
     debug_batches=0,
     max_samples=None,
     max_batches=None,
     pin_memory=False,
 ):
-    """计算 expert 的逐样本 empirical diagonal Fisher 标量 evidence。
-
-    对于包含 d_k 个参数的每个 expert 参数 block Theta_k，计算：
-        1 / (|D_m| * d_k) * sum_i ||grad_{Theta_k} loss_i||^2
-
-    该 pass 只从训练后的 local model 读取梯度，不更新参数或 optimizer state。
-    """
+    """计算 expert 的 Fisher 标量 evidence，不更新参数或 optimizer state。"""
 
     if model_mode not in {"eval", "train"}:
         raise ValueError(f"model_mode must be either 'eval' or 'train', got {model_mode!r}.")
 
     canonical_score_mode = canonicalize_fisher_score_mode(score_mode)
+    canonical_estimator = canonicalize_fisher_estimator(fisher_estimator)
+    is_linear_hook_estimator = canonical_estimator in {
+        "linear_hook_token_fast",
+        "linear_hook_sample_fast",
+    }
     debug_batches = max(int(debug_batches), 0)
     max_samples = parse_optional_positive_int_limit(max_samples, "fedwolf_fisher_max_samples")
     max_batches = parse_optional_positive_int_limit(max_batches, "fedwolf_fisher_max_batches")
@@ -439,10 +878,29 @@ def compute_expert_fisher_evidence(
         "grad_square_sum_by_layer": {},
         "num_batches_with_grad_by_layer": "deprecated; use num_samples_with_grad_by_layer",
         "num_samples_with_grad_by_layer": {},
+        "num_samples_with_grad_semantics": (
+            "active_routed_tokens_for_linear_hook_token_fast"
+            if canonical_estimator == "linear_hook_token_fast"
+            else (
+                "active_original_samples_for_linear_hook_sample_fast"
+                if canonical_estimator == "linear_hook_sample_fast"
+                else "samples_with_non_none_expert_grad_for_per_sample_backward"
+            )
+        ),
         "score_scientific_by_layer": {},
         "total_samples": 0,
         "num_batches": 0,
-        "fisher_estimator": "per_sample_empirical_diagonal_fisher",
+        "fisher_estimator": canonical_estimator,
+        "fisher_estimator_raw": fisher_estimator,
+        "fisher_estimator_impl": (
+            "linear_hook_token_diagonal_fisher"
+            if canonical_estimator == "linear_hook_token_fast"
+            else (
+                "linear_hook_sample_grouped_diagonal_fisher"
+                if canonical_estimator == "linear_hook_sample_fast"
+                else "per_sample_empirical_diagonal_fisher"
+            )
+        ),
         "fisher_score_mode": canonical_score_mode,
         "fisher_score_mode_raw": score_mode,
         "normalization": FISHER_SCORE_NORMALIZATION[canonical_score_mode],
@@ -456,8 +914,6 @@ def compute_expert_fisher_evidence(
         "stop_reason": None,
         "effective_total_samples": 0,
         "effective_num_batches": 0,
-        # Expert Fisher evidence 只基于逐样本 supervised CE loss。
-        # router 辅助损失是 batch-level 标量，不是逐样本 loss，加入这里会重复计入。
         "fisher_loss_source": "supervised_cross_entropy_only",
         "auxiliary_loss_used_for_fisher": False,
         "auxiliary_loss_note": (
@@ -481,6 +937,7 @@ def compute_expert_fisher_evidence(
         "evidence_selected_counts_by_layer": {},
         "evidence_overflow_counts_by_layer": {},
     }
+    _ensure_default_fast_diagnostics(diagnostics, canonical_estimator)
 
     block_param_counts = {}
     unmatched_block_name_count = 0
@@ -545,8 +1002,171 @@ def compute_expert_fisher_evidence(
     limit_reached = False
     stop_reason = None
     evidence_expert_stats_by_layer = {}
+    linear_modules = []
+    activation_cache = {}
+    hook_handles = []
+    counted_experts_this_batch = set()
+    fast_fisher_has_net0 = set()
+    fast_active_token_counts = {}
+    fast_active_sample_counts = {}
+
+    if is_linear_hook_estimator:
+        fast_active_token_counts = {
+            layer_id: torch.zeros(num_experts, dtype=torch.long, device=device)
+            for layer_id in expert_entries
+        }
+        fast_active_sample_counts = {
+            layer_id: torch.zeros(num_experts, dtype=torch.long, device=device)
+            for layer_id in expert_entries
+        }
+        linear_modules = _collect_expert_linear_modules(
+            model=model,
+            num_experts=num_experts,
+            block_param_counts=block_param_counts,
+        )
+        fast_fisher_has_net0 = {
+            (info["layer_id"], info["expert_id"])
+            for info in linear_modules
+            if info["block_prefix"] == "net.0"
+        }
+        diagnostics["fast_fisher_hooked_linear_count"] = int(len(linear_modules))
+        diagnostics["fast_fisher_hooked_linear_names"] = [
+            info["name"] for info in linear_modules[:64]
+        ]
+        diagnostics["fast_fisher_unmatched_linear_block_count"] = int(
+            sum(1 for info in linear_modules if not info["has_weight_block"])
+            + sum(
+                1
+                for info in linear_modules
+                if info["module"].bias is not None and not info["has_bias_block"]
+            )
+        )
+
+        def make_forward_hook(module_name):
+            def forward_hook(module, inputs, output):
+                if not inputs or not torch.is_tensor(inputs[0]):
+                    raise RuntimeError(
+                        f"{canonical_estimator} expected tensor input for expert "
+                        f"Linear module {module_name!r}."
+                    )
+                activation_cache[id(module)] = inputs[0].detach()
+
+            return forward_hook
+
+        def make_backward_hook(info):
+            def backward_hook(module, grad_input, grad_output):
+                if not grad_output or not torch.is_tensor(grad_output[0]):
+                    raise RuntimeError(
+                        f"{canonical_estimator} expected tensor grad_output for expert "
+                        f"Linear module {info['name']!r}."
+                    )
+
+                activation = activation_cache.get(id(module))
+                if activation is None:
+                    raise RuntimeError(
+                        f"{canonical_estimator} could not find cached activation for expert "
+                        f"Linear module {info['name']!r}."
+                    )
+
+                x_flat = _flatten_linear_hook_tensor(activation, info["name"], "input activation")
+                delta_flat = _flatten_linear_hook_tensor(
+                    grad_output[0].detach(),
+                    info["name"],
+                    "grad_output",
+                )
+                if x_flat.shape[0] != delta_flat.shape[0]:
+                    raise RuntimeError(
+                        f"{canonical_estimator} expected matching token counts for Linear input "
+                        f"and grad_output in {info['name']!r}, got x_flat shape "
+                        f"{tuple(x_flat.shape)} and delta_flat shape {tuple(delta_flat.shape)}."
+                    )
+
+                token_count = x_flat.shape[0]
+                if token_count <= 0:
+                    return
+
+                layer_id = info["layer_id"]
+                expert_id = info["expert_id"]
+                expert_block_score_sums = block_score_sums.get(layer_id, {}).get(expert_id, {})
+                expert_block_samples = block_samples_with_grad.get(layer_id, {}).get(expert_id, {})
+
+                if canonical_estimator == "linear_hook_sample_fast":
+                    expert_module = info.get("expert_module")
+                    sample_ids = getattr(expert_module, "_fedwolf_accepted_sample_ids", None)
+                    if sample_ids is None:
+                        raise RuntimeError(
+                            "linear_hook_sample_fast requires expert._fedwolf_accepted_sample_ids. "
+                            "Please make sure TokenSwitchFFN.forward exposes accepted sample ids "
+                            "before calling expert(...). "
+                            "linear_hook_sample_fast depends on TokenSwitchFFN.forward exposing accepted "
+                            "sample ids; expected attribute: _fedwolf_accepted_sample_ids. "
+                            f"Linear module: {info['name']!r}; expert module: "
+                            f"{info.get('expert_module_name')!r}."
+                        )
+                    sample_ids = sample_ids.detach().to(device=x_flat.device, dtype=torch.long).reshape(-1)
+                    if sample_ids.numel() != token_count:
+                        raise RuntimeError(
+                            "linear_hook_sample_fast expected Linear input, grad_output, and accepted "
+                            f"sample ids to have matching token counts for module {info['name']!r}; "
+                            f"x_flat shape={tuple(x_flat.shape)}, delta_flat shape={tuple(delta_flat.shape)}, "
+                            f"sample_ids shape={tuple(sample_ids.shape)}."
+                        )
+                    (
+                        weight_grad_square_sum,
+                        bias_grad_square_sum,
+                        active_sample_count,
+                        active_token_count,
+                    ) = _compute_sample_grouped_linear_fisher_scalars(
+                        x_flat=x_flat,
+                        delta_flat=delta_flat,
+                        sample_ids=sample_ids,
+                    )
+                    count_increment = active_sample_count
+                else:
+                    delta_square = delta_flat.pow(2)
+                    weight_grad_square_sum = torch.einsum(
+                        "to,ti->",
+                        delta_square,
+                        x_flat.pow(2),
+                    ).to(dtype=torch.float64)
+                    bias_grad_square_sum = delta_square.sum().to(dtype=torch.float64)
+                    active_sample_count = 0
+                    active_token_count = token_count
+                    count_increment = token_count
+
+                if info["has_weight_block"] and info["weight_block_name"] in expert_block_score_sums:
+                    score_sums[layer_id][expert_id] += weight_grad_square_sum
+                    expert_block_score_sums[info["weight_block_name"]] += weight_grad_square_sum
+                    expert_block_samples[info["weight_block_name"]] += count_increment
+
+                if (
+                    module.bias is not None
+                    and info["has_bias_block"]
+                    and info["bias_block_name"] in expert_block_score_sums
+                ):
+                    score_sums[layer_id][expert_id] += bias_grad_square_sum
+                    expert_block_score_sums[info["bias_block_name"]] += bias_grad_square_sum
+                    expert_block_samples[info["bias_block_name"]] += count_increment
+
+                count_key = (layer_id, expert_id)
+                if count_key not in counted_experts_this_batch and (
+                    info["block_prefix"] == "net.0" or count_key not in fast_fisher_has_net0
+                ):
+                    samples_with_grad[layer_id][expert_id] += count_increment
+                    if canonical_estimator == "linear_hook_sample_fast":
+                        fast_active_sample_counts[layer_id][expert_id] += active_sample_count
+                    fast_active_token_counts[layer_id][expert_id] += active_token_count
+                    counted_experts_this_batch.add(count_key)
+
+            return backward_hook
 
     try:
+        if is_linear_hook_estimator:
+            for info in linear_modules:
+                module = info["module"]
+                hook_handles.append(module.register_forward_hook(make_forward_hook(info["name"])))
+                hook_handles.append(module.register_full_backward_hook(make_backward_hook(info)))
+
         for inputs, labels in data_loader:
             if max_batches is not None and num_batches >= max_batches:
                 limit_reached = True
@@ -592,54 +1212,66 @@ def compute_expert_fisher_evidence(
             num_batches += 1
             total_samples += batch_size
 
-            # 重要：
-            # 这里仍然逐样本 backward 并累计 grad(loss_i)^2，然后再平均。
-            # 这不同于 grad(mean_i loss_i)^2；后者会先让不同样本梯度相互抵消，再平方。
-            # 梯度平方和保留在 evidence device 上累计，避免内层循环里的 .cpu()/.item()/float(tensor)
-            # 触发 GPU 同步；只有最后构造 CPU 返回值和 diagnostics 时才转 CPU。
-            for sample_idx in range(batch_size):
+            if is_linear_hook_estimator:
+                counted_experts_this_batch.clear()
+                per_sample_losses.sum().backward()
                 model.zero_grad(set_to_none=True)
-                retain_graph = sample_idx < batch_size - 1
-                per_sample_losses[sample_idx].backward(retain_graph=retain_graph)
+                activation_cache.clear()
+            else:
+                # 重要：
+                # 这里仍然逐样本 backward 并累计 grad(loss_i)^2，然后再平均。
+                # 这不同于 grad(mean_i loss_i)^2；后者会先让不同样本梯度相互抵消，再平方。
+                # 梯度平方和保留在 evidence device 上累计，避免内层循环里的 .cpu()/.item()/float(tensor)
+                # 触发 GPU 同步；只有最后构造 CPU 返回值和 diagnostics 时才转 CPU。
+                for sample_idx in range(batch_size):
+                    model.zero_grad(set_to_none=True)
+                    retain_graph = sample_idx < batch_size - 1
+                    per_sample_losses[sample_idx].backward(retain_graph=retain_graph)
 
-                for layer_id, experts in expert_entries.items():
-                    for expert_id, entries in experts.items():
-                        grad_square_sum = None
-                        block_grad_square_sums = {}
-                        has_grad_param_count = 0
-                        none_grad_param_count = 0
-                        for param_name, param in entries:
-                            if param.grad is not None:
-                                value = param.grad.detach().pow(2).sum().to(dtype=torch.float64)
-                                grad_square_sum = value if grad_square_sum is None else grad_square_sum + value
-                                block_ref = parse_expert_param_block_ref(param_name)
-                                if block_ref is not None:
-                                    _, _, block_name = block_ref
-                                    block_grad_square_sums[block_name] = (
-                                        value
-                                        if block_name not in block_grad_square_sums
-                                        else block_grad_square_sums[block_name] + value
-                                    )
-                                has_grad_param_count += 1
-                            else:
-                                none_grad_param_count += 1
+                    for layer_id, experts in expert_entries.items():
+                        for expert_id, entries in experts.items():
+                            grad_square_sum = None
+                            block_grad_square_sums = {}
+                            has_grad_param_count = 0
+                            none_grad_param_count = 0
+                            for param_name, param in entries:
+                                if param.grad is not None:
+                                    value = param.grad.detach().pow(2).sum().to(dtype=torch.float64)
+                                    grad_square_sum = value if grad_square_sum is None else grad_square_sum + value
+                                    block_ref = parse_expert_param_block_ref(param_name)
+                                    if block_ref is not None:
+                                        _, _, block_name = block_ref
+                                        block_grad_square_sums[block_name] = (
+                                            value
+                                            if block_name not in block_grad_square_sums
+                                            else block_grad_square_sums[block_name] + value
+                                        )
+                                    has_grad_param_count += 1
+                                else:
+                                    none_grad_param_count += 1
 
-                        if has_grad_param_count > 0:
-                            samples_with_grad[layer_id][expert_id] += 1
-                            score_sums[layer_id][expert_id] += grad_square_sum
-                            for block_name, block_grad_square_sum in block_grad_square_sums.items():
-                                if block_name in block_score_sums.get(layer_id, {}).get(expert_id, {}):
-                                    block_samples_with_grad[layer_id][expert_id][block_name] += 1
-                                    block_score_sums[layer_id][expert_id][block_name] += block_grad_square_sum
+                            if has_grad_param_count > 0:
+                                samples_with_grad[layer_id][expert_id] += 1
+                                score_sums[layer_id][expert_id] += grad_square_sum
+                                for block_name, block_grad_square_sum in block_grad_square_sums.items():
+                                    if block_name in block_score_sums.get(layer_id, {}).get(expert_id, {}):
+                                        block_samples_with_grad[layer_id][expert_id][block_name] += 1
+                                        block_score_sums[layer_id][expert_id][block_name] += block_grad_square_sum
 
             if num_batches <= debug_batches:
-                diagnostics["batch_grad_status"].append(
-                    {
-                        "batch_index": num_batches,
-                        "batch_size": int(batch_size),
-                        "sample_count": int(batch_size),
-                    }
-                )
+                batch_grad_status = {
+                    "batch_index": num_batches,
+                    "batch_size": int(batch_size),
+                    "sample_count": int(batch_size),
+                }
+                if is_linear_hook_estimator:
+                    batch_grad_status.update(
+                        {
+                            "fisher_estimator": canonical_estimator,
+                            "hooked_linear_count": int(len(linear_modules)),
+                        }
+                    )
+                diagnostics["batch_grad_status"].append(batch_grad_status)
 
             if max_samples is not None and total_samples >= max_samples:
                 limit_reached = True
@@ -650,6 +1282,9 @@ def compute_expert_fisher_evidence(
                 stop_reason = "max_batches"
                 break
     finally:
+        for handle in hook_handles:
+            handle.remove()
+        activation_cache.clear()
         model.zero_grad(set_to_none=True)
         if was_training:
             model.train()
@@ -669,129 +1304,32 @@ def compute_expert_fisher_evidence(
         diagnostics["evidence_overflow_counts_by_layer"],
     ) = _finalize_evidence_expert_stats(evidence_expert_stats_by_layer)
 
-    score_by_layer = {}
-    log_score_by_layer = {}
-    expert_block_fisher_score_by_layer = {}
-    positive_block_scores = []
-    matched_block_count = 0
+    if canonical_estimator == "linear_hook_sample_fast":
+        for layer_id in score_sums:
+            layer_key = str(layer_id)
+            token_counts = fast_active_token_counts.get(layer_id)
+            sample_counts = fast_active_sample_counts.get(layer_id)
+            if token_counts is not None:
+                diagnostics["fast_fisher_active_token_count_by_layer"][layer_key] = [
+                    int(value) for value in token_counts.detach().cpu().tolist()
+                ]
+            if sample_counts is not None:
+                diagnostics["fast_fisher_active_sample_count_by_layer"][layer_key] = [
+                    int(value) for value in sample_counts.detach().cpu().tolist()
+                ]
 
-    for layer_id, experts in block_param_counts.items():
-        layer_key = str(layer_id)
-        layer_block_scores = {}
-        for expert_id, blocks in experts.items():
-            expert_key = str(expert_id)
-            expert_block_scores = {}
-            for block_name, block_param_count in blocks.items():
-                matched_block_count += 1
-                grad_square_sum = block_score_sums.get(layer_id, {}).get(int(expert_id), {}).get(block_name)
-                if grad_square_sum is None:
-                    grad_square_sum_value = 0.0
-                else:
-                    grad_square_sum_value = float(grad_square_sum.detach().cpu().item())
-                num_samples_with_grad = int(
-                    block_samples_with_grad.get(layer_id, {}).get(int(expert_id), {}).get(block_name, 0)
-                )
-                block_score = compute_fisher_scalar_from_sums(
-                    grad_square_sum=grad_square_sum_value,
-                    param_count=int(block_param_count),
-                    total_samples=total_samples,
-                    num_samples_with_grad=num_samples_with_grad,
-                    mode=canonical_score_mode,
-                )
-                expert_block_scores[str(block_name)] = float(block_score)
-                if block_score > 0.0:
-                    positive_block_scores.append(float(block_score))
-            if expert_block_scores:
-                layer_block_scores[expert_key] = expert_block_scores
-        if layer_block_scores:
-            expert_block_fisher_score_by_layer[layer_key] = layer_block_scores
-
-    diagnostics["expert_block_fisher_score_by_layer"] = expert_block_fisher_score_by_layer
-    diagnostics["expert_block_fisher_matched_block_count"] = int(matched_block_count)
-    diagnostics["expert_block_fisher_positive_block_count"] = int(len(positive_block_scores))
-    diagnostics["expert_block_fisher_mean_positive"] = (
-        sum(positive_block_scores) / len(positive_block_scores) if positive_block_scores else 0.0
+    score_by_layer, log_score_by_layer = _finalize_expert_fisher_outputs(
+        score_sums=score_sums,
+        samples_with_grad=samples_with_grad,
+        block_score_sums=block_score_sums,
+        block_samples_with_grad=block_samples_with_grad,
+        param_counts=param_counts,
+        block_param_counts=block_param_counts,
+        num_experts=num_experts,
+        total_samples=total_samples,
+        canonical_score_mode=canonical_score_mode,
+        diagnostics=diagnostics,
     )
-    diagnostics["expert_block_fisher_max_positive"] = max(positive_block_scores) if positive_block_scores else 0.0
-
-    for layer_id, scores in score_sums.items():
-        scores_cpu = scores.detach().cpu()
-        samples_with_grad_cpu = samples_with_grad[layer_id].detach().cpu()
-        mode_scores_by_layer = {
-            mode: torch.zeros(num_experts, dtype=torch.float64)
-            for mode in FISHER_SCORE_MODES
-        }
-        layer_scores = torch.zeros(num_experts, dtype=torch.float64)
-        for expert_id in range(num_experts):
-            param_count = param_counts.get((layer_id, expert_id), 0)
-            num_samples_with_grad = int(samples_with_grad_cpu[expert_id].item())
-            for mode in FISHER_SCORE_MODES:
-                mode_scores_by_layer[mode][expert_id] = compute_fisher_scalar_from_sums(
-                    grad_square_sum=scores_cpu[expert_id].item(),
-                    param_count=param_count,
-                    total_samples=total_samples,
-                    num_samples_with_grad=num_samples_with_grad,
-                    mode=mode,
-                )
-            layer_scores[expert_id] = mode_scores_by_layer[canonical_score_mode][expert_id]
-
-        layer_scores = torch.nan_to_num(layer_scores, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
-        score_by_layer[str(layer_id)] = layer_scores.cpu()
-        log_score_by_layer[str(layer_id)] = torch.log1p(layer_scores).cpu()
-        diagnostics["param_count_by_layer"][str(layer_id)] = {
-            str(expert_id): int(param_counts.get((layer_id, expert_id), 0))
-            for expert_id in range(num_experts)
-        }
-        diagnostics["grad_square_sum_by_layer"][str(layer_id)] = _scientific_list(scores_cpu.tolist())
-        diagnostics["num_samples_with_grad_by_layer"][str(layer_id)] = [
-            int(value) for value in samples_with_grad_cpu.tolist()
-        ]
-        diagnostics["score_scientific_by_layer"][str(layer_id)] = _scientific_list(layer_scores.tolist())
-        diagnostics["score_mean_diag_by_layer"][str(layer_id)] = _scientific_list(
-            mode_scores_by_layer["mean_diag"].tolist()
-        )
-        diagnostics["score_mean_diag_active_by_layer"][str(layer_id)] = _scientific_list(
-            mode_scores_by_layer["mean_diag_active"].tolist()
-        )
-        diagnostics["score_trace_per_sample_by_layer"][str(layer_id)] = _scientific_list(
-            mode_scores_by_layer["trace_per_sample"].tolist()
-        )
-        diagnostics["score_trace_per_active_sample_by_layer"][str(layer_id)] = _scientific_list(
-            mode_scores_by_layer["trace_per_active_sample"].tolist()
-        )
-        diagnostics["score_trace_raw_by_layer"][str(layer_id)] = _scientific_list(
-            mode_scores_by_layer["trace_raw"].tolist()
-        )
-
-    all_scores = [
-        float(value)
-        for scores in score_by_layer.values()
-        for value in scores.tolist()
-    ]
-    if all_scores and all(score == 0.0 for score in all_scores):
-        total_samples_with_grad = sum(
-            sum(layer_counts)
-            for layer_counts in diagnostics["num_samples_with_grad_by_layer"].values()
-        )
-        total_grad_square_sum = sum(
-            float(value)
-            for layer_scores in diagnostics["grad_square_sum_by_layer"].values()
-            for value in layer_scores
-        )
-        if total_samples_with_grad == 0:
-            diagnostics["zero_score_reason"] = (
-                "All matched expert parameters had grad=None for every sample after per-sample backward. "
-                "Experts may be disconnected from the loss or no samples reached them."
-            )
-        elif total_grad_square_sum == 0.0:
-            diagnostics["zero_score_reason"] = (
-                "Expert gradients existed for some samples, but every per-sample expert "
-                "grad_square_sum was exactly 0."
-            )
-        else:
-            diagnostics["zero_score_reason"] = (
-                "Per-sample grad_square_sum was non-zero before normalization, but final scores became 0."
-            )
 
     if return_diagnostics:
         return score_by_layer, log_score_by_layer, diagnostics

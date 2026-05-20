@@ -148,6 +148,13 @@ class TokenSwitchFFN(nn.Module):
         expert_activations = torch.zeros(self.num_experts, device=x.device, dtype=torch.long)
         overflow_counts = torch.zeros(self.num_experts, device=x.device, dtype=torch.long)
 
+        # Per-forward FedWoLF routing metadata for optional Fisher hooks only.
+        for expert in self.experts:
+            expert._fedwolf_accepted_sample_ids = None
+            expert._fedwolf_accepted_positions = None
+            expert._fedwolf_num_tokens = num_tokens
+            expert._fedwolf_batch_size = batch_size
+
         for expert_id, expert in enumerate(self.experts):
             token_positions = torch.nonzero(flat_indices == expert_id, as_tuple=False).flatten()
             if token_positions.numel() == 0:
@@ -162,6 +169,16 @@ class TokenSwitchFFN(nn.Module):
 
             expert_activations[expert_id] = accepted_positions.numel()
             if accepted_positions.numel() > 0:
+                accepted_sample_ids = torch.div(
+                    accepted_positions,
+                    num_tokens,
+                    rounding_mode="floor",
+                )
+                expert._fedwolf_accepted_sample_ids = accepted_sample_ids.detach()
+                expert._fedwolf_accepted_positions = accepted_positions.detach()
+                expert._fedwolf_num_tokens = num_tokens
+                expert._fedwolf_batch_size = batch_size
+
                 expert_output = expert(flat_x[accepted_positions])
                 flat_output[accepted_positions] = (
                     expert_output * flat_top1_probs[accepted_positions].unsqueeze(-1)

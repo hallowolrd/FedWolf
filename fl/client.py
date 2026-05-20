@@ -234,9 +234,18 @@ class Client:
             "total_samples",
             "num_batches",
             "fisher_estimator",
+            "fisher_estimator_raw",
+            "fisher_estimator_impl",
             "fisher_score_mode",
             "fisher_score_mode_raw",
             "normalization",
+            "num_samples_with_grad_semantics",
+            "fast_fisher_sample_grouped",
+            "fast_fisher_count_unit",
+            "fast_fisher_token_count_unit",
+            "fast_fisher_hooked_linear_count",
+            "fast_fisher_note",
+            "fast_fisher_unmatched_linear_block_count",
             "model_mode",
             "debug_batches",
             "max_samples",
@@ -521,6 +530,7 @@ class Client:
             evidence_loader_mode = getattr(self.args, "fedwolf_evidence_loader_mode", "deterministic")
             evidence_model_mode = getattr(self.args, "fedwolf_evidence_model_mode", "eval")
             fisher_score_mode = getattr(self.args, "fedwolf_fisher_score_mode", "mean_diag")
+            fisher_estimator = getattr(self.args, "fedwolf_fisher_estimator", "per_sample_backward")
             fisher_debug_batches = getattr(self.args, "fedwolf_fisher_debug_batches", 0)
             fisher_max_samples = getattr(self.args, "fedwolf_fisher_max_samples", None)
             fisher_max_batches = getattr(self.args, "fedwolf_fisher_max_batches", None)
@@ -530,6 +540,7 @@ class Client:
                 f"--fedwolf_evidence_loader_mode : {evidence_loader_mode} "
                 f"--fedwolf_evidence_model_mode : {evidence_model_mode} "
                 f"--fedwolf_fisher_score_mode : {fisher_score_mode} "
+                f"--fedwolf_fisher_estimator : {fisher_estimator} "
                 f"--fedwolf_fisher_max_samples : {fisher_max_samples} "
                 f"--fedwolf_fisher_max_batches : {fisher_max_batches}"
             )
@@ -543,6 +554,7 @@ class Client:
                 return_diagnostics=True,
                 model_mode=evidence_model_mode,
                 score_mode=fisher_score_mode,
+                fisher_estimator=fisher_estimator,
                 debug_batches=fisher_debug_batches,
                 max_samples=fisher_max_samples,
                 max_batches=fisher_max_batches,
