@@ -84,6 +84,7 @@ python train.py
 4. 对每层每个 expert 参数块累计梯度平方，得到 Fisher raw score `s`。
 5. 计算 `z = log(1+s)`。
 6. 将 `expert_fisher_score_by_layer`、`expert_fisher_log_score_by_layer`、`evidence_expert_activations_by_layer` 随 `client_stats` 返回给 server。
+7. 额外返回标准化字段 `expert_block_fisher_precision_by_layer`，结构为 `layer -> expert -> block -> scalar`，用于 `robust_update_fusion` 的 `fisher_only` 和 `fisher_wolf` variant 读取 client-expert-block Fisher precision。当前默认 `evidence_filter_block_precision` 旧路径仍然使用旧字段，不读取该新字段，默认 FedWoLF 聚合行为不变。
 
 服务端：
 
@@ -102,6 +103,22 @@ FedWoLF 参数放在 `config.yaml` 的 `train` section：
 
 - `agg_method`
   - 可选：`fedavg`、`expert_fedavg`、`fedwolf_fisher_only`、`fedwolf`
+- `fedwolf_fusion_mode`
+  - 默认 `evidence_filter_block_precision`，保持已有 FedWoLF evidence/filter + block precision 路径，不改变旧实验行为
+  - `robust_update_fusion` 进入新版 expert update-fusion 管线
+- `fedwolf_update_fusion_variant`
+  - 默认 `uniform_update`，仅在 `fedwolf_fusion_mode: robust_update_fusion` 时使用
+  - 当前支持 `uniform_update`、`fisher_only`、`robust_only` 和 `fisher_wolf`
+  - `uniform_update` 对每个 expert 参数使用 update 形式：`theta_new = theta_old + mean_m(theta_m - theta_old)`
+  - `fisher_only` 使用 `client_stats["expert_block_fisher_precision_by_layer"]` 作为 `A_m`：`theta_new = theta_old + sum_m A_m * (theta_m - theta_old) / (sum_m A_m + eps)`
+  - `robust_only` 不使用 Fisher；它根据 expert update residual 计算 `rho2_m`，并用 `W_m = rho2_m` 融合 expert update
+  - `fisher_wolf` 使用 Fisher precision `A_m` 和 WoLF robust weight `rho2_m`：`e_m = sqrt(A_m + eps) * RMS(delta_m - center)`，`rho2_m = 1 / (1 + (e_m / median(e))^2)`，`W_m = A_m * rho2_m`，`theta_new = theta_old + sum_m W_m * delta_m / (sum_m W_m + eps)`
+  - `fisher_wolf` 使用 `client_stats["expert_block_fisher_precision_by_layer"]` 作为 `A_m`，但不使用旧 evidence filter 的 `z/s`、`mu/P`、`lambda_clients`、`support_gate` 或 `block_fisher_power`
+  - `fisher_wolf is the final Fisher-WoLF robust expert update fusion variant in the new robust_update_fusion path.`
+- `fedwolf_irls_steps`
+  - 默认 `2`，仅用于 `robust_update_fusion` 的鲁棒 update reweighting；默认旧 FedWoLF 路径不读取它
+- `fedwolf_update_fusion_eps`
+  - 默认 `1.0e-12`，仅用于 `robust_update_fusion` variants 的 residual scale、Fisher whitening 和除法稳定项
 - `aggregation_device`
   - 可选：`cpu`、`cuda`、`cuda:<index>`，默认 `cpu`
   - `cpu`：在 CPU 上聚合，显存占用更稳，和旧版本行为一致
@@ -304,10 +321,11 @@ CSV 和日志文件名都会包含：
 - `agg_method`
 - `run_name`
 
-FedWoLF 日志中可观察：
+FedWoLF 日志和 client_stats 中可观察：
 
 - `--expert_fisher_score_by_layer`
 - `--expert_fisher_log_score_by_layer`
+- `expert_block_fisher_precision_by_layer` 会随 `client_stats` 返回；当前 `fisher_only` 和 `fisher_wolf` 使用它作为 Fisher precision `A_m`，`uniform_update` 和 `robust_only` 不读取它。默认 `evidence_filter_block_precision` 旧路径仍不读取该字段
 - `--fedwolf_filter_summary`
   - `aggregation_weight_mode`
   - `num_experts`

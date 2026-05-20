@@ -794,6 +794,190 @@ def _sum_numeric_tree(value):
     return float(value)
 
 
+def _positive_int_or_none(value):
+    if value is None or isinstance(value, bool):
+        return None
+    if torch.is_tensor(value):
+        if value.numel() == 0:
+            return None
+        value = value.detach().cpu().item()
+    try:
+        int_value = int(value)
+    except (TypeError, ValueError):
+        return None
+    if int_value <= 0:
+        return None
+    return int_value
+
+
+def _nonnegative_float_or_zero(value):
+    if value is None:
+        return 0.0
+    if torch.is_tensor(value):
+        if value.numel() == 0:
+            return 0.0
+        value = value.detach().cpu().item()
+    try:
+        float_value = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(float_value) or float_value <= 0.0:
+        return 0.0
+    return float(float_value)
+
+
+def _get_expert_sequence_scalar(values, expert_id):
+    if values is None:
+        return None
+
+    if isinstance(values, dict):
+        value = None
+        for candidate in _key_candidates(expert_id):
+            if candidate in values:
+                value = values[candidate]
+                break
+        if value is None:
+            return None
+    elif torch.is_tensor(values):
+        flat_values = values.detach().cpu().flatten()
+        try:
+            expert_idx = int(expert_id)
+        except (TypeError, ValueError):
+            return None
+        if expert_idx < 0 or expert_idx >= flat_values.numel():
+            return None
+        value = flat_values[expert_idx].item()
+    else:
+        try:
+            expert_idx = int(expert_id)
+        except (TypeError, ValueError):
+            return None
+        try:
+            if expert_idx < 0 or expert_idx >= len(values):
+                return None
+            value = values[expert_idx]
+        except (TypeError, KeyError, IndexError):
+            return None
+
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value < 0.0:
+        return None
+    return float(value)
+
+
+def _get_activation_support(evidence_expert_activations_by_layer, layer_id, expert_id):
+    layer_values = _get_layer_mapping(
+        evidence_expert_activations_by_layer,
+        layer_id,
+        default=None,
+    )
+    return _get_expert_sequence_scalar(layer_values, expert_id)
+
+
+def build_expert_block_fisher_precision_by_layer(
+    *,
+    block_fisher_score_by_layer,
+    evidence_expert_activations_by_layer,
+    diagnostics=None,
+    num_train_samples=None,
+):
+    """Build the canonical client-expert-block Fisher precision field.
+
+    Existing block scores are normalized according to fedwolf_fisher_score_mode.
+    This helper keeps the old score field intact and emits a separate summed
+    precision field for future update-fusion code.
+    """
+
+    diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+    source_field = "expert_block_fisher_score_by_layer"
+    field_name = "expert_block_fisher_precision_by_layer"
+    score_mode = diagnostics.get("fisher_score_mode")
+    normalization = diagnostics.get("normalization")
+    estimator = diagnostics.get("fisher_estimator")
+    num_train_samples = _positive_int_or_none(num_train_samples)
+    num_evidence_samples = _positive_int_or_none(
+        diagnostics.get("effective_total_samples")
+    )
+    if num_evidence_samples is None:
+        num_evidence_samples = _positive_int_or_none(diagnostics.get("total_samples"))
+
+    full_data_scaled = num_train_samples is not None and num_evidence_samples is not None
+    full_data_scale = (
+        float(num_train_samples) / float(num_evidence_samples)
+        if full_data_scaled
+        else 1.0
+    )
+
+    active_mean_modes = {"mean_diag_active", "trace_per_active_sample"}
+    total_mean_modes = {"mean_diag", "trace_per_sample"}
+    mean_modes = active_mean_modes | total_mean_modes
+    uses_activation_support = score_mode in active_mean_modes
+
+    if score_mode == "trace_raw":
+        precision_mode = "summed" if full_data_scaled else "observed_summed"
+    elif score_mode in mean_modes:
+        precision_mode = "mean_converted_to_summed"
+    else:
+        precision_mode = None
+
+    meta = {
+        "field": field_name,
+        "source_field": source_field,
+        "estimator": str(estimator) if estimator is not None else None,
+        "precision_granularity": "block",
+        "precision_mode": precision_mode,
+        "full_data_scaled": bool(full_data_scaled),
+        "uses_activation_support": bool(uses_activation_support),
+        "num_train_samples": num_train_samples,
+        "num_evidence_samples": num_evidence_samples,
+        "source_score_mode": str(score_mode) if score_mode is not None else None,
+        "source_normalization": str(normalization) if normalization is not None else None,
+        "full_data_scale": float(full_data_scale),
+    }
+
+    if not isinstance(block_fisher_score_by_layer, dict):
+        return {}, meta
+
+    precision_by_layer = {}
+    for layer_id, experts in block_fisher_score_by_layer.items():
+        if not isinstance(experts, dict):
+            continue
+        layer_key = str(layer_id)
+        layer_precision = {}
+        for expert_id, blocks in experts.items():
+            if not isinstance(blocks, dict):
+                continue
+            expert_key = str(expert_id)
+            if score_mode in active_mean_modes:
+                count_scale = _get_activation_support(
+                    evidence_expert_activations_by_layer,
+                    layer_id,
+                    expert_id,
+                )
+                count_scale = 0.0 if count_scale is None else float(count_scale)
+            elif score_mode in total_mean_modes:
+                count_scale = float(num_evidence_samples or 0)
+            elif score_mode == "trace_raw":
+                count_scale = 1.0
+            else:
+                count_scale = 0.0
+
+            expert_precision = {}
+            for block_name, score in blocks.items():
+                value = _nonnegative_float_or_zero(score)
+                precision = value * count_scale * full_data_scale
+                if not math.isfinite(precision) or precision <= 0.0:
+                    precision = 0.0
+                expert_precision[str(block_name)] = float(precision)
+            layer_precision[expert_key] = expert_precision
+        precision_by_layer[layer_key] = layer_precision
+
+    return precision_by_layer, meta
+
+
 def _ensure_default_fast_diagnostics(diagnostics, canonical_estimator):
     defaults = {
         "fast_fisher_sample_grouped": False,

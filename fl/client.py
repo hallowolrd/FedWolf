@@ -6,7 +6,10 @@ from types import SimpleNamespace
 from torch import nn
 
 from data.loader import build_client_evidence_loader, build_client_train_loader
-from fl.expert_evidence import compute_expert_fisher_evidence
+from fl.expert_evidence import (
+    build_expert_block_fisher_precision_by_layer,
+    compute_expert_fisher_evidence,
+)
 from model import build_model_from_args
 from utils.utils import record_result
 
@@ -323,6 +326,12 @@ class Client:
             for key, value in self.model.state_dict().items()
         }
 
+    def get_num_train_samples(self):
+        try:
+            return int(len(self.train_loader.dataset))
+        except (AttributeError, TypeError, ValueError):
+            return None
+
     def get_dataloader(self):
         """构造当前客户端自己的训练 DataLoader。
 
@@ -558,6 +567,14 @@ class Client:
         fisher_log_score_by_layer = {}
         fisher_block_score_by_layer = {}
         fisher_diagnostics = None
+        fisher_block_precision_by_layer, fisher_block_precision_meta = (
+            build_expert_block_fisher_precision_by_layer(
+                block_fisher_score_by_layer={},
+                evidence_expert_activations_by_layer={},
+                diagnostics=None,
+                num_train_samples=self.get_num_train_samples(),
+            )
+        )
 
         if self.should_compute_fisher_evidence():
             evidence_loader_mode = getattr(self.args, "fedwolf_evidence_loader_mode", "deterministic")
@@ -617,6 +634,17 @@ class Client:
                 "expert_block_fisher_score_by_layer",
                 {},
             )
+            fisher_block_precision_by_layer, fisher_block_precision_meta = (
+                build_expert_block_fisher_precision_by_layer(
+                    block_fisher_score_by_layer=fisher_block_score_by_layer,
+                    evidence_expert_activations_by_layer=fisher_diagnostics.get(
+                        "evidence_expert_activations_by_layer",
+                        {},
+                    ),
+                    diagnostics=fisher_diagnostics,
+                    num_train_samples=self.get_num_train_samples(),
+                )
+            )
             fisher_debug = bool(getattr(self.args, "fedwolf_fisher_debug", False))
             fisher_diagnostics_summary = self.summarize_fisher_diagnostics(fisher_diagnostics)
             self.logger.info(
@@ -665,6 +693,8 @@ class Client:
             "expert_fisher_score_by_layer": fisher_score_by_layer,
             "expert_fisher_log_score_by_layer": fisher_log_score_by_layer,
             "expert_block_fisher_score_by_layer": fisher_block_score_by_layer,
+            "expert_block_fisher_precision_by_layer": fisher_block_precision_by_layer,
+            "expert_block_fisher_precision_meta": fisher_block_precision_meta,
             "evidence_expert_stats_by_layer": (
                 fisher_diagnostics.get("evidence_expert_stats_by_layer", {})
                 if fisher_diagnostics else {}

@@ -183,6 +183,20 @@ train:
   #   则 fallback 保留旧 global expert。
   agg_method: fedwolf
 
+  # FedWoLF fusion mode. Default keeps the existing legacy FedWoLF behavior.
+  fedwolf_fusion_mode: evidence_filter_block_precision
+
+  # Variant used only when fedwolf_fusion_mode == robust_update_fusion.
+  # Available: uniform_update, fisher_only, robust_only, fisher_wolf.
+  # Implemented now: uniform_update, fisher_only, robust_only, fisher_wolf.
+  fedwolf_update_fusion_variant: uniform_update
+
+  # Number of IRLS-style reweighting steps used only by robust_update_fusion variants.
+  fedwolf_irls_steps: 2
+
+  # Numerical stability epsilon used by robust_update_fusion variants.
+  fedwolf_update_fusion_eps: 1.0e-12
+
   # 聚合设备：
   # - cpu: 默认，和旧行为一致，在 CPU 上聚合，显存更稳
   # - cuda/cuda:0: 将每个参数 key 的浮点聚合临时放到 GPU，可能更快但会增加聚合阶段显存占用
