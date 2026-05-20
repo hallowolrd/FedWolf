@@ -187,7 +187,7 @@ train:
   # - cpu: 默认，和旧行为一致，在 CPU 上聚合，显存更稳
   # - cuda/cuda:0: 将每个参数 key 的浮点聚合临时放到 GPU，可能更快但会增加聚合阶段显存占用
   # - 聚合完成后仍返回 CPU state_dict，不会长期保留 GPU 版 client state_dict
-  aggregation_device: gpu
+  aggregation_device: cuda
 
   # FedWoLF expert Fisher evidence 使用的数据加载模式：
   # - deterministic: 使用确定性 transform，不做随机增强，不 shuffle
