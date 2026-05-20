@@ -187,7 +187,7 @@ train:
   # - cpu: 默认，和旧行为一致，在 CPU 上聚合，显存更稳
   # - cuda/cuda:0: 将每个参数 key 的浮点聚合临时放到 GPU，可能更快但会增加聚合阶段显存占用
   # - 聚合完成后仍返回 CPU state_dict，不会长期保留 GPU 版 client state_dict
-  aggregation_device: cpu
+  aggregation_device: gpu
 
   # FedWoLF expert Fisher evidence 使用的数据加载模式：
   # - deterministic: 使用确定性 transform，不做随机增强，不 shuffle
@@ -197,7 +197,7 @@ train:
   # 是否在 deterministic evidence 模式下，把 Fisher evidence batch 预加载到 GPU。
   # 只有 fedwolf_evidence_loader_mode=deterministic 且 device=cuda 时才会启用。
   # 该选项只缓存 inputs/labels，不缓存模型输出，不改变 Fisher 算法语义。
-  fedwolf_fisher_cache_evidence_gpu: false
+  fedwolf_fisher_cache_evidence_gpu: true
 
   # FedWoLF expert Fisher evidence 的模型模式：
   # - eval: 关闭 Dropout/BN 更新等训练态随机行为，但仍保留梯度计算
@@ -209,7 +209,7 @@ train:
   # - linear_hook_token_fast: 基于 expert Linear hook 的 token-level fast Fisher，计算 sum_token grad_token^2
   # - linear_hook_sample_fast: 基于 expert Linear hook，先按原始 sample 聚合 routed token 梯度再平方，计算 sum_sample (sum_token grad_token)^2
   # 默认仍使用 per_sample_backward，便于和旧实验保持兼容；加速实验建议显式改成 linear_hook_sample_fast
-  fedwolf_fisher_estimator: per_sample_backward
+  fedwolf_fisher_estimator: linear_hook_sample_fast
 
   # FedWoLF/Fisher evidence 标量压缩方式：
   # - mean_diag: 旧逻辑/PDF 对齐，grad_square_sum / (param_count * total_samples)
