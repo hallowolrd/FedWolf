@@ -200,10 +200,10 @@ train:
   fedwolf_evidence_model_mode: eval
 
   # FedWoLF/Fisher evidence 的计算器：
-  # - per_sample_backward: 当前默认实现；逐样本 backward 后累计 expert 参数 grad^2，语义最稳但速度慢
-  # - linear_hook_token_fast: 后续实现；基于 expert Linear hook 的 token-level fast Fisher
-  # - linear_hook_sample_fast: 后续实现；基于 expert Linear hook，先按 sample 聚合 routed token 梯度再平方
-  # 当前阶段只实现 per_sample_backward，fast 两个选项会在后续步骤实现
+  # - per_sample_backward: 旧实现；逐样本 backward 后累计 expert 参数 grad^2，语义最稳但速度慢
+  # - linear_hook_token_fast: 基于 expert Linear hook 的 token-level fast Fisher，计算 sum_token grad_token^2
+  # - linear_hook_sample_fast: 基于 expert Linear hook，先按原始 sample 聚合 routed token 梯度再平方，计算 sum_sample (sum_token grad_token)^2
+  # 默认仍使用 per_sample_backward，便于和旧实验保持兼容；加速实验建议显式改成 linear_hook_sample_fast
   fedwolf_fisher_estimator: per_sample_backward
 
   # FedWoLF/Fisher evidence 标量压缩方式：

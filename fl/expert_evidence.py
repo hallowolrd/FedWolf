@@ -133,8 +133,12 @@ def _collect_expert_linear_modules(model, num_experts, block_param_counts):
         expert_module = module_lookup.get(expert_module_name)
 
         layer_key = str(layer_id)
-        expert_key = str(expert_id)
-        expert_blocks = block_param_counts.get(layer_key, {}).get(expert_key, {})
+        expert_blocks = _get_expert_mapping(
+            block_param_counts,
+            layer_key,
+            expert_id,
+            default={},
+        ) or {}
         weight_block_name = f"{block_prefix}.weight"
         bias_block_name = f"{block_prefix}.bias"
         has_weight_block = weight_block_name in expert_blocks
@@ -534,23 +538,23 @@ def _key_candidates(value):
     return candidates
 
 
-def _get_layer_mapping(mapping, layer_id):
+def _get_layer_mapping(mapping, layer_id, default=None):
     if not isinstance(mapping, dict):
-        return {}
+        return default
     for layer_key in _key_candidates(layer_id):
-        value = mapping.get(layer_key)
-        if isinstance(value, dict):
-            return value
-    return {}
+        if layer_key in mapping:
+            return mapping[layer_key]
+    return default
 
 
-def _get_expert_mapping(mapping, layer_id, expert_id):
-    layer_mapping = _get_layer_mapping(mapping, layer_id)
+def _get_expert_mapping(mapping, layer_id, expert_id, default=None):
+    layer_mapping = _get_layer_mapping(mapping, layer_id, default=None)
+    if not isinstance(layer_mapping, dict):
+        return default
     for expert_key in _key_candidates(expert_id):
-        value = layer_mapping.get(expert_key)
-        if isinstance(value, dict):
-            return value
-    return {}
+        if expert_key in layer_mapping:
+            return layer_mapping[expert_key]
+    return default
 
 
 def _get_param_count(param_counts, layer_id, expert_id):
@@ -692,8 +696,18 @@ def _finalize_expert_fisher_outputs(
         for expert_id, blocks in experts.items():
             expert_key = str(expert_id)
             expert_block_scores = {}
-            expert_block_score_sums = _get_expert_mapping(block_score_sums, layer_key, expert_id)
-            expert_block_samples = _get_expert_mapping(block_samples_with_grad, layer_key, expert_id)
+            expert_block_score_sums = _get_expert_mapping(
+                block_score_sums,
+                layer_key,
+                expert_id,
+                default={},
+            ) or {}
+            expert_block_samples = _get_expert_mapping(
+                block_samples_with_grad,
+                layer_key,
+                expert_id,
+                default={},
+            ) or {}
             for block_name, block_param_count in blocks.items():
                 matched_block_count += 1
                 grad_square_sum_value = _tensor_scalar_to_float(expert_block_score_sums.get(block_name))
@@ -722,9 +736,7 @@ def _finalize_expert_fisher_outputs(
     for layer_id, scores in score_sums.items():
         layer_key = str(layer_id)
         scores_cpu = scores.detach().cpu() if torch.is_tensor(scores) else torch.as_tensor(scores, dtype=torch.float64)
-        raw_samples_with_grad = samples_with_grad.get(layer_id)
-        if raw_samples_with_grad is None:
-            raw_samples_with_grad = samples_with_grad.get(layer_key)
+        raw_samples_with_grad = _get_layer_mapping(samples_with_grad, layer_id, default=None)
         if raw_samples_with_grad is None:
             samples_with_grad_cpu = torch.zeros(num_experts, dtype=torch.long)
         elif torch.is_tensor(raw_samples_with_grad):
@@ -975,7 +987,7 @@ def compute_expert_fisher_evidence(
         layer_id: {
             expert_id: {
                 block_name: torch.zeros((), dtype=torch.float64, device=device)
-                for block_name in block_param_counts.get(str(layer_id), {}).get(str(expert_id), {})
+                for block_name in (_get_expert_mapping(block_param_counts, layer_id, expert_id, default={}) or {})
             }
             for expert_id in experts
         }
@@ -985,7 +997,7 @@ def compute_expert_fisher_evidence(
         layer_id: {
             expert_id: {
                 block_name: 0
-                for block_name in block_param_counts.get(str(layer_id), {}).get(str(expert_id), {})
+                for block_name in (_get_expert_mapping(block_param_counts, layer_id, expert_id, default={}) or {})
             }
             for expert_id in experts
         }
@@ -1087,8 +1099,18 @@ def compute_expert_fisher_evidence(
 
                 layer_id = info["layer_id"]
                 expert_id = info["expert_id"]
-                expert_block_score_sums = block_score_sums.get(layer_id, {}).get(expert_id, {})
-                expert_block_samples = block_samples_with_grad.get(layer_id, {}).get(expert_id, {})
+                expert_block_score_sums = _get_expert_mapping(
+                    block_score_sums,
+                    layer_id,
+                    expert_id,
+                    default={},
+                ) or {}
+                expert_block_samples = _get_expert_mapping(
+                    block_samples_with_grad,
+                    layer_id,
+                    expert_id,
+                    default={},
+                ) or {}
 
                 if canonical_estimator == "linear_hook_sample_fast":
                     expert_module = info.get("expert_module")
@@ -1253,10 +1275,22 @@ def compute_expert_fisher_evidence(
                             if has_grad_param_count > 0:
                                 samples_with_grad[layer_id][expert_id] += 1
                                 score_sums[layer_id][expert_id] += grad_square_sum
+                                expert_block_score_sums = _get_expert_mapping(
+                                    block_score_sums,
+                                    layer_id,
+                                    expert_id,
+                                    default={},
+                                ) or {}
+                                expert_block_samples = _get_expert_mapping(
+                                    block_samples_with_grad,
+                                    layer_id,
+                                    expert_id,
+                                    default={},
+                                ) or {}
                                 for block_name, block_grad_square_sum in block_grad_square_sums.items():
-                                    if block_name in block_score_sums.get(layer_id, {}).get(expert_id, {}):
-                                        block_samples_with_grad[layer_id][expert_id][block_name] += 1
-                                        block_score_sums[layer_id][expert_id][block_name] += block_grad_square_sum
+                                    if block_name in expert_block_score_sums:
+                                        expert_block_samples[block_name] += 1
+                                        expert_block_score_sums[block_name] += block_grad_square_sum
 
             if num_batches <= debug_batches:
                 batch_grad_status = {
@@ -1307,8 +1341,8 @@ def compute_expert_fisher_evidence(
     if canonical_estimator == "linear_hook_sample_fast":
         for layer_id in score_sums:
             layer_key = str(layer_id)
-            token_counts = fast_active_token_counts.get(layer_id)
-            sample_counts = fast_active_sample_counts.get(layer_id)
+            token_counts = _get_layer_mapping(fast_active_token_counts, layer_id, default=None)
+            sample_counts = _get_layer_mapping(fast_active_sample_counts, layer_id, default=None)
             if token_counts is not None:
                 diagnostics["fast_fisher_active_token_count_by_layer"][layer_key] = [
                     int(value) for value in token_counts.detach().cpu().tolist()
