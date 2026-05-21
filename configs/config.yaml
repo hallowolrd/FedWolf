@@ -183,22 +183,24 @@ train:
   agg_method: fedwolf
 
   # FedWoLF 融合模式：默认走旧版 evidence/filter 路径。
-  fedwolf_fusion_mode: evidence_filter_block_precision
+  fedwolf_fusion_mode: robust_update_fusion
 
   # 仅当 fedwolf_fusion_mode == robust_update_fusion 时使用的 update fusion 变体。
   # 可选值：uniform_update, fisher_only, robust_only, fisher_wolf。
   fedwolf_update_fusion_variant: uniform_update
 
-  # robust_update_fusion 路径中的 IRLS 风格重加权迭代次数。
+  # robust_only / fisher_wolf 使用的 IRLS 风格重加权迭代次数。
   fedwolf_irls_steps: 2
 
   # robust_update_fusion 变体使用的数值稳定项 epsilon。
   fedwolf_update_fusion_eps: 1.0e-12
 
   # 聚合设备：
-  # - cpu: 在 CPU 上聚合，显存更稳
-  # - cuda/cuda:0: 将每个参数 key 的浮点聚合临时放到 GPU，可能更快但会增加聚合阶段显存占用
-  # - 聚合完成后仍返回 CPU state_dict，不会长期保留 GPU 版 client state_dict
+  # - cpu: 在 CPU 上聚合，显存更稳，但聚合可能较慢。
+  # - cuda: 在 GPU 上聚合；多 GPU 时优先跟随训练 device，避免跑到错误默认卡。
+  # - cuda:0 / cuda:1: 显式指定聚合使用的 GPU。
+  # 仅聚合阶段临时迁移浮点 tensor；聚合结果会转回 CPU state_dict。
+  # 非浮点 buffer 不做加权平均，沿用第一个客户端的值。
   aggregation_device: cuda
 
   # FedWoLF expert Fisher evidence 使用的数据加载模式：
@@ -250,47 +252,45 @@ train:
   # - true: 调试模式，打印完整 diagnostics，包括 batch_grad_status 等字段
   fedwolf_fisher_debug: false
 
+
+
+
+
+
+
+
+
+
+
+
   # 以下参数主要用于旧 evidence_filter_block_precision 路径。
-  
-  # FedWoLF 数值稳定项；用于 Fisher 权重归一化、观测噪声分母等，防止除零
+  # robust_update_fusion 不使用旧 mu/P filter、low_only residual、
+  # lambda_clients、support gate、block_fisher_power、update consistency 这套逻辑。
+  # 旧 FedWoLF 数值稳定项；用于 Fisher 权重归一化、观测噪声分母等，防止除零
   fedwolf_eps: 1e-8
-  # FedWoLF expert 可信度状态的过程噪声 q；越大表示跨轮状态允许更快漂移
+  # 旧 FedWoLF expert 可信度状态的过程噪声 q；越大表示跨轮状态允许更快漂移
   fedwolf_process_noise_q: 0.01
-  # FedWoLF 观测噪声基础强度 sigma_e^2。
-  # fedwolf 主方法中，R = sigma_e2 / (sqrt(relative evidence active tokens) + eps)。
-  # fedwolf_fisher_only 不使用 WoLF filter，保留 raw Fisher expert 聚合作为旧 baseline。
+  # 旧 FedWoLF observation noise 基础尺度；
+  # R = sigma_e2 / (sqrt(relative evidence active tokens) + eps)
   fedwolf_sigma_e2: 1e-4
-  # WoLF-IMQ 鲁棒权重尺度 c；越小越容易对残差大的 evidence 降权
+  # 旧 FedWoLF WoLF-IMQ 鲁棒权重尺度 c；越小越容易对 residual 大的 evidence 降权
   fedwolf_imq_c: 0.1
-  # FedWoLF IMQ rho 使用的 residual 模式。
-  # - two_sided: 原始 WoLF-IMQ，对 signed standardized residual 的正负偏离都降权：
-  #              rho = (1 + nu^2 / c^2)^(-1/2)
-  # - low_only: 只惩罚低于历史预测的 Fisher evidence：
-  #             nu_low = max(0, -nu)
-  #             rho = (1 + nu_low^2 / c^2)^(-1/2)
-  #             其中 nu = (z - mu_pred) / sqrt(P_pred + R + eps)。
-  #             这样高 Fisher evidence 不会被 rho 当成 outlier 惩罚。
+  # 旧 FedWoLF IMQ rho 使用的 residual 模式：
+  # - two_sided: 对 signed standardized residual 的正负偏离都降权
+  # - low_only: 只惩罚低于历史预测的 Fisher evidence，高 evidence 不降权
   fedwolf_rho_residual_mode: low_only
-  # FedWoLF precision 粒度。
-  # - scalar: 当前 FedWoLF 行为，每个 client-expert 使用一个 scalar precision。
-  # - block: 预留给未来 Block-wise Fisher-WoLF，每个 client-expert-parameter-block 使用一个 precision。
+  # 旧 evidence_filter_block_precision 路径中的 precision 粒度。
+  # - scalar: 每个 client-expert 使用一个 scalar precision
+  # - block: 每个 client-expert-parameter-block 使用一个 precision
   fedwolf_precision_granularity: block
-  # 未来 block-wise Fisher precision 使用的幂指数。
-  # 仅在未来实现中 fedwolf_precision_granularity == block 时使用。
-  # alpha=0 关闭 block Fisher difference；alpha=1 使用原始 relative Fisher precision。
-  # 默认 0.25 较保守，因为 empirical Fisher 可能有噪声。
+  # 旧 evidence_filter_block_precision 路径中的 block Fisher precision 幂指数。
   fedwolf_block_fisher_power: 0.25
-  # 未来 Block-wise Fisher-WoLF 的 support gate 模式。
-  # - cap_one: 使用 min(1, sqrt(n_rel))，support 不足会降低 evidence 权重，
-  #            但高 support 不会获得无限奖励。
+  # 旧 evidence_filter_block_precision 路径中的 support gate 模式。
   fedwolf_support_gate_mode: cap_one
-  # FedWoLF 是否启用 leave-one-out update consistency。
-  # - true: 使用当前完整逻辑，根据客户端 expert update 方向和 leave-one-out 中心方向的一致性进行降权。
-  # - false: 关闭 update consistency 消融，所有 client-expert 的 consistency 固定为 1.0，
-  #          此时 lambda_raw = fisher_salience * lambda_filter。
+  # 旧 FedWoLF 是否启用 leave-one-out update consistency。
   fedwolf_use_update_consistency: false
-  # FedWoLF precision fusion: update consistency 的最低保留权重，避免 non-IID 少数派客户端被完全压成 0
+  # 旧 FedWoLF update consistency 的最低保留权重
   fedwolf_consistency_min: 0.1
-  # FedWoLF precision fusion: normalized client-expert precision 的裁剪范围
+  # 旧 FedWoLF normalized client-expert precision 的裁剪范围
   fedwolf_lambda_min: 0.05
   fedwolf_lambda_max: 5.0
