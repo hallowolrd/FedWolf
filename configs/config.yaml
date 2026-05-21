@@ -172,33 +172,31 @@ train:
   dataloader_seed_mode: round_client
 
   # 聚合方法：
-  # - fedavg: 全模型按客户端样本数做 FedAvg
-  # - expert_fedavg: shared/router 按样本数 FedAvg，expert 按 expert usage/token usage 加权
-  # - fedwolf_fisher_only: shared/router FedAvg，expert 按 raw Fisher score s 聚合，不使用 WoLF filter，作为旧 Fisher-only baseline
-  # - fedwolf: 完整 FedWoLF；shared/router 按样本数 FedAvg，expert 使用 client-expert precision fusion：
-  #   Fisher salience × support-calibrated filter reliability × leave-one-out update consistency，
-  #   再 normalize + clip 后用于 expert 聚合。
-  #   expert fusion 固定不显式加入 old global expert prior；上一轮 global expert
-  #   会通过客户端本地训练初始化被隐式保留，若某个 expert 没有有效客户端更新，
-  #   则 fallback 保留旧 global expert。
+  # - fedavg: 全模型按样本数 FedAvg。
+  # - expert_fedavg: shared/router 按样本数 FedAvg，expert 按 usage 加权。
+  # - fedwolf_fisher_only: 旧 Fisher-only baseline，只用 raw Fisher score s，不用 WoLF filter。
+  # - fedwolf: FedWoLF 入口，具体 expert 聚合由 fedwolf_fusion_mode 决定：
+  #   * evidence_filter_block_precision: 旧路径，使用 s/z、mu/P filter、lambda_clients 等聚合 expert。
+  #   * robust_update_fusion: 新路径，聚合 client update delta_m = theta_m - theta_old，
+  #     支持 uniform_update / fisher_only / robust_only / fisher_wolf。
+  #   若某个 expert 参数没有有效客户端更新，则保留旧 global expert。
   agg_method: fedwolf
 
-  # FedWoLF fusion mode. Default keeps the existing legacy FedWoLF behavior.
+  # FedWoLF 融合模式：默认走旧版 evidence/filter 路径。
   fedwolf_fusion_mode: evidence_filter_block_precision
 
-  # Variant used only when fedwolf_fusion_mode == robust_update_fusion.
-  # Available: uniform_update, fisher_only, robust_only, fisher_wolf.
-  # Implemented now: uniform_update, fisher_only, robust_only, fisher_wolf.
+  # 仅当 fedwolf_fusion_mode == robust_update_fusion 时使用的 update fusion 变体。
+  # 可选值：uniform_update, fisher_only, robust_only, fisher_wolf。
   fedwolf_update_fusion_variant: uniform_update
 
-  # Number of IRLS-style reweighting steps used only by robust_update_fusion variants.
+  # robust_update_fusion 路径中的 IRLS 风格重加权迭代次数。
   fedwolf_irls_steps: 2
 
-  # Numerical stability epsilon used by robust_update_fusion variants.
+  # robust_update_fusion 变体使用的数值稳定项 epsilon。
   fedwolf_update_fusion_eps: 1.0e-12
 
   # 聚合设备：
-  # - cpu: 默认，和旧行为一致，在 CPU 上聚合，显存更稳
+  # - cpu: 在 CPU 上聚合，显存更稳
   # - cuda/cuda:0: 将每个参数 key 的浮点聚合临时放到 GPU，可能更快但会增加聚合阶段显存占用
   # - 聚合完成后仍返回 CPU state_dict，不会长期保留 GPU 版 client state_dict
   aggregation_device: cuda
@@ -219,10 +217,9 @@ train:
   fedwolf_evidence_model_mode: eval
 
   # FedWoLF/Fisher evidence 的计算器：
-  # - per_sample_backward: 旧实现；逐样本 backward 后累计 expert 参数 grad^2，语义最稳但速度慢
-  # - linear_hook_token_fast: 基于 expert Linear hook 的 token-level fast Fisher，计算 sum_token grad_token^2
-  # - linear_hook_sample_fast: 基于 expert Linear hook，先按原始 sample 聚合 routed token 梯度再平方，计算 sum_sample (sum_token grad_token)^2
-  # 默认仍使用 per_sample_backward，便于和旧实验保持兼容；加速实验建议显式改成 linear_hook_sample_fast
+  # - per_sample_backward: 旧实现；逐样本 backward 后累计 expert 参数 grad^2，语义稳但速度慢
+  # - linear_hook_token_fast: token-level fast Fisher
+  # - linear_hook_sample_fast: sample-grouped fast Fisher
   fedwolf_fisher_estimator: linear_hook_sample_fast
 
   # FedWoLF/Fisher evidence 标量压缩方式：
@@ -253,20 +250,18 @@ train:
   # - true: 调试模式，打印完整 diagnostics，包括 batch_grad_status 等字段
   fedwolf_fisher_debug: false
 
+  # 以下参数主要用于旧 evidence_filter_block_precision 路径。
+  
   # FedWoLF 数值稳定项；用于 Fisher 权重归一化、观测噪声分母等，防止除零
   fedwolf_eps: 1e-8
-
   # FedWoLF expert 可信度状态的过程噪声 q；越大表示跨轮状态允许更快漂移
   fedwolf_process_noise_q: 0.01
-
   # FedWoLF 观测噪声基础强度 sigma_e^2。
   # fedwolf 主方法中，R = sigma_e2 / (sqrt(relative evidence active tokens) + eps)。
   # fedwolf_fisher_only 不使用 WoLF filter，保留 raw Fisher expert 聚合作为旧 baseline。
   fedwolf_sigma_e2: 1e-4
-
   # WoLF-IMQ 鲁棒权重尺度 c；越小越容易对残差大的 evidence 降权
   fedwolf_imq_c: 0.1
-
   # FedWoLF IMQ rho 使用的 residual 模式。
   # - two_sided: 原始 WoLF-IMQ，对 signed standardized residual 的正负偏离都降权：
   #              rho = (1 + nu^2 / c^2)^(-1/2)
@@ -276,32 +271,26 @@ train:
   #             其中 nu = (z - mu_pred) / sqrt(P_pred + R + eps)。
   #             这样高 Fisher evidence 不会被 rho 当成 outlier 惩罚。
   fedwolf_rho_residual_mode: low_only
-
   # FedWoLF precision 粒度。
   # - scalar: 当前 FedWoLF 行为，每个 client-expert 使用一个 scalar precision。
   # - block: 预留给未来 Block-wise Fisher-WoLF，每个 client-expert-parameter-block 使用一个 precision。
   fedwolf_precision_granularity: block
-
   # 未来 block-wise Fisher precision 使用的幂指数。
   # 仅在未来实现中 fedwolf_precision_granularity == block 时使用。
   # alpha=0 关闭 block Fisher difference；alpha=1 使用原始 relative Fisher precision。
   # 默认 0.25 较保守，因为 empirical Fisher 可能有噪声。
   fedwolf_block_fisher_power: 0.25
-
   # 未来 Block-wise Fisher-WoLF 的 support gate 模式。
   # - cap_one: 使用 min(1, sqrt(n_rel))，support 不足会降低 evidence 权重，
   #            但高 support 不会获得无限奖励。
   fedwolf_support_gate_mode: cap_one
-
   # FedWoLF 是否启用 leave-one-out update consistency。
   # - true: 使用当前完整逻辑，根据客户端 expert update 方向和 leave-one-out 中心方向的一致性进行降权。
   # - false: 关闭 update consistency 消融，所有 client-expert 的 consistency 固定为 1.0，
   #          此时 lambda_raw = fisher_salience * lambda_filter。
   fedwolf_use_update_consistency: false
-
   # FedWoLF precision fusion: update consistency 的最低保留权重，避免 non-IID 少数派客户端被完全压成 0
   fedwolf_consistency_min: 0.1
-
   # FedWoLF precision fusion: normalized client-expert precision 的裁剪范围
   fedwolf_lambda_min: 0.05
   fedwolf_lambda_max: 5.0
