@@ -13,11 +13,78 @@ from fl.expert_evidence import (
 from model import build_model_from_args
 from utils.utils import record_result
 
-FISHER_EVIDENCE_AGG_METHODS = {"fedwolf", "fedwolf_fisher_only"}
+FEDWOLF_LEGACY_FUSION_MODE = "evidence_filter_block_precision"
+FEDWOLF_ROBUST_UPDATE_FUSION_MODE = "robust_update_fusion"
+
+FEDWOLF_UPDATE_FUSION_VARIANT_UNIFORM_UPDATE = "uniform_update"
+FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_ONLY = "fisher_only"
+FEDWOLF_UPDATE_FUSION_VARIANT_ROBUST_ONLY = "robust_only"
+FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_WOLF = "fisher_wolf"
+
+ROBUST_UPDATE_FISHER_VARIANTS = {
+    FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_ONLY,
+    FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_WOLF,
+}
+ROBUST_UPDATE_NON_FISHER_VARIANTS = {
+    FEDWOLF_UPDATE_FUSION_VARIANT_UNIFORM_UPDATE,
+    FEDWOLF_UPDATE_FUSION_VARIANT_ROBUST_ONLY,
+}
+ROBUST_UPDATE_FUSION_VARIANTS = [
+    FEDWOLF_UPDATE_FUSION_VARIANT_UNIFORM_UPDATE,
+    FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_ONLY,
+    FEDWOLF_UPDATE_FUSION_VARIANT_ROBUST_ONLY,
+    FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_WOLF,
+]
+FEDWOLF_FUSION_MODES = [
+    FEDWOLF_LEGACY_FUSION_MODE,
+    FEDWOLF_ROBUST_UPDATE_FUSION_MODE,
+]
 
 
 _TRUE_BOOL_STRINGS = {"true", "1", "yes", "y", "on"}
 _FALSE_BOOL_STRINGS = {"false", "0", "no", "n", "off", "none", "null", ""}
+
+
+def should_compute_fisher_evidence_for_args(args):
+    agg_method = str(getattr(args, "agg_method", "")).strip().lower()
+
+    if agg_method == "fedwolf_fisher_only":
+        return True
+
+    if agg_method != "fedwolf":
+        return False
+
+    fusion_mode = str(
+        getattr(args, "fedwolf_fusion_mode", FEDWOLF_LEGACY_FUSION_MODE)
+    ).strip().lower()
+
+    if fusion_mode == FEDWOLF_LEGACY_FUSION_MODE:
+        return True
+
+    if fusion_mode == FEDWOLF_ROBUST_UPDATE_FUSION_MODE:
+        variant = str(
+            getattr(
+                args,
+                "fedwolf_update_fusion_variant",
+                FEDWOLF_UPDATE_FUSION_VARIANT_UNIFORM_UPDATE,
+            )
+        ).strip().lower()
+
+        if variant in ROBUST_UPDATE_FISHER_VARIANTS:
+            return True
+
+        if variant in ROBUST_UPDATE_NON_FISHER_VARIANTS:
+            return False
+
+        raise ValueError(
+            f"Unknown fedwolf_update_fusion_variant={variant!r}. "
+            f"Expected one of {ROBUST_UPDATE_FUSION_VARIANTS}."
+        )
+
+    raise ValueError(
+        f"Unknown fedwolf_fusion_mode={fusion_mode!r}. "
+        f"Expected one of {FEDWOLF_FUSION_MODES}."
+    )
 
 
 def _parse_bool_flag(value, default=False):
@@ -221,7 +288,7 @@ class Client:
         )
 
     def should_compute_fisher_evidence(self):
-        return getattr(self.args, "agg_method", None) in FISHER_EVIDENCE_AGG_METHODS
+        return should_compute_fisher_evidence_for_args(self.args)
 
     def get_fisher_data_loader(self):
         if not self.should_compute_fisher_evidence():
@@ -667,9 +734,20 @@ class Client:
                     f"--expert_fisher_diagnostics_full_skipped : fedwolf_fisher_debug=False"
                 )
         else:
+            agg_method = getattr(self.args, "agg_method", None)
+            fusion_mode = getattr(self.args, "fedwolf_fusion_mode", None)
+            variant = getattr(self.args, "fedwolf_update_fusion_variant", None)
+            if str(agg_method).strip().lower() == "fedwolf":
+                reason = "variant_does_not_require_fisher"
+            else:
+                reason = "agg_method_does_not_require_fisher"
             self.logger.info(
                 f"--client: {self.client_id} "
-                f"--skip_expert_fisher_evidence : agg_method={getattr(self.args, 'agg_method', None)}"
+                f"--skip_expert_fisher_evidence : "
+                f"agg_method={agg_method} "
+                f"fedwolf_fusion_mode={fusion_mode} "
+                f"fedwolf_update_fusion_variant={variant} "
+                f"reason={reason}"
             )
 
         local_state_dict = self.get_cpu_state_dict()
