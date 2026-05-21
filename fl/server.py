@@ -471,7 +471,13 @@ class Server:
         self.logger.info(f"--client_train_sizes : {client_sizes}\n")
         filter_summary = getattr(self.aggregator, "last_filter_summary", None)
         if filter_summary:
-            if isinstance(filter_summary, dict) and "aggregation_weight_mode" in filter_summary:
+            if isinstance(filter_summary, dict) and "fedwolf_update_fusion_variant" in filter_summary:
+                summary_text = " ".join(
+                    f"{key}={_format_fedwolf_summary_value(filter_summary.get(key), integer=key.endswith('_count') or key.endswith('_params') or key.endswith('_contribs') or key.endswith('_steps'))}"
+                    for key in sorted(filter_summary.keys())
+                )
+                self.logger.info(f"--fedwolf_robust_update_summary : {summary_text}\n")
+            elif isinstance(filter_summary, dict) and "aggregation_weight_mode" in filter_summary:
                 summary_keys = [
                     "aggregation_weight_mode",
                     "num_experts",

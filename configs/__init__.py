@@ -286,7 +286,7 @@ def add_config_path_arguments(parser: argparse.ArgumentParser) -> argparse.Argum
     return parser
 
 
-def load_args(config_path: str):
+def load_args(config_path: str = DEFAULT_CONFIG_PATH):
     """加载一个嵌套 config.yaml，并返回扁平 args 风格 namespace。"""
 
     try:

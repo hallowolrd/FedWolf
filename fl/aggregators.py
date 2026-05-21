@@ -1876,6 +1876,12 @@ def aggregate_experts_robust_update_fusion(
     irls_steps = int(getattr(args, "fedwolf_irls_steps", 2))
     if irls_steps < 0:
         raise ValueError("fedwolf_irls_steps must be non-negative")
+    irls_steps = max(1, irls_steps)
+    old_expert_state = {
+        key: global_state_dict[key].detach().clone()
+        for key in client_updates[0].keys()
+        if parse_expert_ref_from_key(key) is not None and key in global_state_dict
+    }
     aggregated_state = collections.OrderedDict()
     updated_expert_params = 0
     skipped_expert_params = 0
@@ -1935,7 +1941,7 @@ def aggregate_experts_robust_update_fusion(
                     f"parameter for key {key!r}."
                 )
 
-            theta_old = global_state_dict[key].detach().to(aggregation_device)
+            theta_old = old_expert_state[key].detach().to(aggregation_device)
             acc_delta = torch.zeros_like(theta_old)
             valid_client_count = 0
             weight_sum = None
