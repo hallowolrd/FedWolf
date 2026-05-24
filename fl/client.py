@@ -13,7 +13,6 @@ from fl.expert_evidence import (
 from model import build_model_from_args
 from utils.utils import record_result
 
-FEDWOLF_LEGACY_FUSION_MODE = "evidence_filter_block_precision"
 FEDWOLF_ROBUST_UPDATE_FUSION_MODE = "robust_update_fusion"
 
 FEDWOLF_UPDATE_FUSION_VARIANT_UNIFORM_UPDATE = "uniform_update"
@@ -35,12 +34,6 @@ ROBUST_UPDATE_FUSION_VARIANTS = [
     FEDWOLF_UPDATE_FUSION_VARIANT_ROBUST_ONLY,
     FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_WOLF,
 ]
-FEDWOLF_FUSION_MODES = [
-    FEDWOLF_LEGACY_FUSION_MODE,
-    FEDWOLF_ROBUST_UPDATE_FUSION_MODE,
-]
-
-
 _TRUE_BOOL_STRINGS = {"true", "1", "yes", "y", "on"}
 _FALSE_BOOL_STRINGS = {"false", "0", "no", "n", "off", "none", "null", ""}
 
@@ -49,41 +42,45 @@ def should_compute_fisher_evidence_for_args(args):
     agg_method = str(getattr(args, "agg_method", "")).strip().lower()
 
     if agg_method == "fedwolf_fisher_only":
-        return True
+        raise ValueError(
+            "agg_method='fedwolf_fisher_only' has been removed with the legacy "
+            "FedWoLF filter path. Use agg_method='fedwolf', "
+            "fedwolf_fusion_mode='robust_update_fusion', and "
+            "fedwolf_update_fusion_variant='fisher_only' instead."
+        )
 
     if agg_method != "fedwolf":
         return False
 
     fusion_mode = str(
-        getattr(args, "fedwolf_fusion_mode", FEDWOLF_LEGACY_FUSION_MODE)
+        getattr(args, "fedwolf_fusion_mode", FEDWOLF_ROBUST_UPDATE_FUSION_MODE)
     ).strip().lower()
 
-    if fusion_mode == FEDWOLF_LEGACY_FUSION_MODE:
-        return True
-
-    if fusion_mode == FEDWOLF_ROBUST_UPDATE_FUSION_MODE:
-        variant = str(
-            getattr(
-                args,
-                "fedwolf_update_fusion_variant",
-                FEDWOLF_UPDATE_FUSION_VARIANT_UNIFORM_UPDATE,
-            )
-        ).strip().lower()
-
-        if variant in ROBUST_UPDATE_FISHER_VARIANTS:
-            return True
-
-        if variant in ROBUST_UPDATE_NON_FISHER_VARIANTS:
-            return False
-
+    if fusion_mode != FEDWOLF_ROBUST_UPDATE_FUSION_MODE:
         raise ValueError(
-            f"Unknown fedwolf_update_fusion_variant={variant!r}. "
-            f"Expected one of {ROBUST_UPDATE_FUSION_VARIANTS}."
+            f"fedwolf_fusion_mode={fusion_mode!r} is no longer enabled for "
+            "agg_method='fedwolf'. Current supported mode is "
+            "'robust_update_fusion'. Use fedwolf_update_fusion_variant in "
+            "{uniform_update, fisher_only, robust_only, fisher_wolf}."
         )
 
+    variant = str(
+        getattr(
+            args,
+            "fedwolf_update_fusion_variant",
+            FEDWOLF_UPDATE_FUSION_VARIANT_UNIFORM_UPDATE,
+        )
+    ).strip().lower()
+
+    if variant in ROBUST_UPDATE_FISHER_VARIANTS:
+        return True
+
+    if variant in ROBUST_UPDATE_NON_FISHER_VARIANTS:
+        return False
+
     raise ValueError(
-        f"Unknown fedwolf_fusion_mode={fusion_mode!r}. "
-        f"Expected one of {FEDWOLF_FUSION_MODES}."
+        f"Unknown fedwolf_update_fusion_variant={variant!r}. "
+        f"Expected one of {ROBUST_UPDATE_FUSION_VARIANTS}."
     )
 
 

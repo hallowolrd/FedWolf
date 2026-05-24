@@ -61,18 +61,13 @@ python train.py
 - `expert_fedavg`
   - shared/backbone/router/classifier 按客户端样本数 FedAvg。
   - expert 参数按 expert usage / token usage 加权。
-- `fedwolf_fisher_only`
-  - shared/backbone/router/classifier 按客户端样本数 FedAvg。
-  - expert 参数按客户端上传的 Fisher raw score `s` 加权。
-  - 不使用 `mu/P`、不使用 IMQ 权重。
-  - 这是 FedWoLF 的 Fisher-only 消融。
 - `fedwolf`
-  - 完整 FedWoLF。
-  - 客户端训练后额外计算 expert Fisher evidence：`s`、`z = log(1+s)` 和 activation support `n`。
-  - 服务端为每个 expert 维护 `mu/P`，使用 activation-support-derived observation noise、IMQ 鲁棒权重、Fisher salience、leave-one-out consistency 和 client-expert precision fusion。
-  - 不再使用旧插值步骤。
+  - 当前 FedWoLF 正式路径。
+  - `fedwolf_fusion_mode` 当前只支持 `robust_update_fusion`。
+  - shared/backbone/router/classifier 继续普通 FedAvg。
+  - expert 参数聚合 client update `delta_m = theta_m - theta_old`，由 `fedwolf_update_fusion_variant` 选择具体融合方式。
 
-当前没有实现 `fedwolf_kf`。如果需要 Fisher + 普通 scalar filter 的消融入口，建议后续单独补充。
+当前没有实现 `fedwolf_kf`。Fisher-only 消融请使用 `agg_method: fedwolf`、`fedwolf_fusion_mode: robust_update_fusion`、`fedwolf_update_fusion_variant: fisher_only`。
 
 ## FedWoLF 流程
 
@@ -80,83 +75,67 @@ python train.py
 
 1. 从 `server.pth` 同步当前全局模型。
 2. 在本地 `client_train` 上训练。
-3. 训练后额外做一次 evidence pass；默认使用 deterministic evidence loader，并以 eval-mode forward 关闭训练态随机行为。
-4. 对每层每个 expert 参数块累计梯度平方，得到 Fisher raw score `s`。
-5. 计算 `z = log(1+s)`。
-6. 将 `expert_fisher_score_by_layer`、`expert_fisher_log_score_by_layer`、`evidence_expert_activations_by_layer` 随 `client_stats` 返回给 server。
-7. 额外返回标准化字段 `expert_block_fisher_precision_by_layer`，结构为 `layer -> expert -> block -> scalar`，用于 `robust_update_fusion` 的 `fisher_only` 和 `fisher_wolf` variant 读取 client-expert-block Fisher precision。当前默认 `evidence_filter_block_precision` 旧路径仍然使用旧字段，不读取该新字段，默认 FedWoLF 聚合行为不变。
+3. 当 variant 为 `fisher_only` 或 `fisher_wolf` 时，训练后额外做一次 evidence pass；默认使用 deterministic evidence loader，并以 eval-mode forward 关闭训练态随机行为。
+4. Fisher evidence 会对每层每个 expert 参数块累计梯度平方，并返回标准化字段 `expert_block_fisher_precision_by_layer`，结构为 `layer -> expert -> block -> scalar`。
+5. 当 variant 为 `uniform_update` 或 `robust_only` 时，不计算 Fisher evidence，日志会记录 `--skip_expert_fisher_evidence`。
 
 服务端：
 
 1. shared/backbone/router/classifier 继续普通 FedAvg。
-2. 对每个 expert：
-   - 先做 filter predict，得到 `mu_pred`, `P_pred`
-   - 用 activation support 计算 `R`
-   - 用 `z = log1p(s)` 和 `R` 做 standardized residual / IMQ / filter precision update
-   - 用 Fisher salience、leave-one-out consistency 得到 `lambda_clients`
-   - 用 `lambda_clients` 做 no-prior client-expert precision fusion
-3. 如果某个 expert 本轮没有有效 evidence，则保留旧 global expert。
+2. 对 expert 参数读取各客户端 `delta_m = theta_m - theta_old`。
+3. `uniform_update` 直接平均有效 `delta_m`。
+4. `fisher_only` 使用 Fisher precision `A_m` 加权 `delta_m`。
+5. `robust_only` 基于 update residual 做 IRLS 鲁棒聚合，不读取 Fisher。
+6. `fisher_wolf` 基于 Fisher-whitened residual 做 IRLS，最终权重近似 `A_m * rho2_m`。
+7. 如果某个 expert 参数本轮没有有效客户端贡献，则保留旧 global expert。
 
 ## FedWoLF 配置
 
 FedWoLF 参数放在 `config.yaml` 的 `train` section：
 
 - `agg_method`
-  - 可选：`fedavg`、`expert_fedavg`、`fedwolf_fisher_only`、`fedwolf`
+  - 当前正式 FedWoLF 配置使用 `fedwolf`。
 - `fedwolf_fusion_mode`
-  - 默认 `evidence_filter_block_precision`，保持已有 FedWoLF evidence/filter + block precision 路径，不改变旧实验行为
-  - `robust_update_fusion` 进入新版 expert update-fusion 管线
+  - 当前唯一支持 `robust_update_fusion`。
 - `fedwolf_update_fusion_variant`
-  - 默认 `uniform_update`，仅在 `fedwolf_fusion_mode: robust_update_fusion` 时使用
-  - 当前支持 `uniform_update`、`fisher_only`、`robust_only` 和 `fisher_wolf`
-  - `uniform_update` 对每个 expert 参数使用 update 形式：`theta_new = theta_old + mean_m(theta_m - theta_old)`
-  - `fisher_only` 使用 `client_stats["expert_block_fisher_precision_by_layer"]` 作为 `A_m`：`theta_new = theta_old + sum_m A_m * (theta_m - theta_old) / (sum_m A_m + eps)`
-  - `robust_only` 不使用 Fisher；它根据 expert update residual 计算 `rho2_m`，并用 `W_m = rho2_m` 融合 expert update
-  - `fisher_wolf` 使用 Fisher precision `A_m` 和 WoLF robust weight `rho2_m`：`e_m = sqrt(A_m + eps) * RMS(delta_m - center)`，`rho2_m = 1 / (1 + (e_m / median(e))^2)`，`W_m = A_m * rho2_m`，`theta_new = theta_old + sum_m W_m * delta_m / (sum_m W_m + eps)`
-  - `fisher_wolf` 使用 `client_stats["expert_block_fisher_precision_by_layer"]` 作为 `A_m`，但不使用旧 evidence filter 的 `z/s`、`mu/P`、`lambda_clients`、`support_gate` 或 `block_fisher_power`
-  - `fisher_wolf is the final Fisher-WoLF robust expert update fusion variant in the new robust_update_fusion path.`
+  - 默认 `uniform_update`。
+  - 当前支持 `uniform_update`、`fisher_only`、`robust_only` 和 `fisher_wolf`。
+  - `uniform_update`: `theta_new = theta_old + mean_m(theta_m - theta_old)`，不计算 Fisher。
+  - `fisher_only`: 使用 `client_stats["expert_block_fisher_precision_by_layer"]` 作为 `A_m`，按 `A_m` 加权 expert update，需要 Fisher。
+  - `robust_only`: 不使用 Fisher；根据 expert update residual 计算 `rho2_m`，做 IRLS 鲁棒聚合。
+  - `fisher_wolf`: 使用 Fisher precision `A_m` 和 robust weight `rho2_m`，基于 Fisher-whitened residual 做 IRLS，需要 Fisher。
 - `fedwolf_irls_steps`
-  - 默认 `2`，仅用于 `robust_update_fusion` 的鲁棒 update reweighting；默认旧 FedWoLF 路径不读取它
+  - 默认 `2`，用于 `robust_only` 和 `fisher_wolf` 的鲁棒 update reweighting。
 - `fedwolf_update_fusion_eps`
-  - 默认 `1.0e-12`，仅用于 `robust_update_fusion` variants 的 residual scale、Fisher whitening 和除法稳定项
-- `aggregation_device`
-  - 可选：`cpu`、`cuda`、`cuda:<index>`，默认 `cpu`
-  - `cpu`：在 CPU 上聚合，显存占用更稳，和旧版本行为一致
-  - `cuda`：将每个参数 key 的浮点聚合临时放到 GPU 上完成，可能减少 CPU 聚合开销
-  - 聚合结果仍然转回 CPU state_dict，不会长期保存 GPU 版 client state_dict
-- `fedwolf_evidence_loader_mode`
-  - 默认 `deterministic`
-- `fedwolf_evidence_model_mode`
-  - 默认 `eval`
-- `fedwolf_fisher_score_mode`
-  - 默认 `trace_per_active_sample`
-- `fedwolf_fisher_max_samples`
-  - 默认 `512`
-- `fedwolf_fisher_max_batches`
-  - 默认 `null`
-- `fedwolf_fisher_debug_batches`
-  - 默认 `0`
-- `fedwolf_fisher_debug`
-  - 默认 `false`
+  - 默认 `1.0e-12`，用于 residual scale、Fisher whitening 和除法稳定项。
 - `fedwolf_eps`
-  - 数值稳定项，用于权重归一化和观测噪声分母，默认 `1e-8`
-- `fedwolf_process_noise_q`
-  - expert 可信度状态的过程噪声，默认 `0.01`
-- `fedwolf_sigma_e2`
-  - 观测噪声基础强度；FedWoLF 主方法中由 activation support 计算 observation noise
-- `fedwolf_imq_c`
-  - WoLF-IMQ 鲁棒权重尺度，越小越容易对残差大的 evidence 降权，默认 `1.0`
-- `fedwolf_consistency_min`
-  - leave-one-out update consistency 的下界，默认 `0.05`
-- `fedwolf_lambda_min` / `fedwolf_lambda_max`
-  - client-expert precision 的归一化后裁剪范围，默认分别为 `0.05` / `5.0`
+  - 兼容项。当前 `fisher_only` 分支仍读取它作为 Fisher 权重分母 fallback；保留该字段是为了不改变现有行为。
+- `aggregation_device`
+  - 可选：`cpu`、`cuda`、`cuda:<index>`。
+  - 聚合结果仍然转回 CPU state_dict，不会长期保存 GPU 版 client state_dict。
+- `fedwolf_evidence_loader_mode`
+  - 默认 `deterministic`。
+- `fedwolf_evidence_model_mode`
+  - 默认 `eval`。
+- `fedwolf_fisher_score_mode`
+  - 默认 `trace_per_active_sample`。
+- `fedwolf_fisher_max_samples`
+  - 默认 `1024`。
+- `fedwolf_fisher_max_batches`
+  - 默认 `null`。
+- `fedwolf_fisher_debug_batches`
+  - 默认 `0`。
+- `fedwolf_fisher_debug`
+  - 默认 `false`。
+
+更多当前配置说明见 `docs/current_fedwolf_config.md`。
 
 ## 实验切换方式
 
 - 切 CIFAR10 / CIFAR100：修改当前 `config.yaml` 的 `data.data_name`
 - 改 `alpha`：修改当前 `config.yaml` 的 `data.alpha`
 - 改客户端数量：修改当前 `config.yaml` 的 `data.num_clients`
-- 切聚合方法：修改当前 `config.yaml` 的 `train.agg_method`，可选 `fedavg`、`expert_fedavg`、`fedwolf_fisher_only`、`fedwolf`
+- 切聚合方法：修改当前 `config.yaml` 的 `train.agg_method`，可选 `fedavg`、`expert_fedavg`、`fedwolf`
 - 开新实验：复制一个 `config.yaml`，并修改 `train.run_name`
 - 故意覆盖旧实验：保留同一个 `run_name`，并设置 `train.allow_overwrite: true`
 - 切模型：修改当前 `config.yaml` 的 `model.model_type`
@@ -243,11 +222,6 @@ run_name: smoke_expert_fedavg
 ```
 
 ```yaml
-agg_method: fedwolf_fisher_only
-run_name: smoke_fedwolf_fisher_only
-```
-
-```yaml
 agg_method: fedwolf
 run_name: smoke_fedwolf
 ```
@@ -323,27 +297,16 @@ CSV 和日志文件名都会包含：
 
 FedWoLF 日志和 client_stats 中可观察：
 
-- `--expert_fisher_score_by_layer`
-- `--expert_fisher_log_score_by_layer`
-- `expert_block_fisher_precision_by_layer` 会随 `client_stats` 返回；当前 `fisher_only` 和 `fisher_wolf` 使用它作为 Fisher precision `A_m`，`uniform_update` 和 `robust_only` 不读取它。默认 `evidence_filter_block_precision` 旧路径仍不读取该字段
-- `--fedwolf_filter_summary`
-  - `aggregation_weight_mode`
-  - `num_experts`
-  - `num_valid_experts`
-  - `mean_lambda_filter`
-  - `mean_lambda_raw`
-  - `mean_lambda_final`
-  - `mean_R`
-  - `mean_rho`
-  - `mean_std_residual`
-  - `mean_abs_standardized_residual`
-  - `mean_fisher_salience`
-  - `mean_update_consistency`
-  - `mean_mu`
-  - `mean_P`
-  - `skipped_observations`
-
-  summary 字典会保留上面的核心字段，以及若干精简的 min/max 诊断项；默认日志行只展开这些核心字段。
+- `--expert_fisher_diagnostics_summary`
+  - 仅 `fisher_only` / `fisher_wolf` 会计算 Fisher 并打印。
+- `--skip_expert_fisher_evidence`
+  - `uniform_update` / `robust_only` 会跳过 Fisher 并打印原因。
+- `expert_block_fisher_precision_by_layer`
+  - 随 `client_stats` 返回；`fisher_only` 和 `fisher_wolf` 使用它作为 Fisher precision `A_m`。
+- `--fedwolf_robust_update_summary`
+  - 记录 robust_update_fusion 的 variant、有效客户端贡献、delta norm、Fisher precision 或 robust weight 诊断。
+- `--server_update_norm_summary`
+  - 记录本轮全模型、expert 和 non-expert update norm 诊断。
 
 ## references 边界
 
@@ -359,12 +322,9 @@ FedWoLF 日志和 client_stats 中可观察：
 - 默认 evidence pass 是 deterministic loader + eval-mode forward；这里的 eval-mode evidence 不是 inference / `no_grad`，而是在关闭训练态随机行为后仍然计算梯度的 Fisher evidence。
 - evidence pass 不使用 `torch.no_grad()`，不执行 `optimizer.step()`，不会更新模型参数；结束后会恢复进入 evidence 前的 `model.training` 状态。
 - 当前 expert evidence 使用 supervised cross-entropy loss 计算 per-sample empirical Fisher；`router_aux_loss` / `router_z_loss` 是 batch-level auxiliary losses，不纳入 expert Fisher。直接把 batch-level scalar 加到每个 sample loss 会重复计入 batch size 次并破坏 Fisher 尺度，而且当前 evidence 只针对 `blocks.*.ffn.experts.*` expert 参数。
-- Fisher score mode 只改变客户端上传的 scalar `s` 的尺度，不改变 server-side FedWoLF 的 `R`、IMQ、`mu/P` 或 expert precision fusion。
-- 如果日志里 `mean_lambda_filter` 很低、`mean_lambda_final` 很低、`mean_R` 达到 `1e7` 以上、`mean_rho` 长期很小、`mean_abs_standardized_residual` 很大、`mu` 长期接近 0，可以做 score mode 尺度消融。`trace_per_active_sample` 对 top-1 MoE 通常更适合作为优先消融，因为每个 expert 只在部分样本上被路由激活。
-- 某些 expert 的 Fisher score 可能为 0；此时该 expert 保留旧 global 参数。
-- `mu/P` 当前只存在内存中；断点续训如果只恢复 `server.pth`，filter state 会丢失。
-- FedWoLF 当前只输出 precision fusion 诊断字段；旧插值相关超参已经删除，当前只使用 client-expert precision fusion。
-- `fedwolf_fisher_only` 和 `fedwolf` 语义不同：前者是消融，后者是完整方法。
+- Fisher score mode 只改变客户端上传的 Fisher scalar 尺度；只有 `fisher_only` / `fisher_wolf` 会读取对应 precision 字段。
+- 某些 expert 的 Fisher precision 可能无效或非正；相关 client contribution 会被跳过。如果某个 expert 参数没有有效客户端贡献，则保留旧 global 参数。
+- FedWoLF 当前输出 robust update fusion 诊断字段；当前消融请通过 `fedwolf_update_fusion_variant` 切换。
 - `train.py` 的自动数据准备只会覆盖 `save/{run_name}/data` 下的 `partition_meta.pt` 和 `partition_stats.json`。
 - 如果 `train.allow_overwrite: false`，`train.py` 仍然会检查 `model/result` 输出目录是否非空，避免误覆盖训练结果。
 - 自动数据准备不会改变模型结构、训练参数或聚合逻辑。

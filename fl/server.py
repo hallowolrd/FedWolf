@@ -211,9 +211,6 @@ class Server:
         self.logger.info(f"--aggregation_device : {getattr(self.aggregator, 'aggregation_device', 'cpu')}\n")
         self.logger.info(f"--dataloader_seed_mode : {getattr(self.args, 'dataloader_seed_mode', 'legacy')}\n")
         self.logger.info(f"--dataloader_base_seed : {getattr(self.args, 'seed', None)}\n")
-        self.logger.info(f"--fedwolf_precision_granularity : {getattr(self.args, 'fedwolf_precision_granularity', 'scalar')}\n")
-        self.logger.info(f"--fedwolf_block_fisher_power : {getattr(self.args, 'fedwolf_block_fisher_power', 0.25)}\n")
-        self.logger.info(f"--fedwolf_support_gate_mode : {getattr(self.args, 'fedwolf_support_gate_mode', 'cap_one')}\n")
         os.makedirs(self.args.model_save_path, exist_ok=True)
         self.partition_meta = load_partition_meta(self.args)
         self.global_test_loader = build_global_eval_loader(
@@ -590,99 +587,15 @@ class Server:
         self.logger.info(f"--aggregation_method : {self.args.agg_method}\n")
         self.logger.info(f"--client_train_sizes : {client_sizes}\n")
         filter_summary = getattr(self.aggregator, "last_filter_summary", None)
-        if filter_summary:
-            if isinstance(filter_summary, dict) and "fedwolf_update_fusion_variant" in filter_summary:
-                summary_text = " ".join(
-                    f"{key}={_format_fedwolf_summary_value(filter_summary.get(key), integer=key.endswith('_count') or key.endswith('_params') or key.endswith('_contribs') or key.endswith('_steps'))}"
-                    for key in sorted(filter_summary.keys())
-                )
-                self.logger.info(f"--fedwolf_robust_update_summary : {summary_text}\n")
-            elif isinstance(filter_summary, dict) and "aggregation_weight_mode" in filter_summary:
-                summary_keys = [
-                    "aggregation_weight_mode",
-                    "num_experts",
-                    "num_valid_experts",
-                    "use_update_consistency",
-                    "precision_granularity_is_block",
-                    "block_precision_cache_enabled",
-                    "block_aggregation_enabled",
-                    "block_aggregation_fallback_fraction",
-                    "block_fisher_power",
-                    "support_gate_cap_one",
-                    "mean_support_gate",
-                    "min_support_gate",
-                    "max_support_gate",
-                    "mean_reliability_gate",
-                    "min_reliability_gate",
-                    "max_reliability_gate",
-                    "block_valid_fraction",
-                    "mean_block_fisher_positive",
-                    "min_block_fisher_positive",
-                    "max_block_fisher_positive",
-                    "mean_block_lambda_raw",
-                    "min_block_lambda_raw",
-                    "max_block_lambda_raw",
-                    "mean_block_lambda_final",
-                    "min_block_lambda_final",
-                    "max_block_lambda_final",
-                    "block_lambda_at_min_clip_fraction",
-                    "block_lambda_at_max_clip_fraction",
-                    "mean_lambda_filter",
-                    "min_lambda_filter",
-                    "max_lambda_filter",
-                    "mean_lambda_raw",
-                    "min_lambda_raw",
-                    "max_lambda_raw",
-                    "mean_lambda_final",
-                    "min_lambda_final",
-                    "max_lambda_final",
-                    "lambda_at_min_clip_fraction",
-                    "lambda_at_max_clip_fraction",
-                    "mean_R",
-                    "mean_n_rel",
-                    "min_n_rel",
-                    "max_n_rel",
-                    "mean_support_reliability",
-                    "min_support_reliability",
-                    "max_support_reliability",
-                    "mean_rho",
-                    "min_rho",
-                    "max_rho",
-                    "rho_low_only_mode",
-                    "mean_rho_residual",
-                    "max_rho_residual",
-                    "rho_low_fraction",
-                    "low_evidence_fraction",
-                    "high_evidence_fraction",
-                    "mean_std_residual",
-                    "mean_abs_standardized_residual",
-                    "min_abs_standardized_residual",
-                    "max_abs_standardized_residual",
-                    "mean_fisher_salience",
-                    "min_fisher_salience",
-                    "max_fisher_salience",
-                    "mean_update_consistency",
-                    "min_update_consistency",
-                    "max_update_consistency",
-                    "low_consistency_fraction",
-                    "mean_positive_s",
-                    "min_mean_positive_s",
-                    "max_mean_positive_s",
-                    "mean_positive_n",
-                    "min_mean_positive_n",
-                    "max_mean_positive_n",
-                    "mean_mu",
-                    "mean_P",
-                    "skipped_observations",
-                ]
-                summary_text = " ".join(
-                    f"{key}={_format_fedwolf_summary_value(filter_summary.get(key), integer=key in {'num_experts', 'num_valid_experts', 'skipped_observations'})}"
-                    for key in summary_keys
-                    if key in filter_summary
-                )
-                self.logger.info(f"--fedwolf_filter_summary : {summary_text}\n")
-            else:
-                self.logger.info(f"--fedwolf_filter_state_summary : {filter_summary}\n")
+        if (
+            isinstance(filter_summary, dict)
+            and "fedwolf_update_fusion_variant" in filter_summary
+        ):
+            summary_text = " ".join(
+                f"{key}={_format_fedwolf_summary_value(filter_summary.get(key), integer=key.endswith('_count') or key.endswith('_params') or key.endswith('_contribs') or key.endswith('_steps'))}"
+                for key in sorted(filter_summary.keys())
+            )
+            self.logger.info(f"--fedwolf_robust_update_summary : {summary_text}\n")
 
     def aggregation(
         self,
