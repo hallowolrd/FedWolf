@@ -213,6 +213,7 @@ class Server:
         self.logger.info(f"--dataloader_base_seed : {getattr(self.args, 'seed', None)}\n")
         os.makedirs(self.args.model_save_path, exist_ok=True)
         self.partition_meta = load_partition_meta(self.args)
+        self.client_cache = {}
         self.global_test_loader = build_global_eval_loader(
             args=self.args,
             split="global_test",
@@ -226,6 +227,18 @@ class Server:
         init_server_result_csv(self.args)
         init_timing_csv(self.args)
 
+
+    def get_or_create_client(self, client_id):
+        if client_id not in self.client_cache:
+            self.client_cache[client_id] = Client(
+                args=self.args,
+                client_id=client_id,
+                logger=self.logger,
+                c_T=0,
+                partition_meta=self.partition_meta,
+                server_state_dict=None,
+            )
+        return self.client_cache[client_id]
 
     def init_global_model(self):
         """ 初始化服务端全局模型。 """
@@ -291,14 +304,11 @@ class Server:
                 client_loop_start = time.perf_counter()
                 for id in self.clientsID_list:
                     # 每个客户端执行本地训练，并返回本轮信息。
-                    client_stats = Client(
-                        args=self.args,
-                        client_id=id,
-                        logger=self.logger,
+                    client = self.get_or_create_client(id)
+                    client_stats = client.train(
                         c_T=c_T,
-                        partition_meta=self.partition_meta,
                         server_state_dict=server_state_dict,
-                    ).train()
+                    )
                     client_state_dict = client_stats.pop("local_state_dict")
                     round_client_states.append(client_state_dict)
                     round_client_sizes.append(self.get_client_train_size(id))

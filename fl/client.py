@@ -218,8 +218,8 @@ class Client:
         """返回当前 global communication round 的学习率。
 
         该调度基于 server round c_T，而不是 local epoch 或 batch。
-        Client 对象和 Adam optimizer 会在每个 server round 重新创建，
-        所以在这里使用 PyTorch local scheduler 会每轮重启。
+        持久化 Client 对象会在每个 server round 重新创建 optimizer，
+        所以在这里使用 PyTorch local scheduler 仍会每轮重启。
         """
 
         schedule = str(getattr(self.args, "lr_schedule", "constant")).strip().lower()
@@ -453,6 +453,21 @@ class Client:
         )
         self.model.load_state_dict(server_state_dict)
 
+    def prepare_for_round(self, c_T: int, server_state_dict=None, rebuild_dataloader: bool = True):
+        """
+        Prepare this persistent Client object for one FL round.
+        This resets per-round training state while keeping the Client object itself.
+        """
+
+        self.c_T = c_T
+        self.server_state_dict = server_state_dict
+        self.model.to(self.device)
+        self.renew_model(server_state_dict)
+        self.current_lr = self.get_current_learning_rate()
+        self.optimizer = self.build_optimizer()
+        if rebuild_dataloader:
+            self.get_dataloader()
+
     def get_auxiliary_losses(self, result):
         """ 从模型 forward 的结果字典中，取出额外损失项。 """
 
@@ -530,7 +545,7 @@ class Client:
                     total_stats[layer_key][stat_key] += value.to(self.device)
             total_stats[layer_key]["capacity"] = stats.get("capacity", total_stats[layer_key]["capacity"])
 
-    def train(self):
+    def train(self, c_T=None, server_state_dict=None):
         """ 执行客户端本地训练。
         流程：
         1. 先同步服务端最新模型
@@ -539,7 +554,22 @@ class Client:
         4. 训练结束后保存客户端模型
         5. 返回专家统计信息给服务端 """
 
-        self.renew_model()
+        if c_T is not None or server_state_dict is not None:
+            if c_T is None:
+                c_T = self.c_T
+            if server_state_dict is None:
+                server_state_dict = self.server_state_dict
+            self.prepare_for_round(
+                c_T=c_T,
+                server_state_dict=server_state_dict,
+                rebuild_dataloader=True,
+            )
+        else:
+            self.prepare_for_round(
+                c_T=self.c_T,
+                server_state_dict=self.server_state_dict,
+                rebuild_dataloader=True,
+            )
 
         last_avg_router_probs = torch.zeros(self.args.num_experts, device=self.device)
         local_usage_total = torch.zeros(self.args.num_experts, device=self.device)
@@ -758,7 +788,7 @@ class Client:
             }
             for layer_id, stats in local_layer_usage_total.items()
         }
-        return {
+        client_stats = {
             "expert_activations": local_usage_total.detach().cpu(),
             "expert_stats_by_layer": layer_stats_cpu,
             "expert_activations_by_layer": {
@@ -788,3 +818,8 @@ class Client:
             ),
             "local_state_dict": local_state_dict,
         }
+        self.optimizer = None
+        if str(self.device).startswith("cuda"):
+            self.model.to("cpu")
+            torch.cuda.empty_cache()
+        return client_stats
