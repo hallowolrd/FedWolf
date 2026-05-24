@@ -101,9 +101,13 @@ FedWoLF 参数放在 `config.yaml` 的 `train` section：
   - 默认 `uniform_update`。
   - 当前支持 `uniform_update`、`fisher_only`、`robust_only` 和 `fisher_wolf`。
   - `uniform_update`: `theta_new = theta_old + mean_m(theta_m - theta_old)`，不计算 Fisher。
-  - `fisher_only`: 使用 `client_stats["expert_block_fisher_precision_by_layer"]` 作为 `A_m`，按 `A_m` 加权 expert update，需要 Fisher。
+  - `fisher_only`: 使用 Fisher precision `A_m` 加权 expert update，需要 Fisher。
   - `robust_only`: 不使用 Fisher；根据 expert update residual 计算 `rho2_m`，做 IRLS 鲁棒聚合。
-  - `fisher_wolf`: 使用 Fisher precision `A_m` 和 robust weight `rho2_m`，基于 Fisher-whitened residual 做 IRLS，需要 Fisher。
+  - `fisher_wolf`: 使用 Fisher precision `A_m` 和 robust weight `rho2_m`，权重近似 `A_m * rho2_m`，基于 Fisher-whitened residual 做 IRLS，需要 Fisher。
+- `fedwolf_fisher_precision_granularity`
+  - 仅影响 `fisher_only` / `fisher_wolf`。
+  - 默认 `block`，使用 `client_stats["expert_block_fisher_precision_by_layer"]`，保持当前每个 expert 参数块一个 precision 的行为。
+  - `expert` 使用 `client_stats["expert_fisher_precision_by_layer"]`，每个 layer-expert 一个 precision，由该 expert 内所有 block precision 求和得到，并被该 expert 内所有参数块共享。
 - `fedwolf_irls_steps`
   - 默认 `2`，用于 `robust_only` 和 `fisher_wolf` 的鲁棒 update reweighting。
 - `fedwolf_update_fusion_eps`

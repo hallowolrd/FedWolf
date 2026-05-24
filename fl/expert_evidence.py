@@ -978,6 +978,41 @@ def build_expert_block_fisher_precision_by_layer(
     return precision_by_layer, meta
 
 
+def build_expert_fisher_precision_by_layer(
+    *,
+    block_precision_by_layer,
+    block_precision_meta=None,
+):
+    """Sum positive finite block precision into layer-expert precision."""
+
+    meta = {
+        "field": "expert_fisher_precision_by_layer",
+        "source_field": "expert_block_fisher_precision_by_layer",
+        "precision_granularity": "expert",
+        "aggregation": "sum_positive_finite_blocks",
+        "source_precision_meta": block_precision_meta or {},
+    }
+
+    if not isinstance(block_precision_by_layer, dict):
+        return {}, meta
+
+    expert_precision_by_layer = {}
+    for layer_id, experts in block_precision_by_layer.items():
+        if not isinstance(experts, dict):
+            continue
+        layer_key = str(layer_id)
+        layer_precision = {}
+        for expert_id, blocks in experts.items():
+            total_precision = 0.0
+            if isinstance(blocks, dict):
+                for block_precision in blocks.values():
+                    total_precision += _nonnegative_float_or_zero(block_precision)
+            layer_precision[str(expert_id)] = float(total_precision)
+        expert_precision_by_layer[layer_key] = layer_precision
+
+    return expert_precision_by_layer, meta
+
+
 def _ensure_default_fast_diagnostics(diagnostics, canonical_estimator):
     defaults = {
         "fast_fisher_sample_grouped": False,

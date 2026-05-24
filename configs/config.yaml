@@ -188,6 +188,11 @@ train:
   # - fisher_wolf: 计算 Fisher，基于 Fisher-whitened residual 做 IRLS，权重近似 A_m * rho2_m。
   fedwolf_update_fusion_variant: uniform_update
 
+  # Fisher precision 粒度，仅影响 fisher_only / fisher_wolf：
+  # - block: 每个 expert 参数块一个 Fisher precision A_{m,l,e,b}，保持当前默认行为。
+  # - expert: 每个 expert 一个 Fisher precision A_{m,l,e}，由该 expert 内所有 block precision 求和得到，expert 内所有参数块共享。
+  fedwolf_fisher_precision_granularity: block
+
   # robust_only / fisher_wolf 使用的 IRLS 风格重加权迭代次数。
   fedwolf_irls_steps: 2
 

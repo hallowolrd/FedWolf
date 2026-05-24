@@ -8,6 +8,7 @@ from torch import nn
 from data.loader import build_client_evidence_loader, build_client_train_loader
 from fl.expert_evidence import (
     build_expert_block_fisher_precision_by_layer,
+    build_expert_fisher_precision_by_layer,
     compute_expert_fisher_evidence,
 )
 from model import build_model_from_args
@@ -669,6 +670,12 @@ class Client:
                 num_train_samples=self.get_num_train_samples(),
             )
         )
+        fisher_expert_precision_by_layer, fisher_expert_precision_meta = (
+            build_expert_fisher_precision_by_layer(
+                block_precision_by_layer=fisher_block_precision_by_layer,
+                block_precision_meta=fisher_block_precision_meta,
+            )
+        )
 
         if self.should_compute_fisher_evidence():
             evidence_loader_mode = getattr(self.args, "fedwolf_evidence_loader_mode", "deterministic")
@@ -739,6 +746,12 @@ class Client:
                     num_train_samples=self.get_num_train_samples(),
                 )
             )
+            fisher_expert_precision_by_layer, fisher_expert_precision_meta = (
+                build_expert_fisher_precision_by_layer(
+                    block_precision_by_layer=fisher_block_precision_by_layer,
+                    block_precision_meta=fisher_block_precision_meta,
+                )
+            )
             fisher_debug = bool(getattr(self.args, "fedwolf_fisher_debug", False))
             fisher_diagnostics_summary = self.summarize_fisher_diagnostics(fisher_diagnostics)
             self.logger.info(
@@ -800,6 +813,8 @@ class Client:
             "expert_block_fisher_score_by_layer": fisher_block_score_by_layer,
             "expert_block_fisher_precision_by_layer": fisher_block_precision_by_layer,
             "expert_block_fisher_precision_meta": fisher_block_precision_meta,
+            "expert_fisher_precision_by_layer": fisher_expert_precision_by_layer,
+            "expert_fisher_precision_meta": fisher_expert_precision_meta,
             "evidence_expert_stats_by_layer": (
                 fisher_diagnostics.get("evidence_expert_stats_by_layer", {})
                 if fisher_diagnostics else {}
