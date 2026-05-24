@@ -293,6 +293,7 @@ class Server:
                 f"--resume_already_complete : completed_round={self.start_round} "
                 f"target_rounds={self.server_epochs}"
             )
+            self.evaluate_final_on_global_test()
             return
 
         steps_per_round = num_clients + 2
@@ -399,14 +400,6 @@ class Server:
                     "stage": "round_eval",
                 })
                 torch.cuda.empty_cache()
-                checkpoint_every = int(getattr(self.args, "checkpoint_every", 1))
-                if round_id % checkpoint_every == 0:
-                    save_training_checkpoint(
-                        self.args,
-                        self.model,
-                        completed_round=round_id,
-                        logger=self.logger,
-                    )
 
                 round_total_sec = time.perf_counter() - round_start_time
                 round_total_sec_acc += round_total_sec
@@ -444,6 +437,14 @@ class Server:
                     f"round_total_sec={round_total_sec:.2f} "
                     f"eta_sec={eta_sec:.2f}\n"
                 )
+                checkpoint_every = int(getattr(self.args, "checkpoint_every", 1))
+                if round_id % checkpoint_every == 0:
+                    save_training_checkpoint(
+                        self.args,
+                        self.model,
+                        completed_round=round_id,
+                        logger=self.logger,
+                    )
 
             save_training_checkpoint(
                 self.args,
