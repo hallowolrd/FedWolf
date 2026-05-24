@@ -1031,7 +1031,7 @@ class FedWoLFRobustUpdateFusionAggregator(FedAvgAggregator):
     def __init__(self, args=None):
         super().__init__(args)
         self.args = args
-        self.last_filter_summary = {}
+        self.last_robust_update_summary = {}
 
     def aggregate(self, client_updates, client_weights, global_model=None, **kwargs):
         client_stats = kwargs.get("client_stats")
@@ -1045,7 +1045,7 @@ class FedWoLFRobustUpdateFusionAggregator(FedAvgAggregator):
             client_stats=client_stats,
             aggregation_device=self.aggregation_device,
         )
-        self.last_filter_summary = diagnostics
+        self.last_robust_update_summary = diagnostics
         return aggregated_state
 
 
