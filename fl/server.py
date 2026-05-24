@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import math
 from types import SimpleNamespace
 
 import torch
@@ -64,7 +65,7 @@ except ModuleNotFoundError:
             sys.stderr.flush()
 
 from data.loader import build_global_eval_loader, get_client_train_size, load_partition_meta
-from fl.aggregators import build_aggregator
+from fl.aggregators import build_aggregator, parse_expert_ref_from_key
 from fl.client import Client
 from model import build_model_from_args
 from utils.utils import (
@@ -88,6 +89,100 @@ def _format_fedwolf_summary_value(value, integer=False):
     if integer:
         return str(int(round(numeric_value)))
     return f"{numeric_value:.12e}"
+
+
+SERVER_UPDATE_NORM_SUMMARY_KEYS = [
+    "expert_update_norm",
+    "nonexpert_update_norm",
+    "total_update_norm",
+    "expert_update_norm_ratio",
+    "expert_update_energy_ratio",
+    "expert_tensor_count",
+    "nonexpert_tensor_count",
+    "expert_numel",
+    "nonexpert_numel",
+    "skipped_nonfloat_count",
+    "skipped_missing_count",
+    "skipped_shape_mismatch_count",
+]
+
+SERVER_UPDATE_NORM_INTEGER_FIELDS = {
+    "expert_tensor_count",
+    "nonexpert_tensor_count",
+    "expert_numel",
+    "nonexpert_numel",
+    "skipped_nonfloat_count",
+    "skipped_missing_count",
+    "skipped_shape_mismatch_count",
+}
+
+
+def compute_update_norm_summary(old_state, new_state, eps=1e-12):
+    expert_update_norm_sq = 0.0
+    nonexpert_update_norm_sq = 0.0
+    expert_tensor_count = 0
+    nonexpert_tensor_count = 0
+    expert_numel = 0
+    nonexpert_numel = 0
+    skipped_nonfloat_count = 0
+    skipped_missing_count = 0
+    skipped_shape_mismatch_count = 0
+
+    keys = list(old_state.keys())
+    for key in new_state.keys():
+        if key not in old_state:
+            keys.append(key)
+
+    for key in keys:
+        if key not in old_state or key not in new_state:
+            skipped_missing_count += 1
+            continue
+
+        old_tensor = old_state[key]
+        new_tensor = new_state[key]
+        if not isinstance(old_tensor, torch.Tensor) or not isinstance(new_tensor, torch.Tensor):
+            continue
+        if not torch.is_floating_point(old_tensor) or not torch.is_floating_point(new_tensor):
+            skipped_nonfloat_count += 1
+            continue
+        if old_tensor.shape != new_tensor.shape:
+            skipped_shape_mismatch_count += 1
+            continue
+
+        old_f = old_tensor.detach().to(device="cpu", dtype=torch.float32)
+        new_f = new_tensor.detach().to(device="cpu", dtype=torch.float32)
+        diff = new_f - old_f
+        update_norm_sq = float(diff.pow(2).sum().item())
+        numel = int(new_tensor.numel())
+
+        if parse_expert_ref_from_key(key) is not None:
+            expert_update_norm_sq += update_norm_sq
+            expert_tensor_count += 1
+            expert_numel += numel
+        else:
+            nonexpert_update_norm_sq += update_norm_sq
+            nonexpert_tensor_count += 1
+            nonexpert_numel += numel
+
+    total_update_norm_sq = expert_update_norm_sq + nonexpert_update_norm_sq
+    expert_update_norm = math.sqrt(expert_update_norm_sq)
+    nonexpert_update_norm = math.sqrt(nonexpert_update_norm_sq)
+    total_update_norm = math.sqrt(total_update_norm_sq)
+
+    return {
+        "expert_update_norm": expert_update_norm,
+        "nonexpert_update_norm": nonexpert_update_norm,
+        "total_update_norm": total_update_norm,
+        "expert_update_norm_ratio": expert_update_norm / (total_update_norm + eps),
+        "expert_update_energy_ratio": expert_update_norm_sq / (total_update_norm_sq + eps),
+        "expert_tensor_count": expert_tensor_count,
+        "nonexpert_tensor_count": nonexpert_tensor_count,
+        "expert_numel": expert_numel,
+        "nonexpert_numel": nonexpert_numel,
+        "skipped_nonfloat_count": skipped_nonfloat_count,
+        "skipped_missing_count": skipped_missing_count,
+        "skipped_shape_mismatch_count": skipped_shape_mismatch_count,
+    }
 
 
 class Server:
@@ -253,6 +348,8 @@ class Server:
                 self.aggregation(
                     client_states=round_client_states,
                     client_sizes=round_client_sizes,
+                    old_server_state=server_state_dict,
+                    round_id=round_id,
                 )
                 aggregation_sec = time.perf_counter() - aggregation_start
 
@@ -423,7 +520,13 @@ class Server:
         # FedAvg 使用客户端训练样本数作为聚合权重。
         return get_client_train_size(self.args, client_id, meta=self.partition_meta)
 
-    def aggregation_by_method(self, client_states=None, client_sizes=None):
+    def aggregation_by_method(
+        self,
+        client_states=None,
+        client_sizes=None,
+        old_server_state=None,
+        round_id=None,
+    ):
         """ 聚合器接口：按当前配置的聚合方法执行参数聚合
         - fedavg:对完整 state_dict 按客户端训练样本数加权平均；
         - expert_fedavg:普通层按客户端样本数聚合,专家层按每个 expert 实际处理样本数聚合；
@@ -466,6 +569,23 @@ class Server:
             aggregate_kwargs["expert_weights"] = getattr(self, "last_client_expert_usages", None)
 
         fedavg_state = self.aggregator.aggregate(**aggregate_kwargs)
+        enable_update_norm_diag = bool(getattr(self.args, "server_update_norm_diag", True))
+        update_norm_diag_interval = int(getattr(self.args, "server_update_norm_diag_interval", 1))
+        if update_norm_diag_interval <= 0:
+            update_norm_diag_interval = 1
+        should_log_update_norm = (
+            enable_update_norm_diag
+            and old_server_state is not None
+            and (round_id is None or round_id % update_norm_diag_interval == 0)
+        )
+        if should_log_update_norm:
+            update_norm_summary = compute_update_norm_summary(old_server_state, fedavg_state)
+            summary_text = " ".join(
+                f"{key}={_format_fedwolf_summary_value(update_norm_summary.get(key), integer=key in SERVER_UPDATE_NORM_INTEGER_FIELDS)}"
+                for key in SERVER_UPDATE_NORM_SUMMARY_KEYS
+            )
+            round_text = "None" if round_id is None else str(round_id)
+            self.logger.info(f"--server_update_norm_summary : round={round_text} {summary_text}\n")
         self.model.load_state_dict(fedavg_state)
         self.logger.info(f"--aggregation_method : {self.args.agg_method}\n")
         self.logger.info(f"--client_train_sizes : {client_sizes}\n")
@@ -564,7 +684,13 @@ class Server:
             else:
                 self.logger.info(f"--fedwolf_filter_state_summary : {filter_summary}\n")
 
-    def aggregation(self, client_states=None, client_sizes=None):
+    def aggregation(
+        self,
+        client_states=None,
+        client_sizes=None,
+        old_server_state=None,
+        round_id=None,
+    ):
         """ 聚合入口函数。
         现在只是简单调用 aggregation_by_method()，
         后续如果想扩展多种聚合流程，可以在这里继续封装。 """
@@ -572,4 +698,6 @@ class Server:
         self.aggregation_by_method(
             client_states=client_states,
             client_sizes=client_sizes,
+            old_server_state=old_server_state,
+            round_id=round_id,
         )
