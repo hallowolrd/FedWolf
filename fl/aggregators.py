@@ -525,12 +525,15 @@ def aggregate_experts_robust_update_fusion(
 ):
     """Run the new FedWoLF expert update-fusion path.
 
-    `uniform_update` is the step-5 smoke variant: expert parameters are updated
-    as theta_old + mean_m(theta_m - theta_old). `fisher_only` uses the
-    canonical client_stats field `expert_block_fisher_precision_by_layer` as
-    block-wise Fisher precision A. `robust_only` ignores Fisher and uses
-    residual-based rho2 weights over expert update tensors. `fisher_wolf` uses
-    Fisher-whitened update residuals and final weights W = A * rho2.
+    `uniform_update` updates expert parameters as
+    theta_old + mean_m(theta_m - theta_old). `fisher_only` uses Fisher
+    precision A at the configured granularity to weight expert updates.
+    `robust_only` ignores Fisher and uses residual-based rho2 weights over
+    expert update tensors. `fisher_wolf` uses Fisher precision A at the same
+    configured granularity with robust rho2, with final weights approximately
+    A * rho2. When fedwolf_fisher_precision_granularity='block', A is read
+    from `expert_block_fisher_precision_by_layer`; when it is 'expert', A is
+    read from `expert_fisher_precision_by_layer`.
     """
 
     variant = str(

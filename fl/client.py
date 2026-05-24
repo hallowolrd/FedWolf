@@ -689,6 +689,11 @@ class Client:
             fisher_debug_batches = getattr(self.args, "fedwolf_fisher_debug_batches", 0)
             fisher_max_samples = getattr(self.args, "fedwolf_fisher_max_samples", None)
             fisher_max_batches = getattr(self.args, "fedwolf_fisher_max_batches", None)
+            fisher_precision_granularity = getattr(
+                self.args,
+                "fedwolf_fisher_precision_granularity",
+                "block",
+            )
             fisher_data_loader = self.get_fisher_data_loader()
             self.logger.info(
                 f"--client: {self.client_id} "
@@ -697,6 +702,7 @@ class Client:
                 f"--fedwolf_fisher_score_mode : {fisher_score_mode} "
                 f"--fedwolf_fisher_estimator : {fisher_estimator} "
                 f"--fedwolf_fisher_cache_evidence_gpu : {fisher_cache_evidence_gpu} "
+                f"--fedwolf_fisher_precision_granularity : {fisher_precision_granularity} "
                 f"--fedwolf_fisher_max_samples : {fisher_max_samples} "
                 f"--fedwolf_fisher_max_batches : {fisher_max_batches}"
             )
