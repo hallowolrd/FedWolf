@@ -73,7 +73,7 @@ def save_training_checkpoint(args, model, completed_round, logger=None):
     _atomic_torch_save(checkpoint, latest_path)
 
     if logger is not None:
-        logger.info(f"--checkpoint_saved : round={completed_round} path={latest_path}\n")
+        logger.info(f"--checkpoint_saved : round={completed_round} path={latest_path}")
 
 
 def load_training_checkpoint(args, model, logger=None):
@@ -83,11 +83,17 @@ def load_training_checkpoint(args, model, logger=None):
             f"Resume checkpoint does not exist: {checkpoint_path}"
         )
 
-    checkpoint = torch.load(
-        checkpoint_path,
-        map_location="cpu",
-        weights_only=False,
-    )
+    try:
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+    except TypeError:
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+        )
     model.load_state_dict(checkpoint["server_state_dict"])
 
     if bool(getattr(args, "restore_rng_state", True)):
@@ -95,8 +101,8 @@ def load_training_checkpoint(args, model, logger=None):
 
     completed_round = int(checkpoint["completed_round"])
     if logger is not None:
-        logger.info(f"--resume_checkpoint_path : {checkpoint_path}\n")
-        logger.info(f"--resume_completed_round : {completed_round}\n")
-        logger.info(f"--resume_next_round : {completed_round + 1}\n")
+        logger.info(f"--resume_checkpoint_path : {checkpoint_path}")
+        logger.info(f"--resume_completed_round : {completed_round}")
+        logger.info(f"--resume_next_round : {completed_round + 1}")
 
     return completed_round

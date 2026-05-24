@@ -160,7 +160,17 @@ def main():
     validate_output_paths(args, stage="train")
     set_seed(args.seed)
 
-    if not cli_args.no_auto_prepare_data:
+    if bool(getattr(args, "resume", False)):
+        should_prepare, reason = need_prepare_data(
+            args=args,
+            force_repartition=False,
+        )
+        if should_prepare:
+            raise RuntimeError(
+                "resume mode requires existing valid partition files. "
+                f"Reason: {reason}"
+            )
+    elif not cli_args.no_auto_prepare_data:
         prepare_data_if_needed(
             args=args,
             logger=None,
@@ -168,10 +178,10 @@ def main():
         )
 
     logger = build_logger(args)
-    logger.info(f"--resume : {getattr(args, 'resume', False)}\n")
-    logger.info(f"--resume_checkpoint_path : {getattr(args, 'resume_checkpoint_path', 'latest')}\n")
-    logger.info(f"--checkpoint_every : {getattr(args, 'checkpoint_every', 1)}\n")
-    logger.info(f"--restore_rng_state : {getattr(args, 'restore_rng_state', True)}\n")
+    logger.info(f"--resume : {getattr(args, 'resume', False)}")
+    logger.info(f"--resume_checkpoint_path : {getattr(args, 'resume_checkpoint_path', 'latest')}")
+    logger.info(f"--checkpoint_every : {getattr(args, 'checkpoint_every', 1)}")
+    logger.info(f"--restore_rng_state : {getattr(args, 'restore_rng_state', True)}")
 
     # 项目主入口：创建服务端对象，然后启动联邦训练流程。
     Server(args=args, logger=logger).train()

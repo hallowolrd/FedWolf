@@ -291,7 +291,7 @@ class Server:
         if self.start_round >= self.server_epochs:
             self.logger.info(
                 f"--resume_already_complete : completed_round={self.start_round} "
-                f"target_rounds={self.server_epochs}\n"
+                f"target_rounds={self.server_epochs}"
             )
             return
 
