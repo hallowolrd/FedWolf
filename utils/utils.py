@@ -57,13 +57,23 @@ def get_timing_csv_path(args):
     filename = f"{get_experiment_stem(args)}.csv"
     return os.path.join(timing_dir, filename)
 
-def init_result_csv(args):
+def _should_append_existing_csv(csv_path, append_existing):
+    return (
+        append_existing
+        and os.path.exists(csv_path)
+        and os.path.getsize(csv_path) > 0
+    )
+
+
+def init_result_csv(args, append_existing=False):
     """初始化结果 CSV，写入表头。
 
     Server 初始化时会调用一次，所以每次重新运行训练会覆盖同名 CSV。
     """
 
     csv_path = get_csv_path(args)
+    if _should_append_existing_csv(csv_path, append_existing):
+        return
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
     with open(csv_path, 'w', newline='') as csvfile:
         fieldnames = [
@@ -80,13 +90,15 @@ def init_result_csv(args):
         writer.writeheader()
 
 
-def init_server_result_csv(args):
+def init_server_result_csv(args, append_existing=False):
     """初始化服务端结果 CSV。
 
     记录每轮 round_test global_test 监控结果，以及训练结束后的 final_test。
     """
 
     csv_path = get_server_csv_path(args)
+    if _should_append_existing_csv(csv_path, append_existing):
+        return
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
     with open(csv_path, 'w', newline='') as csvfile:
         fieldnames = [
@@ -98,13 +110,15 @@ def init_server_result_csv(args):
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
 
-def init_timing_csv(args):
+def init_timing_csv(args, append_existing=False):
     """初始化每轮耗时 CSV，写入表头。
 
     记录每轮 client loop、aggregation、server save、round eval 和总耗时。
     """
 
     csv_path = get_timing_csv_path(args)
+    if _should_append_existing_csv(csv_path, append_existing):
+        return
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
     with open(csv_path, 'w', newline='') as csvfile:
         fieldnames = [

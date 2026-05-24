@@ -254,6 +254,8 @@ def validate_output_paths(args: SimpleNamespace, stage: str) -> None:
 
     if args.allow_overwrite:
         return
+    if bool(getattr(args, "resume", False)):
+        return
 
     if stage == "data":
         targets = [Path(args.data_save_path)]
@@ -328,6 +330,22 @@ def load_args(config_path: str = DEFAULT_CONFIG_PATH):
     merged_config.setdefault("weight_decay", 0.0)
     merged_config.setdefault("warmup_rounds", 0)
     merged_config.setdefault("warmup_start_learning_rate", None)
+    merged_config.setdefault("resume", False)
+    merged_config.setdefault("resume_checkpoint_path", "latest")
+    merged_config.setdefault("checkpoint_every", 1)
+    merged_config.setdefault("restore_rng_state", True)
+    merged_config["resume"] = _coerce_bool(merged_config["resume"], "resume")
+    merged_config["restore_rng_state"] = _coerce_bool(
+        merged_config["restore_rng_state"],
+        "restore_rng_state",
+    )
+    try:
+        checkpoint_every = int(merged_config["checkpoint_every"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("checkpoint_every must be an integer >= 1.") from exc
+    if checkpoint_every < 1:
+        raise ValueError("checkpoint_every must be >= 1.")
+    merged_config["checkpoint_every"] = checkpoint_every
     _validate_training_hparams(merged_config)
     _derive_output_paths(merged_config)
 

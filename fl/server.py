@@ -68,6 +68,7 @@ from data.loader import build_global_eval_loader, get_client_train_size, load_pa
 from fl.aggregators import build_aggregator, parse_expert_ref_from_key
 from fl.client import Client
 from model import build_model_from_args
+from utils.checkpoint import load_training_checkpoint, save_training_checkpoint
 from utils.utils import (
     init_result_csv,
     init_server_result_csv,
@@ -204,6 +205,7 @@ class Server:
         # 基础联邦训练配置。
         self.num_clients = self.args.num_clients
         self.server_epochs = self.args.server_epochs
+        self.start_round = 0
         # 客户端编号从 1 开始，例如 num_clients=4 时为 [1, 2, 3, 4]。
         self.clientsID_list = [i+1 for i in range(self.num_clients)]
         self.device = self.args.device
@@ -221,11 +223,20 @@ class Server:
         )
         # 初始化全局模型，并保存到 server.pth。
         self.init_global_model()
+        if bool(getattr(self.args, "resume", False)):
+            completed_round = load_training_checkpoint(
+                self.args,
+                self.model,
+                logger=self.logger,
+            )
+            self.start_round = int(completed_round)
+            self.save_server_model()
         self.criterion = nn.CrossEntropyLoss()
         # 初始化 CSV 结果文件，后续客户端训练会不断追加记录。
-        init_result_csv(self.args)
-        init_server_result_csv(self.args)
-        init_timing_csv(self.args)
+        append_existing = bool(getattr(self.args, "resume", False))
+        init_result_csv(self.args, append_existing=append_existing)
+        init_server_result_csv(self.args, append_existing=append_existing)
+        init_timing_csv(self.args, append_existing=append_existing)
 
 
     def get_or_create_client(self, client_id):
@@ -274,10 +285,19 @@ class Server:
 
         train_start_time = time.perf_counter()
         round_total_sec_acc = 0.0
+        completed_this_run_rounds = 0
 
         num_clients = len(self.clientsID_list)
+        if self.start_round >= self.server_epochs:
+            self.logger.info(
+                f"--resume_already_complete : completed_round={self.start_round} "
+                f"target_rounds={self.server_epochs}\n"
+            )
+            return
+
         steps_per_round = num_clients + 2
-        total_steps = self.server_epochs * steps_per_round + 1
+        remaining_rounds = self.server_epochs - self.start_round
+        total_steps = remaining_rounds * steps_per_round + 1
         progress_bar = tqdm(
             total=total_steps,
             desc="Total training progress",
@@ -288,7 +308,7 @@ class Server:
 
         try:
             # 外层循环是一轮轮服务端通信，也就是联邦学习中的 global round。
-            for c_T in range(self.server_epochs):
+            for c_T in range(self.start_round, self.server_epochs):
                 round_id = c_T + 1
                 round_start_time = time.perf_counter()
                 self.logger.info(f"============================== T:{round_id} start !!! ===============================\n")
@@ -379,11 +399,24 @@ class Server:
                     "stage": "round_eval",
                 })
                 torch.cuda.empty_cache()
+                checkpoint_every = int(getattr(self.args, "checkpoint_every", 1))
+                if round_id % checkpoint_every == 0:
+                    save_training_checkpoint(
+                        self.args,
+                        self.model,
+                        completed_round=round_id,
+                        logger=self.logger,
+                    )
 
                 round_total_sec = time.perf_counter() - round_start_time
                 round_total_sec_acc += round_total_sec
+                completed_this_run_rounds += 1
                 cumulative_train_sec = time.perf_counter() - train_start_time
-                avg_round_sec = round_total_sec_acc / round_id if round_id > 0 else 0.0
+                avg_round_sec = (
+                    round_total_sec_acc / completed_this_run_rounds
+                    if completed_this_run_rounds > 0
+                    else 0.0
+                )
                 eta_sec = avg_round_sec * max(self.server_epochs - round_id, 0)
                 record_timing_result(
                     {
@@ -412,11 +445,21 @@ class Server:
                     f"eta_sec={eta_sec:.2f}\n"
                 )
 
+            save_training_checkpoint(
+                self.args,
+                self.model,
+                completed_round=self.server_epochs,
+                logger=self.logger,
+            )
             final_eval_start = time.perf_counter()
             self.evaluate_final_on_global_test()
             final_eval_sec = time.perf_counter() - final_eval_start
             cumulative_train_sec = time.perf_counter() - train_start_time
-            avg_round_sec = round_total_sec_acc / self.server_epochs if self.server_epochs > 0 else 0.0
+            avg_round_sec = (
+                round_total_sec_acc / completed_this_run_rounds
+                if completed_this_run_rounds > 0
+                else 0.0
+            )
             record_timing_result(
                 {
                     "phase": "final_eval",

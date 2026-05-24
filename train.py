@@ -39,7 +39,11 @@ def build_logger(args):
     console_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
 
     # 文件日志：同时把训练过程保存到 save/result/logs/*.log。
-    file_handler = logging.FileHandler(os.path.join(log_dir, f"{logger_name}.log"), mode="w")
+    file_mode = "a" if bool(getattr(args, "resume", False)) else "w"
+    file_handler = logging.FileHandler(
+        os.path.join(log_dir, f"{logger_name}.log"),
+        mode=file_mode,
+    )
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
 
@@ -125,6 +129,17 @@ def main():
         help="Force regeneration of partition_meta.pt and partition_stats.json before training.",
     )
     cli_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume training from the configured checkpoint.",
+    )
+    cli_parser.add_argument(
+        "--resume_checkpoint",
+        type=str,
+        default="",
+        help="Checkpoint path to resume from, or 'latest' for the latest checkpoint.",
+    )
+    cli_parser.add_argument(
         "--no_auto_prepare_data",
         action="store_true",
         help="Disable automatic data partition checking and generation before training.",
@@ -133,6 +148,15 @@ def main():
 
     # 从 --config 指定的 config.yaml 读取实验设置。
     args = load_args(config_path=cli_args.config)
+    if cli_args.resume:
+        args.resume = True
+    if cli_args.resume_checkpoint:
+        args.resume_checkpoint_path = cli_args.resume_checkpoint
+    if bool(getattr(args, "resume", False)) and cli_args.force_repartition:
+        raise ValueError(
+            "resume mode does not allow force_repartition because data partitions "
+            "must stay unchanged when continuing training."
+        )
     validate_output_paths(args, stage="train")
     set_seed(args.seed)
 
@@ -144,6 +168,10 @@ def main():
         )
 
     logger = build_logger(args)
+    logger.info(f"--resume : {getattr(args, 'resume', False)}\n")
+    logger.info(f"--resume_checkpoint_path : {getattr(args, 'resume_checkpoint_path', 'latest')}\n")
+    logger.info(f"--checkpoint_every : {getattr(args, 'checkpoint_every', 1)}\n")
+    logger.info(f"--restore_rng_state : {getattr(args, 'restore_rng_state', True)}\n")
 
     # 项目主入口：创建服务端对象，然后启动联邦训练流程。
     Server(args=args, logger=logger).train()
