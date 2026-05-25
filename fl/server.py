@@ -334,6 +334,7 @@ class Server:
                     round_client_states.append(client_state_dict)
                     round_client_sizes.append(self.get_client_train_size(id))
                     client_expert_usage = client_stats["expert_activations"].float().cpu()
+                    client_stats["client_id"] = id
                     round_client_expert_usages.append(client_stats)
                     round_expert_usage_summary += client_expert_usage
                     for layer_id, stats in client_stats.get("expert_stats_by_layer", {}).items():

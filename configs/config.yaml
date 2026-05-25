@@ -186,7 +186,20 @@ train:
   # - fisher_only: 计算 Fisher，使用 precision A_m 加权 expert update。
   # - robust_only: 不计算 Fisher，基于 update residual 做 IRLS 鲁棒聚合。
   # - fisher_wolf: 计算 Fisher，基于 Fisher-whitened residual 做 IRLS，权重近似 A_m * rho2_m。
+  # - fisher_history_wolf: 使用 current Fisher observation + usage confidence，可选 history reliability filtering。
   fedwolf_update_fusion_variant: uniform_update
+
+  # History-WoLF expert filter:
+  # - false: fisher_history_wolf only uses current Fisher observation + usage confidence
+  # - true: additionally enables persistent per-(client_id, layer_id, expert_id) history reliability filtering
+  fedwolf_history_filter_enabled: false
+
+  # EMA step for history reliability update:
+  # h <- h + eta * usage_conf * (observation - h)
+  fedwolf_history_eta: 0.1
+
+  # Initial neutral history reliability for unseen client-expert pairs
+  fedwolf_history_init: 0.5
 
   # Fisher precision 粒度，仅影响 fisher_only / fisher_wolf：
   # - block: 每个 expert 参数块一个 Fisher precision A_{m,l,e,b}，保持当前默认行为。

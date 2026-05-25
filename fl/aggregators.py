@@ -9,11 +9,13 @@ FEDWOLF_UPDATE_FUSION_VARIANT_UNIFORM_UPDATE = "uniform_update"
 FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_ONLY = "fisher_only"
 FEDWOLF_UPDATE_FUSION_VARIANT_ROBUST_ONLY = "robust_only"
 FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_WOLF = "fisher_wolf"
+FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_HISTORY_WOLF = "fisher_history_wolf"
 FEDWOLF_UPDATE_FUSION_VARIANTS = (
     FEDWOLF_UPDATE_FUSION_VARIANT_UNIFORM_UPDATE,
     FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_ONLY,
     FEDWOLF_UPDATE_FUSION_VARIANT_ROBUST_ONLY,
     FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_WOLF,
+    FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_HISTORY_WOLF,
 )
 FEDWOLF_FISHER_PRECISION_GRANULARITY_BLOCK = "block"
 FEDWOLF_FISHER_PRECISION_GRANULARITY_EXPERT = "expert"
@@ -448,6 +450,394 @@ def _get_client_fisher_weight(
     )
 
 
+def _get_client_id(client_stat, fallback_idx):
+    if isinstance(client_stat, dict) and "client_id" in client_stat:
+        client_id = client_stat.get("client_id")
+    else:
+        client_id = fallback_idx
+
+    if torch.is_tensor(client_id):
+        if client_id.numel() != 1:
+            return fallback_idx
+        try:
+            client_id = client_id.detach().cpu().item()
+        except (RuntimeError, TypeError, ValueError):
+            return fallback_idx
+
+    if isinstance(client_id, float) and not math.isfinite(client_id):
+        return fallback_idx
+
+    try:
+        hash(client_id)
+    except TypeError:
+        return fallback_idx
+    return client_id
+
+
+def _get_client_expert_usage_count(client_stat, layer_id, expert_id):
+    def read_usage_value(usage):
+        if usage is None:
+            return None
+        try:
+            expert_index = int(expert_id)
+        except (TypeError, ValueError):
+            return None
+
+        if isinstance(usage, dict):
+            value = _lookup_mapping_by_id(usage, expert_id)
+        elif torch.is_tensor(usage):
+            try:
+                flat_usage = usage.detach().cpu().reshape(-1)
+            except (RuntimeError, TypeError, ValueError):
+                return None
+            if expert_index < 0 or expert_index >= flat_usage.numel():
+                return None
+            value = flat_usage[expert_index].item()
+        else:
+            try:
+                value = usage[expert_index]
+            except (IndexError, KeyError, TypeError):
+                return None
+
+        if torch.is_tensor(value):
+            if value.numel() != 1:
+                return None
+            try:
+                value = value.detach().cpu().item()
+            except (RuntimeError, TypeError, ValueError):
+                return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value) or value < 0.0:
+            return None
+        return value
+
+    if not isinstance(client_stat, dict):
+        return 0.0
+
+    stats_by_layer = client_stat.get("expert_stats_by_layer")
+    if isinstance(stats_by_layer, dict):
+        layer_stats = _lookup_mapping_by_id(stats_by_layer, layer_id)
+        if isinstance(layer_stats, dict):
+            usage_value = read_usage_value(layer_stats.get("expert_activations"))
+            if usage_value is not None:
+                return float(usage_value)
+
+    activations_by_layer = client_stat.get("expert_activations_by_layer")
+    if isinstance(activations_by_layer, dict):
+        layer_usage = _lookup_mapping_by_id(activations_by_layer, layer_id)
+        usage_value = read_usage_value(layer_usage)
+        if usage_value is not None:
+            return float(usage_value)
+
+    usage_value = read_usage_value(client_stat.get("expert_activations"))
+    if usage_value is not None:
+        return float(usage_value)
+    return 0.0
+
+
+def _get_client_expert_legacy_fisher_score(client_stat, layer_id, expert_id):
+    score, score_error = _get_client_expert_fisher_score(
+        client_stat,
+        layer_id,
+        expert_id,
+    )
+    if score_error is None:
+        return float(score)
+    return None
+
+
+def _safe_median(values, eps):
+    try:
+        fallback = float(eps)
+    except (TypeError, ValueError):
+        fallback = 0.0
+    if not math.isfinite(fallback):
+        fallback = 0.0
+
+    finite_values = []
+
+    def append_value(value):
+        if torch.is_tensor(value):
+            try:
+                flat_value = value.detach().float().cpu().reshape(-1)
+            except (RuntimeError, TypeError, ValueError):
+                return
+            finite_mask = torch.isfinite(flat_value)
+            if bool(finite_mask.any().detach().cpu().item()):
+                finite_values.extend(
+                    float(item.item()) for item in flat_value[finite_mask]
+                )
+            return
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return
+        if math.isfinite(value):
+            finite_values.append(value)
+
+    if torch.is_tensor(values):
+        append_value(values)
+    else:
+        try:
+            iterator = iter(values)
+        except TypeError:
+            iterator = (values,)
+        for value in iterator:
+            append_value(value)
+
+    if not finite_values:
+        return fallback
+
+    finite_values.sort()
+    mid = len(finite_values) // 2
+    if len(finite_values) % 2 == 1:
+        return float(finite_values[mid])
+    return float((finite_values[mid - 1] + finite_values[mid]) * 0.5)
+
+
+def _summarize_float_values(values, prefix):
+    finite_values = []
+
+    def append_value(value):
+        if torch.is_tensor(value):
+            try:
+                flat_value = value.detach().float().cpu().reshape(-1)
+            except (RuntimeError, TypeError, ValueError):
+                return
+            finite_mask = torch.isfinite(flat_value)
+            if bool(finite_mask.any().detach().cpu().item()):
+                finite_values.extend(
+                    float(item.item()) for item in flat_value[finite_mask]
+                )
+            return
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return
+        if math.isfinite(value):
+            finite_values.append(value)
+
+    if torch.is_tensor(values):
+        append_value(values)
+    else:
+        try:
+            iterator = iter(values)
+        except TypeError:
+            iterator = (values,)
+        for value in iterator:
+            append_value(value)
+
+    if not finite_values:
+        return {
+            f"{prefix}_mean": 0.0,
+            f"{prefix}_std": 0.0,
+            f"{prefix}_min": 0.0,
+            f"{prefix}_max": 0.0,
+        }
+
+    mean_value = sum(finite_values) / float(len(finite_values))
+    variance = sum((value - mean_value) ** 2 for value in finite_values) / float(
+        len(finite_values)
+    )
+    return {
+        f"{prefix}_mean": float(mean_value),
+        f"{prefix}_std": float(math.sqrt(max(variance, 0.0))),
+        f"{prefix}_min": float(min(finite_values)),
+        f"{prefix}_max": float(max(finite_values)),
+    }
+
+
+def _compute_fisher_history_expert_weights(
+    client_stats,
+    layer_id,
+    expert_id,
+    history_state,
+    history_enabled,
+    history_eta,
+    history_init,
+    eps,
+):
+    if client_stats is None:
+        client_stats = []
+    elif isinstance(client_stats, dict):
+        client_stats = [client_stats]
+    else:
+        try:
+            client_stats = list(client_stats)
+        except TypeError:
+            client_stats = []
+
+    diagnostics = {
+        "usage_conf_values": [],
+        "fisher_factor_values": [],
+        "observation_values": [],
+        "history_factor_values": [],
+        "weight_values": [],
+        "missing_score_count": 0,
+        "nonfinite_or_nonpositive_score_count": 0,
+        "zero_usage_count": 0,
+        "history_good_current_good_count": 0,
+        "history_bad_current_good_count": 0,
+        "history_good_current_bad_count": 0,
+        "history_bad_current_bad_count": 0,
+    }
+    pending_history_updates = {}
+    num_clients = len(client_stats)
+    if num_clients <= 0:
+        return [], diagnostics, pending_history_updates
+
+    if not isinstance(history_state, dict):
+        history_state = {}
+    history_enabled = bool(history_enabled)
+    try:
+        history_eta = float(history_eta)
+    except (TypeError, ValueError):
+        history_eta = 0.0
+    if not math.isfinite(history_eta):
+        history_eta = 0.0
+    try:
+        history_init = float(history_init)
+    except (TypeError, ValueError):
+        history_init = 0.5
+    if not math.isfinite(history_init):
+        history_init = 0.5
+    history_init = min(1.0, max(0.0, history_init))
+    try:
+        eps = float(eps)
+    except (TypeError, ValueError):
+        eps = 0.0
+    if not math.isfinite(eps) or eps < 0.0:
+        eps = 0.0
+
+    records = []
+    positive_scores = []
+    for fallback_idx, client_stat in enumerate(client_stats):
+        client_id = _get_client_id(client_stat, fallback_idx)
+        usage_count = _get_client_expert_usage_count(
+            client_stat,
+            layer_id,
+            expert_id,
+        )
+        if usage_count <= 0.0:
+            diagnostics["zero_usage_count"] += 1
+        sqrt_usage = math.sqrt(max(usage_count, 0.0))
+
+        score = _get_client_expert_legacy_fisher_score(
+            client_stat,
+            layer_id,
+            expert_id,
+        )
+        if score is not None:
+            positive_scores.append(score)
+        else:
+            _, score_error = _get_client_expert_fisher_score(
+                client_stat,
+                layer_id,
+                expert_id,
+            )
+            if score_error == "missing":
+                diagnostics["missing_score_count"] += 1
+            else:
+                diagnostics["nonfinite_or_nonpositive_score_count"] += 1
+
+        records.append(
+            {
+                "client_id": client_id,
+                "sqrt_usage": sqrt_usage,
+                "score": score,
+            }
+        )
+
+    median_sqrt_usage = _safe_median(
+        [record["sqrt_usage"] for record in records],
+        eps,
+    )
+    if positive_scores:
+        median_score = _safe_median(positive_scores, eps)
+    else:
+        median_score = eps
+
+    unnormalized_weights = []
+    for record in records:
+        if median_sqrt_usage <= eps:
+            usage_conf = 0.0
+        else:
+            usage_conf = record["sqrt_usage"] / (median_sqrt_usage + eps)
+            usage_conf = min(1.0, max(0.0, usage_conf))
+
+        if positive_scores and record["score"] is not None:
+            z_value = record["score"] / (median_score + eps)
+            if math.isfinite(z_value) and z_value >= 0.0:
+                fisher_factor = z_value / (1.0 + z_value)
+            else:
+                fisher_factor = 0.5
+        else:
+            fisher_factor = 0.5
+
+        observation = 0.5 + usage_conf * (fisher_factor - 0.5)
+        observation = min(1.0, max(0.0, observation))
+
+        history_key = (record["client_id"], layer_id, expert_id)
+        if history_enabled:
+            h_prev = history_state.get(history_key, history_init)
+            if torch.is_tensor(h_prev):
+                if h_prev.numel() == 1:
+                    try:
+                        h_prev = h_prev.detach().cpu().item()
+                    except (RuntimeError, TypeError, ValueError):
+                        h_prev = history_init
+                else:
+                    h_prev = history_init
+            try:
+                h_prev = float(h_prev)
+            except (TypeError, ValueError):
+                h_prev = history_init
+            if not math.isfinite(h_prev):
+                h_prev = history_init
+            h_prev = min(1.0, max(0.0, h_prev))
+            history_factor = 0.75 + 0.5 * h_prev
+        else:
+            h_prev = history_init
+            history_factor = 1.0
+
+        unnormalized_weight = usage_conf * observation * history_factor
+        unnormalized_weights.append(float(unnormalized_weight))
+
+        if history_enabled:
+            h_new = h_prev + history_eta * usage_conf * (observation - h_prev)
+            if not math.isfinite(h_new):
+                h_new = h_prev
+            pending_history_updates[history_key] = min(1.0, max(0.0, h_new))
+
+        history_good = h_prev > 0.5
+        current_good = observation > 0.5
+        if history_good and current_good:
+            diagnostics["history_good_current_good_count"] += 1
+        elif (not history_good) and current_good:
+            diagnostics["history_bad_current_good_count"] += 1
+        elif history_good and (not current_good):
+            diagnostics["history_good_current_bad_count"] += 1
+        else:
+            diagnostics["history_bad_current_bad_count"] += 1
+
+        diagnostics["usage_conf_values"].append(float(usage_conf))
+        diagnostics["fisher_factor_values"].append(float(fisher_factor))
+        diagnostics["observation_values"].append(float(observation))
+        diagnostics["history_factor_values"].append(float(history_factor))
+
+    weight_sum = sum(unnormalized_weights)
+    if math.isfinite(weight_sum) and weight_sum > eps:
+        weights = [float(weight / weight_sum) for weight in unnormalized_weights]
+    else:
+        weights = [1.0 / float(num_clients) for _ in range(num_clients)]
+    diagnostics["weight_values"] = weights
+
+    return weights, diagnostics, pending_history_updates
+
+
 def _tensor_is_all_finite(tensor):
     try:
         return bool(torch.isfinite(tensor).all().detach().cpu().item())
@@ -639,6 +1029,7 @@ def aggregate_experts_robust_update_fusion(
     client_stats=None,
     aggregation_device=None,
     round_idx=None,
+    history_state=None,
 ):
     """Run the new FedWoLF expert update-fusion path.
 
@@ -653,6 +1044,9 @@ def aggregate_experts_robust_update_fusion(
     read from `expert_fisher_precision_by_layer`.
     """
 
+    if history_state is None:
+        history_state = {}
+
     variant = str(
         getattr(
             args,
@@ -666,12 +1060,12 @@ def aggregate_experts_robust_update_fusion(
         FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_ONLY,
         FEDWOLF_UPDATE_FUSION_VARIANT_ROBUST_ONLY,
         FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_WOLF,
+        FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_HISTORY_WOLF,
     }:
         raise ValueError(
             f"Unknown fedwolf_update_fusion_variant: {variant}. "
             f"Expected one of {list(FEDWOLF_UPDATE_FUSION_VARIANTS)}."
         )
-
     if not client_updates:
         raise ValueError("robust_update_fusion requires at least one client update")
     if client_weights is None or len(client_updates) != len(client_weights):
@@ -752,6 +1146,12 @@ def aggregate_experts_robust_update_fusion(
                     "but it was not found."
                 )
 
+    if variant == FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_HISTORY_WOLF:
+        if client_stats is None or len(client_stats) != len(client_updates):
+            raise RuntimeError(
+                f"{variant} requires client_stats with one entry per client update."
+            )
+
     if global_state_dict is None:
         if global_model is None:
             raise ValueError("robust_update_fusion requires global_model or global_state_dict")
@@ -772,6 +1172,9 @@ def aggregate_experts_robust_update_fusion(
     if irls_steps < 0:
         raise ValueError("fedwolf_irls_steps must be non-negative")
     irls_steps = max(1, irls_steps)
+    history_enabled = bool(getattr(args, "fedwolf_history_filter_enabled", False))
+    history_eta = float(getattr(args, "fedwolf_history_eta", 0.1))
+    history_init = float(getattr(args, "fedwolf_history_init", 0.5))
     old_expert_state = {
         key: global_state_dict[key].detach().clone()
         for key in client_updates[0].keys()
@@ -813,6 +1216,22 @@ def aggregate_experts_robust_update_fusion(
     fisher_wolf_W_values = []
     fisher_wolf_weight_sums = []
     fisher_wolf_effective_num_clients = []
+    fisher_history_weight_cache = {}
+    fisher_history_pending_updates = {}
+    fisher_history_valid_client_contribs = 0
+    fisher_history_usage_conf_values = []
+    fisher_history_fisher_factor_values = []
+    fisher_history_observation_values = []
+    fisher_history_factor_values = []
+    fisher_history_weight_values = []
+    fisher_history_effective_num_clients = []
+    fisher_history_missing_score_count = 0
+    fisher_history_nonfinite_or_nonpositive_score_count = 0
+    fisher_history_zero_usage_count = 0
+    fisher_history_good_current_good_count = 0
+    fisher_history_bad_current_good_count = 0
+    fisher_history_good_current_bad_count = 0
+    fisher_history_bad_current_bad_count = 0
 
     with torch.no_grad():
         for key in client_updates[0].keys():
@@ -844,6 +1263,70 @@ def aggregate_experts_robust_update_fusion(
             robust_deltas = []
             fisher_wolf_deltas = []
             fisher_wolf_precisions = []
+            fisher_history_weights = None
+            if variant == FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_HISTORY_WOLF:
+                layer_id, expert_id = expert_ref
+                fisher_history_ref = (int(layer_id), int(expert_id))
+                if fisher_history_ref not in fisher_history_weight_cache:
+                    weights, fisher_history_diag, pending_updates = (
+                        _compute_fisher_history_expert_weights(
+                            client_stats=client_stats,
+                            layer_id=fisher_history_ref[0],
+                            expert_id=fisher_history_ref[1],
+                            history_state=history_state,
+                            history_enabled=history_enabled,
+                            history_eta=history_eta,
+                            history_init=history_init,
+                            eps=eps,
+                        )
+                    )
+                    fisher_history_weight_cache[fisher_history_ref] = weights
+                    fisher_history_pending_updates.update(pending_updates)
+                    fisher_history_usage_conf_values.extend(
+                        fisher_history_diag.get("usage_conf_values", [])
+                    )
+                    fisher_history_fisher_factor_values.extend(
+                        fisher_history_diag.get("fisher_factor_values", [])
+                    )
+                    fisher_history_observation_values.extend(
+                        fisher_history_diag.get("observation_values", [])
+                    )
+                    fisher_history_factor_values.extend(
+                        fisher_history_diag.get("history_factor_values", [])
+                    )
+                    fisher_history_weight_values.extend(
+                        fisher_history_diag.get("weight_values", [])
+                    )
+                    weight_square_sum = sum(float(weight) ** 2 for weight in weights)
+                    if math.isfinite(weight_square_sum) and weight_square_sum > 0.0:
+                        fisher_history_effective_num_clients.append(
+                            1.0 / weight_square_sum
+                        )
+                    fisher_history_missing_score_count += int(
+                        fisher_history_diag.get("missing_score_count", 0)
+                    )
+                    fisher_history_nonfinite_or_nonpositive_score_count += int(
+                        fisher_history_diag.get(
+                            "nonfinite_or_nonpositive_score_count",
+                            0,
+                        )
+                    )
+                    fisher_history_zero_usage_count += int(
+                        fisher_history_diag.get("zero_usage_count", 0)
+                    )
+                    fisher_history_good_current_good_count += int(
+                        fisher_history_diag.get("history_good_current_good_count", 0)
+                    )
+                    fisher_history_bad_current_good_count += int(
+                        fisher_history_diag.get("history_bad_current_good_count", 0)
+                    )
+                    fisher_history_good_current_bad_count += int(
+                        fisher_history_diag.get("history_good_current_bad_count", 0)
+                    )
+                    fisher_history_bad_current_bad_count += int(
+                        fisher_history_diag.get("history_bad_current_bad_count", 0)
+                    )
+                fisher_history_weights = fisher_history_weight_cache[fisher_history_ref]
             if variant in {
                 FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_ONLY,
                 FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_WOLF,
@@ -918,6 +1401,33 @@ def aggregate_experts_robust_update_fusion(
                     valid_client_count += 1
                     fisher_wolf_valid_client_contribs += 1
                     fisher_wolf_A_values.append(float(precision))
+                    delta_norms.append(
+                        float(torch.linalg.vector_norm(delta.detach().float()).detach().cpu().item())
+                    )
+                    continue
+                if variant == FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_HISTORY_WOLF:
+                    if client_param.shape != theta_old.shape:
+                        continue
+                    if not _tensor_is_all_finite(client_param):
+                        continue
+                    if fisher_history_weights is None or client_idx >= len(fisher_history_weights):
+                        continue
+                    client_weight = float(fisher_history_weights[client_idx])
+                    if not math.isfinite(client_weight) or client_weight < 0.0:
+                        continue
+                    client_param = client_param.to(device=theta_old.device, dtype=theta_old.dtype)
+                    delta = client_param - theta_old
+                    weight = torch.as_tensor(
+                        client_weight,
+                        device=theta_old.device,
+                        dtype=theta_old.dtype,
+                    )
+                    acc_delta += weight * delta
+                    if weight_sum is None:
+                        weight_sum = torch.zeros((), device=theta_old.device, dtype=theta_old.dtype)
+                    weight_sum += weight
+                    valid_client_count += 1
+                    fisher_history_valid_client_contribs += 1
                     delta_norms.append(
                         float(torch.linalg.vector_norm(delta.detach().float()).detach().cpu().item())
                     )
@@ -999,6 +1509,14 @@ def aggregate_experts_robust_update_fusion(
                     skipped_expert_params += 1
                     continue
                 clients_per_param.append(float(valid_client_count))
+            elif variant == FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_HISTORY_WOLF:
+                weight_sum_value = float(weight_sum.detach().cpu().item()) if weight_sum is not None else 0.0
+                if weight_sum_value <= eps:
+                    aggregated_state[key] = theta_old.detach().cpu().clone()
+                    skipped_expert_params += 1
+                    continue
+                fused_delta = acc_delta / (weight_sum + eps)
+                clients_per_param.append(float(valid_client_count))
             else:
                 fused_delta, fisher_wolf_diag = _compute_fisher_wolf_center(
                     fisher_wolf_deltas,
@@ -1032,6 +1550,9 @@ def aggregate_experts_robust_update_fusion(
             theta_new = theta_old + fused_delta
             aggregated_state[key] = theta_new.detach().cpu()
             updated_expert_params += 1
+
+    if variant == FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_HISTORY_WOLF and history_enabled:
+        history_state.update(fisher_history_pending_updates)
 
     diagnostics = {
         "fedwolf_fusion_mode": FEDWOLF_FUSION_MODE_ROBUST_UPDATE_FUSION,
@@ -1269,6 +1790,105 @@ def aggregate_experts_robust_update_fusion(
                 "fisher_wolf_delta_norm_max": diagnostics["robust_update_fusion_delta_norm_max"],
             }
         )
+    elif variant == FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_HISTORY_WOLF:
+        history_values = []
+        if isinstance(history_state, dict):
+            for history_value in history_state.values():
+                if torch.is_tensor(history_value):
+                    if history_value.numel() != 1:
+                        continue
+                    try:
+                        history_value = history_value.detach().cpu().item()
+                    except (RuntimeError, TypeError, ValueError):
+                        continue
+                try:
+                    history_value = float(history_value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(history_value):
+                    history_values.append(min(1.0, max(0.0, history_value)))
+        history_state_size = len(history_state) if isinstance(history_state, dict) else 0
+        diagnostics.update(
+            {
+                "fisher_history_enabled": bool(history_enabled),
+                "fisher_history_eta": float(history_eta),
+                "fisher_history_init": float(history_init),
+                "fisher_history_state_size": int(history_state_size),
+                "fisher_history_updated_expert_params": int(updated_expert_params),
+                "fisher_history_skipped_expert_params": int(skipped_expert_params),
+                "fisher_history_valid_client_contribs": int(fisher_history_valid_client_contribs),
+                "fisher_history_missing_score_count": int(fisher_history_missing_score_count),
+                "fisher_history_nonfinite_or_nonpositive_score_count": int(
+                    fisher_history_nonfinite_or_nonpositive_score_count
+                ),
+                "fisher_history_zero_usage_count": int(fisher_history_zero_usage_count),
+                "fisher_history_good_current_good_count": int(
+                    fisher_history_good_current_good_count
+                ),
+                "fisher_history_bad_current_good_count": int(
+                    fisher_history_bad_current_good_count
+                ),
+                "fisher_history_good_current_bad_count": int(
+                    fisher_history_good_current_bad_count
+                ),
+                "fisher_history_bad_current_bad_count": int(
+                    fisher_history_bad_current_bad_count
+                ),
+            }
+        )
+        diagnostics.update(
+            _summarize_float_values(
+                fisher_history_usage_conf_values,
+                "fisher_history_usage_conf",
+            )
+        )
+        diagnostics.update(
+            _summarize_float_values(
+                fisher_history_fisher_factor_values,
+                "fisher_history_fisher_factor",
+            )
+        )
+        diagnostics.update(
+            _summarize_float_values(
+                fisher_history_observation_values,
+                "fisher_history_observation",
+            )
+        )
+        diagnostics.update(
+            _summarize_float_values(
+                fisher_history_factor_values,
+                "fisher_history_factor",
+            )
+        )
+        diagnostics.update(
+            _summarize_float_values(
+                fisher_history_weight_values,
+                "fisher_history_weight",
+            )
+        )
+        diagnostics.update(
+            _summarize_float_values(
+                history_values,
+                "fisher_history_state",
+            )
+        )
+        effective_num_clients_summary = _summarize_float_values(
+            fisher_history_effective_num_clients,
+            "fisher_history_effective_num_clients",
+        )
+        diagnostics.update(
+            {
+                "fisher_history_effective_num_clients_mean": effective_num_clients_summary[
+                    "fisher_history_effective_num_clients_mean"
+                ],
+                "fisher_history_effective_num_clients_min": effective_num_clients_summary[
+                    "fisher_history_effective_num_clients_min"
+                ],
+                "fisher_history_effective_num_clients_max": effective_num_clients_summary[
+                    "fisher_history_effective_num_clients_max"
+                ],
+            }
+        )
     return aggregated_state, diagnostics
 
 
@@ -1277,6 +1897,9 @@ class FedWoLFRobustUpdateFusionAggregator(FedAvgAggregator):
         super().__init__(args)
         self.args = args
         self.last_robust_update_summary = {}
+        # Persistent per-(client_id, layer_id, expert_id) history reliability state
+        # used by the fisher_history_wolf variant. Values are scalar h in [0, 1].
+        self.fisher_history_state = {}
 
     def aggregate(self, client_updates, client_weights, global_model=None, **kwargs):
         client_stats = kwargs.get("client_stats")
@@ -1289,6 +1912,7 @@ class FedWoLFRobustUpdateFusionAggregator(FedAvgAggregator):
             client_weights=client_weights,
             client_stats=client_stats,
             aggregation_device=self.aggregation_device,
+            history_state=self.fisher_history_state,
         )
         self.last_robust_update_summary = diagnostics
         return aggregated_state
@@ -1315,7 +1939,8 @@ def build_aggregator(args):
                 f"fedwolf_fusion_mode={fusion_mode!r} is no longer enabled for "
                 "agg_method='fedwolf'. Current supported mode is "
                 "'robust_update_fusion'. Use fedwolf_update_fusion_variant in "
-                "{uniform_update, fisher_only, robust_only, fisher_wolf}."
+                "{uniform_update, fisher_only, robust_only, fisher_wolf, "
+                "fisher_history_wolf}."
             )
         return FedWoLFRobustUpdateFusionAggregator(args)
     if args.agg_method == "expert_fedavg":
