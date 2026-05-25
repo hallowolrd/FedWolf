@@ -811,7 +811,7 @@ def _compute_fisher_history_expert_weights(
         unnormalized_weight = usage_conf * observation * history_factor
         unnormalized_weights.append(float(unnormalized_weight))
 
-        if history_enabled:
+        if history_enabled and usage_conf > eps:
             h_new = h_prev + history_eta * usage_conf * (observation - h_prev)
             if not math.isfinite(h_new):
                 h_new = h_prev
@@ -1152,6 +1152,8 @@ def aggregate_experts_robust_update_fusion(
                 )
 
     if variant == FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_HISTORY_WOLF:
+        precision_granularity = FEDWOLF_FISHER_PRECISION_GRANULARITY_EXPERT
+        fisher_weight_source = FEDWOLF_FISHER_WEIGHT_SOURCE_LEGACY_SCORE
         if client_stats is None or len(client_stats) != len(client_updates):
             raise RuntimeError(
                 f"{variant} requires client_stats with one entry per client update."
@@ -1418,7 +1420,7 @@ def aggregate_experts_robust_update_fusion(
                     if fisher_history_weights is None or client_idx >= len(fisher_history_weights):
                         continue
                     client_weight = float(fisher_history_weights[client_idx])
-                    if not math.isfinite(client_weight) or client_weight < 0.0:
+                    if not math.isfinite(client_weight) or client_weight <= eps:
                         continue
                     client_param = client_param.to(device=theta_old.device, dtype=theta_old.dtype)
                     delta = client_param - theta_old
@@ -1818,6 +1820,8 @@ def aggregate_experts_robust_update_fusion(
                 "fisher_history_enabled": bool(history_enabled),
                 "fisher_history_eta": float(history_eta),
                 "fisher_history_init": float(history_init),
+                "fisher_history_fisher_granularity": precision_granularity,
+                "fisher_history_fisher_weight_source": fisher_weight_source,
                 "fisher_history_state_size": int(history_state_size),
                 "fisher_history_updated_expert_params": int(updated_expert_params),
                 "fisher_history_skipped_expert_params": int(skipped_expert_params),
