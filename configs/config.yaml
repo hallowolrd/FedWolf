@@ -193,6 +193,13 @@ train:
   # - expert: 每个 expert 一个 Fisher precision A_{m,l,e}，由该 expert 内所有 block precision 求和得到，expert 内所有参数块共享。
   fedwolf_fisher_precision_granularity: block
 
+  # fisher_only 的 Fisher 权重来源：
+  # - precision: 默认新版行为，使用 summed Fisher precision A_m。
+  # - legacy_score: 复现旧版 fedwolf_fisher_only 思路，直接使用归一化后的 Fisher score 作为权重。
+  #   通常配合 fedwolf_fisher_precision_granularity: expert 和
+  #   fedwolf_fisher_score_mode: trace_per_active_sample 做旧版复现实验。
+  fedwolf_fisher_weight_source: precision
+
   # robust_only / fisher_wolf 使用的 IRLS 风格重加权迭代次数。
   fedwolf_irls_steps: 2
 

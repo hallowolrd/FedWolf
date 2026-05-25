@@ -21,6 +21,12 @@ FEDWOLF_FISHER_PRECISION_GRANULARITIES = (
     FEDWOLF_FISHER_PRECISION_GRANULARITY_BLOCK,
     FEDWOLF_FISHER_PRECISION_GRANULARITY_EXPERT,
 )
+FEDWOLF_FISHER_WEIGHT_SOURCE_PRECISION = "precision"
+FEDWOLF_FISHER_WEIGHT_SOURCE_LEGACY_SCORE = "legacy_score"
+FEDWOLF_FISHER_WEIGHT_SOURCES = (
+    FEDWOLF_FISHER_WEIGHT_SOURCE_PRECISION,
+    FEDWOLF_FISHER_WEIGHT_SOURCE_LEGACY_SCORE,
+)
 
 
 def parse_expert_ref_from_key(key):
@@ -331,6 +337,117 @@ def _get_client_fisher_precision(
     )
 
 
+def _get_client_block_fisher_score(client_stat, layer_id, expert_id, block_name):
+    if not isinstance(client_stat, dict):
+        return None, "missing"
+
+    score_by_layer = client_stat.get("expert_block_fisher_score_by_layer")
+    if not isinstance(score_by_layer, dict):
+        return None, "missing"
+
+    layer_dict = _lookup_mapping_by_id(score_by_layer, layer_id)
+    if not isinstance(layer_dict, dict):
+        return None, "missing"
+
+    expert_dict = _lookup_mapping_by_id(layer_dict, expert_id)
+    if not isinstance(expert_dict, dict):
+        return None, "missing"
+
+    if block_name not in expert_dict:
+        return None, "missing"
+
+    return _as_finite_positive_scalar(expert_dict.get(block_name))
+
+
+def _get_client_expert_fisher_score(client_stat, layer_id, expert_id):
+    if not isinstance(client_stat, dict):
+        return None, "missing"
+
+    score_by_layer = client_stat.get("expert_fisher_score_by_layer")
+    if isinstance(score_by_layer, dict):
+        layer_dict = _lookup_mapping_by_id(score_by_layer, layer_id)
+        if isinstance(layer_dict, dict):
+            score = _lookup_mapping_by_id(layer_dict, expert_id)
+            score_value, score_error = _as_finite_positive_scalar(score)
+            if score_error is None:
+                return score_value, None
+            if score_error != "missing":
+                return None, score_error
+
+    block_score_by_layer = client_stat.get("expert_block_fisher_score_by_layer")
+    if not isinstance(block_score_by_layer, dict):
+        return None, "missing"
+
+    layer_dict = _lookup_mapping_by_id(block_score_by_layer, layer_id)
+    if not isinstance(layer_dict, dict):
+        return None, "missing"
+
+    expert_dict = _lookup_mapping_by_id(layer_dict, expert_id)
+    if not isinstance(expert_dict, dict) or not expert_dict:
+        return None, "missing"
+
+    score_sum = 0.0
+    valid_count = 0
+    saw_nonfinite = False
+    saw_nonpositive = False
+    for block_score in expert_dict.values():
+        score_value, score_error = _as_finite_positive_scalar(block_score)
+        if score_error is None:
+            score_sum += score_value
+            valid_count += 1
+        elif score_error == "nonfinite":
+            saw_nonfinite = True
+        elif score_error == "nonpositive":
+            saw_nonpositive = True
+
+    if valid_count > 0:
+        return score_sum, None
+    if saw_nonfinite:
+        return None, "nonfinite"
+    if saw_nonpositive:
+        return None, "nonpositive"
+    return None, "missing"
+
+
+def _get_client_fisher_weight(
+    client_stat,
+    layer_id,
+    expert_id,
+    block_name,
+    precision_granularity,
+    weight_source,
+):
+    if weight_source == FEDWOLF_FISHER_WEIGHT_SOURCE_PRECISION:
+        return _get_client_fisher_precision(
+            client_stat,
+            layer_id,
+            expert_id,
+            block_name,
+            precision_granularity,
+        )
+    if weight_source == FEDWOLF_FISHER_WEIGHT_SOURCE_LEGACY_SCORE:
+        if precision_granularity == FEDWOLF_FISHER_PRECISION_GRANULARITY_BLOCK:
+            return _get_client_block_fisher_score(
+                client_stat,
+                layer_id,
+                expert_id,
+                block_name,
+            )
+        if precision_granularity == FEDWOLF_FISHER_PRECISION_GRANULARITY_EXPERT:
+            return _get_client_expert_fisher_score(
+                client_stat,
+                layer_id,
+                expert_id,
+            )
+    raise ValueError(
+        "fedwolf_fisher_weight_source must be one of "
+        f"{list(FEDWOLF_FISHER_WEIGHT_SOURCES)}, got {weight_source!r}; "
+        "fedwolf_fisher_precision_granularity must be one of "
+        f"{list(FEDWOLF_FISHER_PRECISION_GRANULARITIES)}, "
+        f"got {precision_granularity!r}."
+    )
+
+
 def _tensor_is_all_finite(tensor):
     try:
         return bool(torch.isfinite(tensor).all().detach().cpu().item())
@@ -561,6 +678,7 @@ def aggregate_experts_robust_update_fusion(
         raise ValueError("client_updates and client_weights must have the same length")
 
     precision_granularity = FEDWOLF_FISHER_PRECISION_GRANULARITY_BLOCK
+    fisher_weight_source = FEDWOLF_FISHER_WEIGHT_SOURCE_PRECISION
     if variant in {
         FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_ONLY,
         FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_WOLF,
@@ -578,26 +696,61 @@ def aggregate_experts_robust_update_fusion(
                 f"{list(FEDWOLF_FISHER_PRECISION_GRANULARITIES)}, "
                 f"got {precision_granularity!r}."
             )
+        if variant == FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_ONLY:
+            fisher_weight_source = str(
+                getattr(
+                    args,
+                    "fedwolf_fisher_weight_source",
+                    FEDWOLF_FISHER_WEIGHT_SOURCE_PRECISION,
+                )
+            ).strip().lower()
+            if fisher_weight_source not in FEDWOLF_FISHER_WEIGHT_SOURCES:
+                raise ValueError(
+                    "fedwolf_fisher_weight_source must be one of "
+                    f"{list(FEDWOLF_FISHER_WEIGHT_SOURCES)}, "
+                    f"got {fisher_weight_source!r}."
+                )
         if client_stats is None or len(client_stats) != len(client_updates):
             raise RuntimeError(
                 f"{variant} requires client_stats with one entry per client update."
             )
-        precision_field = (
-            "expert_block_fisher_precision_by_layer"
-            if precision_granularity == FEDWOLF_FISHER_PRECISION_GRANULARITY_BLOCK
-            else "expert_fisher_precision_by_layer"
-        )
-        has_precision_field = any(
-            isinstance(client_stat, dict)
-            and precision_field in client_stat
-            for client_stat in client_stats
-        )
-        if not has_precision_field:
-            raise RuntimeError(
-                f"{variant} with fedwolf_fisher_precision_granularity="
-                f"{precision_granularity!r} requires client_stats[{precision_field!r}], "
-                "but it was not found."
+        if (
+            variant == FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_ONLY
+            and fisher_weight_source == FEDWOLF_FISHER_WEIGHT_SOURCE_LEGACY_SCORE
+        ):
+            score_fields = (
+                "expert_block_fisher_score_by_layer",
+                "expert_fisher_score_by_layer",
             )
+            has_score_field = any(
+                isinstance(client_stat, dict)
+                and any(score_field in client_stat for score_field in score_fields)
+                for client_stat in client_stats
+            )
+            if not has_score_field:
+                raise RuntimeError(
+                    "fisher_only with fedwolf_fisher_weight_source="
+                    + repr(FEDWOLF_FISHER_WEIGHT_SOURCE_LEGACY_SCORE)
+                    + " requires expert_block_fisher_score_by_layer or "
+                    "expert_fisher_score_by_layer."
+                )
+        else:
+            precision_field = (
+                "expert_block_fisher_precision_by_layer"
+                if precision_granularity == FEDWOLF_FISHER_PRECISION_GRANULARITY_BLOCK
+                else "expert_fisher_precision_by_layer"
+            )
+            has_precision_field = any(
+                isinstance(client_stat, dict)
+                and precision_field in client_stat
+                for client_stat in client_stats
+            )
+            if not has_precision_field:
+                raise RuntimeError(
+                    f"{variant} with fedwolf_fisher_precision_granularity="
+                    f"{precision_granularity!r} requires client_stats[{precision_field!r}], "
+                    "but it was not found."
+                )
 
     if global_state_dict is None:
         if global_model is None:
@@ -782,12 +935,13 @@ def aggregate_experts_robust_update_fusion(
                     continue
 
                 layer_id, expert_id, block_name = expert_block_ref
-                precision, precision_error = _get_client_fisher_precision(
+                fisher_weight, precision_error = _get_client_fisher_weight(
                     client_stats[client_idx],
                     layer_id,
                     expert_id,
                     block_name,
                     precision_granularity,
+                    fisher_weight_source,
                 )
                 if precision_error == "missing":
                     fisher_only_missing_precision_count += 1
@@ -799,12 +953,12 @@ def aggregate_experts_robust_update_fusion(
                     fisher_only_nonpositive_precision_count += 1
                     continue
 
-                weight = torch.as_tensor(precision, device=theta_old.device, dtype=theta_old.dtype)
+                weight = torch.as_tensor(fisher_weight, device=theta_old.device, dtype=theta_old.dtype)
                 acc_delta += weight * delta
                 weight_sum += weight
                 valid_client_count += 1
                 fisher_only_valid_client_contribs += 1
-                fisher_only_A_values.append(float(precision))
+                fisher_only_A_values.append(float(fisher_weight))
                 delta_norms.append(
                     float(torch.linalg.vector_norm(delta.detach().float()).detach().cpu().item())
                 )
@@ -883,6 +1037,7 @@ def aggregate_experts_robust_update_fusion(
         "fedwolf_fusion_mode": FEDWOLF_FUSION_MODE_ROBUST_UPDATE_FUSION,
         "fedwolf_update_fusion_variant": variant,
         "fedwolf_fisher_precision_granularity": precision_granularity,
+        "fedwolf_fisher_weight_source": fisher_weight_source,
         "robust_update_fusion_updated_expert_params": int(updated_expert_params),
         "robust_update_fusion_skipped_expert_params": int(skipped_expert_params),
         "robust_update_fusion_mean_clients_per_param": (
