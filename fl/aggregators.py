@@ -751,10 +751,15 @@ def _compute_fisher_history_expert_weights(
             }
         )
 
-    median_sqrt_usage = _safe_median(
-        [record["sqrt_usage"] for record in records],
-        eps,
-    )
+    positive_sqrt_usages = [
+        record["sqrt_usage"]
+        for record in records
+        if record["sqrt_usage"] > eps
+    ]
+    if positive_sqrt_usages:
+        median_sqrt_usage = _safe_median(positive_sqrt_usages, eps)
+    else:
+        median_sqrt_usage = 0.0
     if positive_scores:
         median_score = _safe_median(positive_scores, eps)
     else:
@@ -832,7 +837,7 @@ def _compute_fisher_history_expert_weights(
     if math.isfinite(weight_sum) and weight_sum > eps:
         weights = [float(weight / weight_sum) for weight in unnormalized_weights]
     else:
-        weights = [1.0 / float(num_clients) for _ in range(num_clients)]
+        weights = [0.0 for _ in range(num_clients)]
     diagnostics["weight_values"] = weights
 
     return weights, diagnostics, pending_history_updates

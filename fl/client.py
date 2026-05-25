@@ -20,10 +20,12 @@ FEDWOLF_UPDATE_FUSION_VARIANT_UNIFORM_UPDATE = "uniform_update"
 FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_ONLY = "fisher_only"
 FEDWOLF_UPDATE_FUSION_VARIANT_ROBUST_ONLY = "robust_only"
 FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_WOLF = "fisher_wolf"
+FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_HISTORY_WOLF = "fisher_history_wolf"
 
 ROBUST_UPDATE_FISHER_VARIANTS = {
     FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_ONLY,
     FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_WOLF,
+    FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_HISTORY_WOLF,
 }
 ROBUST_UPDATE_NON_FISHER_VARIANTS = {
     FEDWOLF_UPDATE_FUSION_VARIANT_UNIFORM_UPDATE,
@@ -34,6 +36,7 @@ ROBUST_UPDATE_FUSION_VARIANTS = [
     FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_ONLY,
     FEDWOLF_UPDATE_FUSION_VARIANT_ROBUST_ONLY,
     FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_WOLF,
+    FEDWOLF_UPDATE_FUSION_VARIANT_FISHER_HISTORY_WOLF,
 ]
 _TRUE_BOOL_STRINGS = {"true", "1", "yes", "y", "on"}
 _FALSE_BOOL_STRINGS = {"false", "0", "no", "n", "off", "none", "null", ""}
@@ -62,7 +65,8 @@ def should_compute_fisher_evidence_for_args(args):
             f"fedwolf_fusion_mode={fusion_mode!r} is no longer enabled for "
             "agg_method='fedwolf'. Current supported mode is "
             "'robust_update_fusion'. Use fedwolf_update_fusion_variant in "
-            "{uniform_update, fisher_only, robust_only, fisher_wolf}."
+            "{uniform_update, fisher_only, robust_only, fisher_wolf, "
+            "fisher_history_wolf}."
         )
 
     variant = str(
