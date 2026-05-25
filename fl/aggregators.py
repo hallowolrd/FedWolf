@@ -935,7 +935,7 @@ def aggregate_experts_robust_update_fusion(
                     continue
 
                 layer_id, expert_id, block_name = expert_block_ref
-                fisher_weight, precision_error = _get_client_fisher_weight(
+                fisher_weight, weight_error = _get_client_fisher_weight(
                     client_stats[client_idx],
                     layer_id,
                     expert_id,
@@ -943,13 +943,13 @@ def aggregate_experts_robust_update_fusion(
                     precision_granularity,
                     fisher_weight_source,
                 )
-                if precision_error == "missing":
+                if weight_error == "missing":
                     fisher_only_missing_precision_count += 1
                     continue
-                if precision_error == "nonfinite":
+                if weight_error == "nonfinite":
                     fisher_only_nonfinite_precision_count += 1
                     continue
-                if precision_error == "nonpositive":
+                if weight_error == "nonpositive":
                     fisher_only_nonpositive_precision_count += 1
                     continue
 
@@ -1062,14 +1062,29 @@ def aggregate_experts_robust_update_fusion(
             if fisher_only_A_values
             else 0.0
         )
+        # Historical A/precision fields are kept for compatibility. With
+        # legacy_score they describe the actual score weight, not precision A.
         diagnostics.update(
             {
                 "fisher_only_updated_expert_params": int(updated_expert_params),
                 "fisher_only_skipped_expert_params": int(skipped_expert_params),
                 "fisher_only_valid_client_contribs": int(fisher_only_valid_client_contribs),
+                "fisher_only_weight_source": fisher_weight_source,
+                "fisher_only_missing_weight_count": int(fisher_only_missing_precision_count),
+                "fisher_only_nonfinite_weight_count": int(fisher_only_nonfinite_precision_count),
+                "fisher_only_nonpositive_weight_count": int(fisher_only_nonpositive_precision_count),
                 "fisher_only_missing_precision_count": int(fisher_only_missing_precision_count),
                 "fisher_only_nonfinite_precision_count": int(fisher_only_nonfinite_precision_count),
                 "fisher_only_nonpositive_precision_count": int(fisher_only_nonpositive_precision_count),
+                "fisher_only_weight_mean": float(A_mean),
+                "fisher_only_weight_std": float(math.sqrt(max(A_var, 0.0))),
+                "fisher_only_weight_min": min(fisher_only_A_values) if fisher_only_A_values else 0.0,
+                "fisher_only_weight_max": max(fisher_only_A_values) if fisher_only_A_values else 0.0,
+                "fisher_only_weight_zero_or_invalid_fraction": (
+                    invalid_precision_count / float(total_precision_count)
+                    if total_precision_count > 0
+                    else 0.0
+                ),
                 "fisher_only_A_mean": float(A_mean),
                 "fisher_only_A_std": float(math.sqrt(max(A_var, 0.0))),
                 "fisher_only_A_min": min(fisher_only_A_values) if fisher_only_A_values else 0.0,
