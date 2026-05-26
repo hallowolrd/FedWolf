@@ -232,6 +232,13 @@ train:
   # 非浮点 buffer 不做加权平均，沿用第一个客户端的值。
   aggregation_device: cuda
 
+  # Round bundle 保存：默认关闭，仅在显式开启时保存聚合前客户端上传材料。
+  save_round_bundle: false
+  round_bundle_interval: 1
+  round_bundle_dir: "round_bundles"
+  round_bundle_scope: "expert_only"
+  round_bundle_max_rounds: null
+
   # 是否在每轮聚合后记录 expert update 占全模型 update 的比例。
   # 仅做 server-side 诊断，不改变聚合结果。
   server_update_norm_diag: true

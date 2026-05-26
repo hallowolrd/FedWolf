@@ -69,6 +69,7 @@ from fl.aggregators import build_aggregator, parse_expert_ref_from_key
 from fl.client import Client
 from model import build_model_from_args
 from utils.checkpoint import load_training_checkpoint, save_training_checkpoint
+from utils.round_bundle import save_round_bundle
 from utils.utils import (
     init_result_csv,
     init_server_result_csv,
@@ -373,6 +374,27 @@ class Server:
                 self.logger.info(f"--round_expert_stats_by_layer : {layer_stats_log}\n")
                 client_loop_sec = time.perf_counter() - client_loop_start
                 # 所有客户端本地训练完成后，服务端通过聚合器更新全局模型。
+                try:
+                    save_round_bundle(
+                        args=self.args,
+                        round_id=round_id,
+                        sampled_client_ids=self.clientsID_list,
+                        server_state_before=server_state_dict,
+                        client_states=round_client_states,
+                        client_sizes=round_client_sizes,
+                        client_stats=round_client_expert_usages,
+                        extra_payload={
+                            "note": "saved before server aggregation",
+                        },
+                        logger=getattr(self, "logger", None),
+                    )
+                except Exception as exc:
+                    logger = getattr(self, "logger", None)
+                    message = f"[RoundBundle] failed to save round={round_id}: {exc}"
+                    if logger is not None:
+                        logger.warning(message)
+                    else:
+                        print(message)
                 aggregation_start = time.perf_counter()
                 self.aggregation(
                     client_states=round_client_states,
