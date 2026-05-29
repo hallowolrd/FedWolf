@@ -7,7 +7,7 @@ from torchvision.datasets import CIFAR10, CIFAR100
 
 
 EXPECTED_PROTOCOL = "client_train_global_test_index_partition"
-EXPECTED_VERSION = 2
+EXPECTED_VERSION = 3
 
 
 def get_cifar_stats(data_name):
@@ -85,7 +85,6 @@ def validate_partition_meta(meta, args):
         ("num_clients", meta.get("num_clients"), args.num_clients, "int"),
         ("alpha", meta.get("alpha"), args.alpha, "float"),
         ("seed", meta.get("seed"), args.seed, "int"),
-        ("min_datasize", meta.get("min_datasize"), args.min_datasize, "int"),
         ("data_path", meta.get("data_path"), args.data_path, "path"),
     ]
 

@@ -34,7 +34,6 @@ class CIFARPartitionBuilder:
         self.train_dataset,self.test_dataset,self.num_classes = self.load_dataset()
 
         # 官方 train set 全部划给客户端；官方 test set 保持统一，不参与客户端划分。
-        self.min_datasize = self.args.min_datasize
         self.seed = self.args.seed
         self.rng = np.random.default_rng(self.seed)
         self.train_targets = np.array(self.train_dataset.targets)
@@ -61,14 +60,13 @@ class CIFARPartitionBuilder:
 
         meta = {
             "protocol": "client_train_global_test_index_partition",
-            "version": 2,
+            "version": 3,
             "dataset": self.data_name,
             "data_path": self.data_path,
             "num_classes": self.num_classes,
             "num_clients": self.num_clients,
             "alpha": self.alpha,
             "seed": self.seed,
-            "min_datasize": self.min_datasize,
             "index_space": {
                 "client_train": "official_train",
                 "global_test": "official_test",
@@ -93,10 +91,8 @@ class CIFARPartitionBuilder:
             raise ValueError("num_clients must be positive")
         if self.alpha <= 0:
             raise ValueError("alpha must be positive")
-        if self.min_datasize <= 0:
-            raise ValueError("min_datasize must be positive")
 
-    def dirichlet_client_split(self, pool_indices, max_attempts=100):
+    def dirichlet_client_split(self, pool_indices):
         """ 把官方训练集按 Dirichlet 分布切给多个客户端，构造 non-IID 的联邦训练数据。"""
 
         pool_indices = np.array(pool_indices)
@@ -106,31 +102,24 @@ class CIFARPartitionBuilder:
             for class_id in range(self.num_classes)
         ]
 
-        for _ in range(max_attempts):
-            client_indices = {client_id: [] for client_id in range(1, self.num_clients + 1)}
-            label_distribution = self.rng.dirichlet(
-                [self.alpha] * self.num_clients,
-                self.num_classes,
-            )
-
-            for class_id, class_idcs in enumerate(class_indices):
-                shuffled_idcs = self.rng.permutation(class_idcs)
-                split_points = (
-                    np.cumsum(label_distribution[class_id])[:-1] * len(shuffled_idcs)
-                ).astype(int)
-                for client_id, idcs in enumerate(np.split(shuffled_idcs, split_points), start=1):
-                    client_indices[client_id].extend(idcs.tolist())
-
-            for idcs in client_indices.values():
-                self.rng.shuffle(idcs)
-
-            if min(len(idcs) for idcs in client_indices.values()) >= self.min_datasize:
-                return client_indices
-
-        raise ValueError(
-            "Unable to split data with the requested min_datasize. "
-            "Try increasing alpha, reducing num_clients, or lowering min_datasize in config.yaml."
+        client_indices = {client_id: [] for client_id in range(1, self.num_clients + 1)}
+        label_distribution = self.rng.dirichlet(
+            [self.alpha] * self.num_clients,
+            self.num_classes,
         )
+
+        for class_id, class_idcs in enumerate(class_indices):
+            shuffled_idcs = self.rng.permutation(class_idcs)
+            split_points = (
+                np.cumsum(label_distribution[class_id])[:-1] * len(shuffled_idcs)
+            ).astype(int)
+            for client_id, idcs in enumerate(np.split(shuffled_idcs, split_points), start=1):
+                client_indices[client_id].extend(idcs.tolist())
+
+        for idcs in client_indices.values():
+            self.rng.shuffle(idcs)
+
+        return client_indices
 
     def build_stats(self, meta):
         """ 根据 meta 中的划分结果，生成统计信息 stats。

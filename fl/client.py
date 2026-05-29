@@ -8,7 +8,7 @@ from fl.expert_evidence import compute_expert_fisher_evidence
 from model import build_model_from_args
 from utils.utils import record_result
 
-FISHER_EVIDENCE_AGG_METHODS = {"fedwolf", "fedwolf_fisher_only"}
+FISHER_EVIDENCE_AGG_METHODS = {"fedwolf_fisher_only"}
 
 
 class Client:
@@ -59,8 +59,6 @@ class Client:
         self.get_dataloader()
 
         self.logger = logger
-        self.router_aux_loss_coef = self.args.router_aux_loss_coef
-        self.router_z_loss_coef = self.args.router_z_loss_coef
 
     def should_compute_fisher_evidence(self):
         return getattr(self.args, "agg_method", None) in FISHER_EVIDENCE_AGG_METHODS
@@ -158,10 +156,7 @@ class Client:
         zero = torch.tensor(0.0, device=self.device)
         router_aux_loss = result.get("router_aux_loss", result.get("aux_loss", zero))
         router_z_loss = result.get("router_z_loss", zero)
-        extra_loss = (
-            self.router_aux_loss_coef * router_aux_loss
-            + self.router_z_loss_coef * router_z_loss
-        )
+        extra_loss = result.get("total_router_loss", zero)
         return extra_loss, router_aux_loss, router_z_loss
 
     def get_expert_activations(self, result):

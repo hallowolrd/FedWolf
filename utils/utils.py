@@ -30,10 +30,6 @@ def get_experiment_stem(args):
         f"agg_{args.agg_method}_"
         f"model_{args.model_type}"
     )
-    if args.model_type == "switch_transformer":
-        patch_size = getattr(args, "patch_size", None)
-        patch_tag = "auto" if patch_size is None else str(patch_size)
-        stem += f"_patch_{patch_tag}"
     stem += f"_run_{run_name}"
     return stem
 

@@ -1,6 +1,6 @@
 # FedWolf
 
-这是一个基于 CIFAR10/CIFAR100 的 FL + MoE / Switch Transformer 聚合实验项目。当前主工程包含标准 baseline 聚合方法，以及面向 expert 参数的 FedWoLF 聚合方法。
+这是一个基于 CIFAR10/CIFAR100 的 FL + MoE / Switch Transformer 聚合实验项目。当前主工程包含标准 baseline 聚合方法，以及面向 expert 参数的 Fisher-only 聚合方法。
 
 `references/` 只作为论文代码和映射说明的参考区，不是生产代码路径。主工程不应直接 import `references/`。
 
@@ -67,21 +67,14 @@ CUDA_VISIBLE_DEVICES=1 python train.py --config configs/test1/config.yaml
 - `expert_fedavg`
   - shared/backbone/router/classifier 按客户端样本数 FedAvg。
   - expert 参数按 expert usage / token usage 加权。
+- `expert_equal_avg`
+  - shared/backbone/router/classifier 按客户端样本数 FedAvg。
+  - expert 参数按客户端数等权平均。
 - `fedwolf_fisher_only`
   - shared/backbone/router/classifier 按客户端样本数 FedAvg。
   - expert 参数按客户端上传的 Fisher raw score `s` 加权。
-  - 不使用 `mu/P`，不使用 IMQ 权重，不使用 gamma。
-  - 这是 FedWoLF 的 Fisher-only 消融。
-- `fedwolf`
-  - 完整 FedWoLF。
-  - 客户端训练后额外计算 expert Fisher evidence：`s` 和 `z = log(1+s)`。
-  - 服务端为每层每个 expert 维护 `mu/P` 状态。
-  - 使用 WoLF-IMQ 权重对残差大的 evidence 降权。
-  - 使用 bounded learned gamma 在 old global expert 和 Fisher weighted expert average 之间插值：`gamma = gamma_min + (gamma_max - gamma_min) * sigmoid(mu / tau)`，其中 `tau = fedwolf_gamma_temperature`；默认 `gamma_min=0.0`、`gamma_max=1.0` 时退化为 `gamma = sigmoid(mu / tau)`。
 
-当前没有实现 `fedwolf_kf`。如果需要 Fisher + 普通 scalar filter 的消融入口，建议后续单独补充。
-
-## FedWoLF 流程
+## Fisher-only 流程
 
 客户端：
 
@@ -95,29 +88,15 @@ CUDA_VISIBLE_DEVICES=1 python train.py --config configs/test1/config.yaml
 服务端：
 
 1. shared/backbone/router/classifier 继续普通 FedAvg。
-2. 对每层每个 expert，按客户端顺序用 `z/s` 更新 scalar filter state：
-   - `mu_pred = mu_prev`
-   - `P_pred = P_prev + q`
-   - `R = sigma_e2 / (s + eps)`
-   - `residual = z - mu`
-   - `w = (1 + residual^2 / c^2)^(-0.5)`
-   - `obs_precision = w^2 / R`
-3. 用 Fisher raw score `s` 得到 `Theta_bar`。
-4. 对 `fedwolf`，计算 `gamma = gamma_min + (gamma_max - gamma_min) * sigmoid(mu / tau)`，其中 `tau = fedwolf_gamma_temperature`，`gamma_min = fedwolf_gamma_min`，`gamma_max = fedwolf_gamma_max`；默认 `gamma_min=0.0`、`gamma_max=1.0` 时退化为旧公式 `gamma = sigmoid(mu / tau)`。
-5. 最终 expert 更新：
+2. expert 参数按 Fisher raw score `s` 加权得到 `Theta_bar`。
+3. 如果某个 expert 本轮 Fisher 总权重为 0，则保留旧 global expert，不用随机客户端参数覆盖。
 
-```text
-expert_new = (1 - gamma) * expert_old + gamma * Theta_bar
-```
+## Fisher Evidence 配置
 
-如果某个 expert 本轮 Fisher 总权重为 0，则保留旧 global expert，不用随机客户端参数覆盖。
-
-## FedWoLF 配置
-
-FedWoLF 参数放在 `config.yaml` 的 `train` section：
+Fisher evidence 参数放在 `config.yaml` 的 `train` section：
 
 - `agg_method`
-  - 可选：`fedavg`、`expert_fedavg`、`fedwolf_fisher_only`、`fedwolf`
+  - 可选：`fedavg`、`expert_fedavg`、`expert_equal_avg`、`fedwolf_fisher_only`
 - `fedwolf_evidence_loader_mode`
   - 可选：`deterministic`、`train_loader`
   - 默认 `deterministic`：使用同一份客户端 `client_train_indices`，但采用 `ToTensor + Normalize` 的确定性 transform，不做 `RandomCrop` / `RandomHorizontalFlip`，并且 `shuffle=False`
@@ -139,54 +118,17 @@ FedWoLF 参数放在 `config.yaml` 的 `train` section：
   - 设置为正整数 `N` 时，只记录前 `N` 个 evidence batch 的简要诊断
 - `fedwolf_eps`
   - 数值稳定项，用于 Fisher 权重归一化和观测噪声分母，默认 `1e-8`
-- `fedwolf_process_noise_q`
-  - expert 可信度状态的过程噪声，默认 `0.01`
-- `fedwolf_sigma_e2`
-  - 观测噪声基础强度，`R = sigma_e2 / (s + eps)`，默认 `1.0`
-- `fedwolf_imq_c`
-  - WoLF-IMQ 鲁棒权重尺度，越小越容易对残差大的 evidence 降权，默认 `1.0`
-- `fedwolf_gamma_temperature`
-  - gamma 温度系数 `tau`，默认 `1.0`
-  - 原始映射是 `gamma = sigmoid(mu)`；工程温度校准版是 `gamma = sigmoid(mu / tau)`
-  - `tau=1.0` 时退化为旧行为，较小的 `tau` 会让 gamma 更容易离开 `0.5`
-  - 该温度只影响 `mu -> gamma -> expert_new = (1-gamma) * old_global + gamma * theta_bar`
-  - 它不影响 Fisher evidence `s/z`、`R = sigma_e2 / (s + eps)`、IMQ weight、`mu/P` filter update，也不影响 `theta_bar` 的 Fisher 加权平均
-- `fedwolf_gamma_min` / `fedwolf_gamma_max`
-  - learned 模式下使用 bounded gamma：`gamma = gamma_min + (gamma_max - gamma_min) * sigmoid(mu / tau)`
-  - 默认 `fedwolf_gamma_min: 0.0`、`fedwolf_gamma_max: 1.0`，此时退化为旧公式 `gamma = sigmoid(mu / tau)`
-  - 两者合法范围都是 `[0, 1]`，且要求 `fedwolf_gamma_min <= fedwolf_gamma_max`
-  - 作用是避免 learned gamma 长期卡在 `0.50` 附近，同时保留不同 expert 的 `mu` 自适应差异
-- `fedwolf_gamma_mode`
-  - 可选：`learned`、`fixed`
-  - 默认 `learned`，使用 bounded learned gamma，其中 `tau = fedwolf_gamma_temperature`
-  - `fixed` 用于消融诊断 learned gamma 是否过于保守，此时 `gamma = fedwolf_fixed_gamma`，不再由 `mu` 决定，也不使用 `fedwolf_gamma_min/max`
-- `fedwolf_fixed_gamma`
-  - 默认 `null`，仅当 `fedwolf_gamma_mode: fixed` 时生效，合法范围是 `[0, 1]`
-  - `0.7`：测试更强 Fisher 插值是否优于 learned gamma
-  - `0.9`：测试接近 Fisher-only 是否更好
-  - `1.0`：应近似退化为 `fedwolf_fisher_only`，用于验证实现
-  - fixed-gamma 仍然保留 `mu/P` filter update 和日志，只改变最终 `mu -> gamma` 这一步
-
-如果 gamma 长期停留在 `0.500x` 附近，可以尝试 bounded learned gamma。当前第一候选是 `fedwolf_gamma_mode: learned`、`fedwolf_gamma_temperature: 0.03`、`fedwolf_gamma_min: 0.5`、`fedwolf_gamma_max: 1.0`，此时 `gamma = 0.5 + 0.5 * sigmoid(mu / 0.03)`，当 `mu≈0` 时 `gamma≈0.75`。第二候选是 `fedwolf_gamma_temperature: 0.03`、`fedwolf_gamma_min: 0.4`、`fedwolf_gamma_max: 1.0`，当 `mu≈0` 时 `gamma≈0.7`。更激进候选是 `fedwolf_gamma_temperature: 0.03`、`fedwolf_gamma_min: 0.7`、`fedwolf_gamma_max: 1.0`，当 `mu≈0` 时 `gamma≈0.85`。
-如果要判断 learned gamma 是否太保守，可以用 `fedwolf_gamma_mode: fixed` 搭配 `fedwolf_fixed_gamma: 0.7`、`0.9`、`1.0` 做消融。这个设置不改变 Fisher evidence `s/z`、score mode、`R = sigma_e2 / (s + eps)`、IMQ weight、`mu/P` filter update，也不改变 `theta_bar` 的 Fisher 加权平均，只改变最终 expert 插值强度。
-
 ## 实验切换方式
 
 - 切 CIFAR10 / CIFAR100：修改当前 `config.yaml` 的 `data.data_name`
 - 改 `alpha`：修改当前 `config.yaml` 的 `data.alpha`
 - 改客户端数量：修改当前 `config.yaml` 的 `data.num_clients`
-- 切聚合方法：修改当前 `config.yaml` 的 `train.agg_method`，可选 `fedavg`、`expert_fedavg`、`fedwolf_fisher_only`、`fedwolf`
+- 切聚合方法：修改当前 `config.yaml` 的 `train.agg_method`，可选 `fedavg`、`expert_fedavg`、`expert_equal_avg`、`fedwolf_fisher_only`
 - 开新实验：复制一个 `config.yaml`，并修改 `train.run_name`
 - 故意覆盖旧实验：保留同一个 `run_name`，并设置 `train.allow_overwrite: true`
 - 切模型：修改当前 `config.yaml` 的 `model.model_type`
-  - `hybrid_switch_transformer`：CNN stem + Transformer
-  - `switch_transformer`：patch embedding + Transformer
-  - `resnet20_switch_transformer`：ResNet-20 style backbone + Switch Transformer
-  - `resnet32_switch_transformer`：ResNet-32 style backbone + Switch Transformer
-  - `switch_transformer` 现在支持显式 `patch_size`；该字段只对标准 Switch 生效
-  - `hybrid_switch_transformer` 仍然使用 `token_grid_size` 控制 token 网格
-  - 结果文件名现在会区分 `model_type`；对 `switch_transformer` 还会进一步区分 `patch_size`
-- 改完会影响数据划分的配置后，可以直接运行 `train.py`。例如 `data.data_name`、`data.alpha`、`data.num_clients`、`data.seed`、`data.min_datasize`、`data.data_path` 变化时，`train.py` 会检测旧 partition 是否与当前 config 匹配，不匹配就自动重新生成。
+  - `resnet18_switch_transformer`：ResNet-18 style backbone + Switch Transformer
+- 改完会影响数据划分的配置后，可以直接运行 `train.py`。例如 `data.data_name`、`data.alpha`、`data.num_clients`、`data.seed`、`data.data_path` 变化时，`train.py` 会检测旧 partition 是否与当前 config 匹配，不匹配就自动重新生成。
 - 如果希望无论是否匹配都重新划分，加 `--force_repartition`。
 - 如果只改 `model` 或 `train` 中不影响数据划分的参数，partition 会被复用。
 
@@ -261,13 +203,13 @@ run_name: smoke_expert_fedavg
 ```
 
 ```yaml
-agg_method: fedwolf_fisher_only
-run_name: smoke_fedwolf_fisher_only
+agg_method: expert_equal_avg
+run_name: smoke_expert_equal_avg
 ```
 
 ```yaml
-agg_method: fedwolf
-run_name: smoke_fedwolf
+agg_method: fedwolf_fisher_only
+run_name: smoke_fedwolf_fisher_only
 ```
 
 如果修改了 `train.run_name`，输出目录会变化；直接运行 `train.py` 时会为该 run 自动检查并生成 partition。
@@ -339,18 +281,10 @@ CSV 和日志文件名都会包含：
 - `agg_method`
 - `run_name`
 
-FedWoLF 日志中可观察：
+Fisher-only 日志中可观察：
 
 - `--expert_fisher_score_by_layer`
 - `--expert_fisher_log_score_by_layer`
-- `--fedwolf_filter_state_summary`
-  - `mu`
-  - `P`
-  - `mean_weight`
-  - `mean_abs_residual`
-  - `mean_kalman_gain`
-  - `gamma`
-  - `total_fisher_weight`
 
 ## references 边界
 
@@ -366,13 +300,9 @@ FedWoLF 日志中可观察：
 - 默认 evidence pass 是 deterministic loader + eval-mode forward；这里的 eval-mode evidence 不是 inference / `no_grad`，而是在关闭训练态随机行为后仍然计算梯度的 Fisher evidence。
 - evidence pass 不使用 `torch.no_grad()`，不执行 `optimizer.step()`，不会更新模型参数；结束后会恢复进入 evidence 前的 `model.training` 状态。
 - 当前 expert evidence 使用 supervised cross-entropy loss 计算 per-sample empirical Fisher；`router_aux_loss` / `router_z_loss` 是 batch-level auxiliary losses，不纳入 expert Fisher。直接把 batch-level scalar 加到每个 sample loss 会重复计入 batch size 次并破坏 Fisher 尺度，而且当前 evidence 只针对 `blocks.*.ffn.experts.*` expert 参数。
-- Fisher score mode 只改变客户端上传的 scalar `s` 的尺度，不改变 server-side FedWoLF 的 `R`、IMQ、`mu/P`、`gamma` 或 expert 插值公式。
-- 如果日志里 `mean_s` 只有 `1e-12` 到 `1e-9`、`mean_R` 达到 `1e7` 以上、`mean_kalman_gain` 接近 0、`mu` 长期接近 0 或 `gamma` 长期接近 0.5，可以做 score mode 尺度消融。`trace_per_active_sample` 对 top-1 MoE 通常更适合作为优先消融，因为每个 expert 只在部分样本上被路由激活。
+- Fisher score mode 只改变客户端上传的 scalar `s` 的尺度。
+- 如果日志里 `mean_s` 只有 `1e-12` 到 `1e-9`，可以做 score mode 尺度消融。`trace_per_active_sample` 对 top-1 MoE 通常更适合作为优先消融，因为每个 expert 只在部分样本上被路由激活。
 - 某些 expert 的 Fisher score 可能为 0；此时该 expert 保留旧 global 参数。
-- `mu/P` 当前只存在内存中；断点续训如果只恢复 `server.pth`，filter state 会丢失。
-- bounded learned gamma 只校准 `mu -> gamma` 的映射区间；默认 `fedwolf_gamma_min: 0.0`、`fedwolf_gamma_max: 1.0` 时等价于 `gamma = sigmoid(mu / fedwolf_gamma_temperature)`，如果 gamma 长期接近 `0.5`，可优先尝试 `fedwolf_gamma_temperature: 0.03`、`fedwolf_gamma_min: 0.5`、`fedwolf_gamma_max: 1.0`。
-- fixed-gamma 消融只改变最终 expert 插值强度；`fedwolf_gamma_mode: fixed` 时仍会更新和记录 `mu/P`，便于诊断 learned gamma 是否过于保守。
-- `fedwolf_fisher_only` 和 `fedwolf` 语义不同：前者是消融，后者是完整方法。
 - `train.py` 的自动数据准备只会覆盖 `save/{run_name}/data` 下的 `partition_meta.pt` 和 `partition_stats.json`。
 - 如果 `train.allow_overwrite: false`，`train.py` 仍然会检查 `model/result` 输出目录是否非空，避免误覆盖训练结果。
 - 自动数据准备不会改变模型结构、训练参数或聚合逻辑。

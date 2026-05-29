@@ -221,8 +221,8 @@ class Server:
         """ 聚合器接口：按当前配置的聚合方法执行参数聚合
         - fedavg:对完整 state_dict 按客户端训练样本数加权平均；
         - expert_fedavg:普通层按客户端样本数聚合,专家层按每个 expert 实际处理样本数聚合；
-        - fedwolf_fisher_only:普通层按客户端样本数聚合,专家层按 Fisher score 聚合；
-        - fedwolf:在 Fisher score 聚合基础上加入 WoLF-IMQ 状态更新和 gamma 插值。 """
+        - expert_equal_avg:普通层按客户端样本数聚合,专家层按客户端数等权平均；
+        - fedwolf_fisher_only:普通层按客户端样本数聚合,专家层按 Fisher score 聚合。 """
 
         if client_states is None:
             self.logger.info("--client_state_transport : disk\n")
@@ -255,9 +255,6 @@ class Server:
         self.model.load_state_dict(fedavg_state)
         self.logger.info(f"--aggregation_method : {self.args.agg_method}\n")
         self.logger.info(f"--client_train_sizes : {client_sizes}\n")
-        filter_summary = getattr(self.aggregator, "last_filter_summary", None)
-        if filter_summary:
-            self.logger.info(f"--fedwolf_filter_state_summary : {filter_summary}\n")
 
     def aggregation(self, client_states=None, client_sizes=None):
         """ 聚合入口函数。

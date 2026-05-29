@@ -8,9 +8,6 @@ data:
   # DataLoader 的 batch size
   batch_size: 32
 
-  # Dirichlet 划分后，每个客户端至少要有多少条训练样本
-  min_datasize: 32
-
   # Dirichlet 分布参数，越小表示客户端间数据越不均匀；
   # 官方 train 会全部按这个参数划分给各客户端
   alpha: 0.1
@@ -34,16 +31,9 @@ data:
 
 model:
   # 模型类型：
-  # hybrid_switch_transformer = CNN stem + Transformer
-  # switch_transformer = patch embedding + Transformer
-  # resnet20_switch_transformer = ResNet-20 backbone + Transformer
-  # resnet32_switch_transformer = ResNet-32 backbone + Transformer
-  model_type: resnet20_switch_transformer
+  # resnet18_switch_transformer = ResNet-18 backbone + Transformer
+  model_type: resnet18_switch_transformer
 
-  # 标准 switch_transformer 的显式 patch 大小；
-  # 为 null 时会回退到兼容逻辑，根据 token_grid_size 推导
-  # 该字段只对 switch_transformer 生效
-  patch_size: null
 
   # 每个 Switch FFN 中的专家数量
   num_experts: 8
@@ -66,39 +56,14 @@ model:
   # Transformer block 总层数
   depth: 4
 
-  # depth 的别名；如果不是 null，会优先使用它覆盖 depth
-  num_layers: null
-
   # 哪些层使用 MoE/Switch FFN，字符串形式，例如 "1,3"
   moe_layers: "1,3"
 
   # 每个 token 选择的专家数量，当前项目实际按 top-1 使用
   top_k: 1
 
-  # router auxiliary loss 的权重系数
-  router_aux_loss_coef: 0.01
-
-  # router z-loss 的权重系数
-  router_z_loss_coef: 0.001
-
-  # 训练时 router 输入抖动噪声强度
-  router_jitter_noise: 0.0
-
-  # expert capacity 系数，用于控制每个 expert 一轮可接收多少 token
-  capacity_factor: 1.25
-
-  # 每个 expert 的最小 capacity
-  min_capacity: 4
-
-  # token 超过 expert capacity 时是否丢弃
-  drop_tokens: true
-
-  # Hybrid 模型 CNN stem 的通道数；标准 switch_transformer 不使用该字段
-  stem_channels: 64
-
   # token 网格边长：
-  # 对 Hybrid 表示 token pooling 后的网格边长；
-  # 对标准 Switch 在 patch_size 为 null 时可用于推导 patch 大小
+  # ResNet18 backbone 输出会被 pooling 到 token_grid_size x token_grid_size
   token_grid_size: 8
 
   # 是否使用 cls token 做分类；false 时用 token mean pooling
@@ -134,9 +99,9 @@ train:
   # 聚合方法：
   # - fedavg: 全模型按客户端样本数做 FedAvg
   # - expert_fedavg: shared/router 按样本数 FedAvg，expert 按 expert usage/token usage 加权
+  # - expert_equal_avg: shared/router 按样本数 FedAvg，expert 按客户端数等权平均
   # - fedwolf_fisher_only: shared/router FedAvg，expert 按 Fisher raw score s 加权
-  # - fedwolf: 完整 FedWoLF，包含 Fisher evidence、WoLF-IMQ 状态更新和 gamma 插值
-  agg_method: fedwolf
+  agg_method: fedwolf_fisher_only
 
   # FedWoLF expert Fisher evidence 使用的数据加载模式：
   # - deterministic: 使用确定性 transform，不做随机增强，不 shuffle
@@ -169,43 +134,3 @@ train:
   # FedWoLF 数值稳定项；用于 Fisher 权重归一化、观测噪声分母等，防止除零
   fedwolf_eps: 1e-8
 
-  # FedWoLF expert 可信度状态的过程噪声 q；越大表示跨轮状态允许更快漂移
-  fedwolf_process_noise_q: 0.01
-
-  # FedWoLF 观测噪声基础强度 sigma_e^2；R = sigma_e2 / (s + eps)
-  fedwolf_sigma_e2: 1e-4
-
-  # WoLF-IMQ 鲁棒权重尺度 c；越小越容易对残差大的 evidence 降权
-  fedwolf_imq_c: 1.0
-
-  # FedWoLF gamma 温度系数：
-  # - learned 模式下先计算 sigmoid(mu / fedwolf_gamma_temperature)，再由 gamma_min/gamma_max 映射
-  # - 当 gamma_min=0.0、gamma_max=1.0、temperature=1.0 时退化为旧行为 gamma = sigmoid(mu)
-  # - 较小的值会放大 mu 对 gamma 的影响，使 gamma 更容易偏离 0.5
-  # - 必须 > 0
-  fedwolf_gamma_temperature: 0.05
-
-  # FedWoLF learned gamma 的下界：
-  # - learned 模式下 gamma = gamma_min + (gamma_max - gamma_min) * sigmoid(mu / fedwolf_gamma_temperature)
-  # - 默认 0.0，和 gamma_max=1.0 配合时等价旧公式 gamma = sigmoid(mu / tau)
-  # - 取值范围 [0, 1]
-  fedwolf_gamma_min: 0.0
-
-  # FedWoLF learned gamma 的上界：
-  # - learned 模式下 gamma = gamma_min + (gamma_max - gamma_min) * sigmoid(mu / fedwolf_gamma_temperature)
-  # - 默认 1.0，和 gamma_min=0.0 配合时等价旧公式 gamma = sigmoid(mu / tau)
-  # - 取值范围 [0, 1]，且必须 >= fedwolf_gamma_min
-  fedwolf_gamma_max: 1.0
-
-  # FedWoLF gamma 模式：
-  # - learned: 使用 bounded learned gamma，由 gamma_min/gamma_max 缩放 sigmoid(mu / fedwolf_gamma_temperature)
-  # - fixed: 使用固定 gamma，即 gamma = fedwolf_fixed_gamma，用于消融诊断
-  fedwolf_gamma_mode: learned
-
-  # fixed gamma 消融值：
-  # - 仅当 fedwolf_gamma_mode: fixed 时生效
-  # - 取值范围 [0, 1]
-  # - 0.7: 更强 Fisher 插值
-  # - 0.9: 接近 Fisher-only
-  # - 1.0: 应该近似退化为 fedwolf_fisher_only，用于验证实现
-  fedwolf_fixed_gamma: null
