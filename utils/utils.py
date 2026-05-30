@@ -72,10 +72,86 @@ def get_server_csv_path(args):
     return os.path.join(server_dir, filename)
 
 
+def _keep_existing_csv_for_resume(args, csv_path):
+    return (
+        bool(getattr(args, "resume", False))
+        and os.path.exists(csv_path)
+        and os.path.getsize(csv_path) > 0
+    )
+
+
+def _read_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _rewrite_csv(csv_path, fieldnames, keep_row):
+    if not os.path.exists(csv_path):
+        return
+
+    with open(csv_path, "r", newline="") as csvfile:
+        reader = csv.DictReader(csvfile)
+        rows = [row for row in reader if keep_row(row)]
+
+    with open(csv_path, "w", newline="") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def trim_result_csv_for_resume(args, completed_round, final_evaluated=False):
+    """裁掉 checkpoint 之后的 CSV 记录，避免续训重复统计未完成轮。"""
+
+    completed_round = int(completed_round)
+
+    client_fieldnames = [
+        "T",
+        "client_epoch",
+        "client_id",
+        "train_loss",
+        "train_acc",
+        "router_aux_loss",
+        "router_z_loss",
+    ]
+    _rewrite_csv(
+        get_csv_path(args),
+        client_fieldnames,
+        lambda row: (
+            _read_int(row.get("T")) is not None
+            and _read_int(row.get("T")) < completed_round
+        ),
+    )
+
+    server_fieldnames = [
+        "phase",
+        "round",
+        "test_loss",
+        "test_acc",
+        "selected_round",
+    ]
+
+    def keep_server_row(row):
+        phase = row.get("phase")
+        round_id = _read_int(row.get("round"))
+        if phase == "round_test":
+            return round_id is not None and round_id <= completed_round
+        if phase == "final_test":
+            return bool(final_evaluated) and round_id == getattr(args, "server_epochs", None)
+        return False
+
+    _rewrite_csv(
+        get_server_csv_path(args),
+        server_fieldnames,
+        keep_server_row,
+    )
+
+
 def init_result_csv(args):
     """初始化结果 CSV，写入表头。
 
-    Server 初始化时会调用一次，所以每次重新运行训练会覆盖同名 CSV。
+    Server 初始化时会调用一次；断点续训时会保留已有 CSV 并继续追加。
     """
 
     # 获取客户端训练详细结果 CSV 路径。
@@ -83,6 +159,9 @@ def init_result_csv(args):
 
     # 确保 CSV 所在目录存在。
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+
+    if _keep_existing_csv_for_resume(args, csv_path):
+        return
 
     # 以写入模式打开文件。
     # mode='w' 会覆盖同名旧文件，因此每次新训练都会重新写表头。
@@ -100,13 +179,16 @@ def init_result_csv(args):
 def init_server_result_csv(args):
     """初始化服务端结果 CSV。
 
-    当前协议不再记录逐轮验证集结果，只保留最终 global_test 评估。"""
+    当前协议记录每轮 / 最终 global_test 评估；断点续训时继续追加。"""
 
     # 获取服务端结果 CSV 路径。
     csv_path = get_server_csv_path(args)
 
     # 确保 CSV 所在目录存在。
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+
+    if _keep_existing_csv_for_resume(args, csv_path):
+        return
 
     # 以写入模式打开文件，重新运行训练时会覆盖同名旧文件。
     with open(csv_path, 'w', newline='') as csvfile:

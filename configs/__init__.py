@@ -43,6 +43,7 @@ _REQUIRED_CONFIG_KEYS = (
 )
 _DEFAULT_SAVE_ROOT = "save"
 _DEFAULT_ALLOW_OVERWRITE = False
+_DEFAULT_RESUME = False
 _NON_EXPERT_AGG_ALIASES = {
     "equal_avg": "equal_avg",
     "direct_avg": "equal_avg",
@@ -239,11 +240,16 @@ def _derive_output_paths(merged_config: dict) -> None:
         merged_config.get("allow_overwrite", _DEFAULT_ALLOW_OVERWRITE),
         "allow_overwrite",
     )
+    resume = _coerce_bool(
+        merged_config.get("resume", _DEFAULT_RESUME),
+        "resume",
+    )
     run_root = Path(save_root) / run_name
 
     merged_config["save_root"] = save_root
     merged_config["run_name"] = run_name
     merged_config["allow_overwrite"] = allow_overwrite
+    merged_config["resume"] = resume
     merged_config["data_save_path"] = str(run_root / "data")
     merged_config["model_save_path"] = str(run_root / "model")
     merged_config["save_result"] = str(run_root / "result")
@@ -262,6 +268,8 @@ def validate_output_paths(args: SimpleNamespace, stage: str) -> None:
     if stage == "data":
         targets = [Path(args.data_save_path)]
     elif stage == "train":
+        if getattr(args, "resume", False):
+            return
         targets = [Path(args.model_save_path), Path(args.save_result)]
     else:
         raise ValueError("stage must be either 'data' or 'train'")

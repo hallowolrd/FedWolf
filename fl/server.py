@@ -2,12 +2,18 @@ import torch
 import os
 from types import SimpleNamespace
 from torch import nn
+from tqdm import tqdm
 
 from data.loader import build_global_eval_loader, get_client_train_size, load_partition_meta
 from fl.aggregators import build_aggregator
 from fl.client import Client
 from model import build_model_from_args
-from utils.utils import init_result_csv, init_server_result_csv, record_server_result
+from utils.utils import (
+    init_result_csv,
+    init_server_result_csv,
+    record_server_result,
+    trim_result_csv_for_resume,
+)
 
 
 class Server:
@@ -45,6 +51,12 @@ class Server:
         # 确保模型保存目录存在。
         os.makedirs(self.args.model_save_path, exist_ok=True)
 
+        # 断点续训 checkpoint 路径。
+        self.checkpoint_path = os.path.join(self.args.model_save_path, "checkpoint.pth")
+        self.resume = bool(getattr(self.args, "resume", False))
+        self.start_round = 0
+        self.final_evaluated = False
+
         # 加载数据划分元信息，后续客户端和服务端都复用这份划分信息。
         self.partition_meta = load_partition_meta(self.args)
 
@@ -56,38 +68,91 @@ class Server:
             meta=self.partition_meta,
         )
 
-        # 初始化全局模型，并保存到 server.pth。
-        self.init_global_model()
+        # 初始化全局模型；断点续训时会随后加载 checkpoint 参数。
+        self.init_global_model(save_initial=not self.resume)
+        if self.resume:
+            self.load_training_checkpoint()
 
         # 服务端评估分类任务时使用交叉熵损失。
         self.criterion = nn.CrossEntropyLoss()
 
         # 初始化 CSV 结果文件，后续客户端训练会不断追加记录。
+        if self.resume:
+            trim_result_csv_for_resume(
+                self.args,
+                completed_round=self.start_round,
+                final_evaluated=self.final_evaluated,
+            )
         init_result_csv(self.args)
         init_server_result_csv(self.args)
 
 
-    def init_global_model(self):
+    def init_global_model(self, save_initial=True):
         """ 初始化服务端全局模型。 """
 
         # 根据 model_type 初始化全局模型。
         self.model = build_model_from_args(self.args)
 
-        # 初始化完成后立即保存，客户端 renew_model 时会读取这个文件。
-        self.save_server_model()
+        # 普通训练初始化完成后立即保存，客户端 renew_model 可从磁盘读取。
+        if save_initial:
+            self.save_server_model()
 
-    def save_server_model(self):
-        """ 保存当前服务端模型参数到 server.pth。 """
+    def get_server_state_dict(self):
+        """将当前服务端模型参数拷贝到 CPU。"""
 
-        # 将服务端模型参数全部拷贝到 CPU。
-        # detach 避免保存计算图，clone 避免后续参数变化影响当前快照。
-        cpu_state_dict = {
+        return {
             key: value.detach().cpu().clone()
             for key, value in self.model.state_dict().items()
         }
 
+    def save_server_model(self):
+        """ 保存当前服务端模型参数到 server.pth。 """
+
         # 保存为 server.pth，供客户端下一轮同步全局模型。
-        torch.save(cpu_state_dict, self.args.model_save_path + f"/server.pth")
+        torch.save(self.get_server_state_dict(), self.args.model_save_path + f"/server.pth")
+
+    def save_training_checkpoint(self, completed_round, final_evaluated=False):
+        """保存 server round 级别的断点续训 checkpoint。"""
+
+        checkpoint = {
+            "completed_round": int(completed_round),
+            "final_evaluated": bool(final_evaluated),
+            "server_state_dict": self.get_server_state_dict(),
+        }
+        torch.save(checkpoint, self.checkpoint_path)
+
+    def load_training_checkpoint(self):
+        """从 checkpoint 恢复服务端模型和已完成轮数。"""
+
+        if not os.path.exists(self.checkpoint_path):
+            raise FileNotFoundError(
+                "resume=True requires checkpoint file: "
+                f"{self.checkpoint_path}"
+            )
+
+        checkpoint = torch.load(self.checkpoint_path, map_location="cpu")
+        if "server_state_dict" not in checkpoint or "completed_round" not in checkpoint:
+            raise ValueError(
+                "Invalid checkpoint: expected server_state_dict and completed_round "
+                f"in {self.checkpoint_path}"
+            )
+
+        completed_round = int(checkpoint["completed_round"])
+        if completed_round < 0 or completed_round > self.server_epochs:
+            raise ValueError(
+                "Invalid checkpoint completed_round: "
+                f"{completed_round}, server_epochs={self.server_epochs}"
+            )
+
+        self.model.load_state_dict(checkpoint["server_state_dict"])
+        self.start_round = completed_round
+        self.final_evaluated = bool(checkpoint.get("final_evaluated", False))
+        self.save_server_model()
+        self.logger.info(
+            f"--resume_checkpoint : {self.checkpoint_path} "
+            f"--completed_round : {self.start_round} "
+            f"--server_epochs : {self.server_epochs}\n"
+        )
 
 
     def train(self):
@@ -99,8 +164,23 @@ class Server:
         4. 保存 server.pth,供下一轮客户端同步
         5. 所有轮次结束后，在 global_test 上评估最终模型 """
 
+        if self.start_round >= self.server_epochs:
+            if self.final_evaluated:
+                self.logger.info(
+                    f"--resume_status : already completed "
+                    f"--completed_round : {self.start_round}\n"
+                )
+                return
+
+            self.evaluate_final_on_global_test()
+            self.save_training_checkpoint(
+                completed_round=self.server_epochs,
+                final_evaluated=True,
+            )
+            return
+
         # 外层循环是一轮轮服务端通信，也就是联邦学习中的 global round。
-        for c_T in range(self.server_epochs):
+        for c_T in range(self.start_round, self.server_epochs):
             self.logger.info(f"============================== T:{c_T+1} start !!! ===============================\n")
 
             # 当前轮开始前，把服务端模型参数拷贝出来。
@@ -126,7 +206,12 @@ class Server:
             # 保存每个客户端训练集大小，FedAvg 会用它作为聚合权重。
             round_client_sizes = []
 
-            for id in self.clientsID_list:
+            for id in tqdm(
+                self.clientsID_list,
+                desc=f"T:{c_T + 1}/{self.server_epochs} clients",
+                unit="client",
+                dynamic_ncols=True,
+            ):
                 # 每个客户端执行本地训练，并返回本轮信息。
                 client_stats = Client(
                     args=self.args,
@@ -215,11 +300,18 @@ class Server:
             # 每轮聚合后在 global_test 上评估一次，用来观察训练曲线。
             self.evaluate_round_on_global_test(round_id=c_T + 1)
 
+            # checkpoint 记录已经完整完成的 server round。
+            self.save_training_checkpoint(completed_round=c_T + 1)
+
             # 清理 CUDA 缓存，降低多轮训练中的显存占用波动。
             torch.cuda.empty_cache()
 
         # 所有 server round 结束后，再做一次最终测试。
         self.evaluate_final_on_global_test()
+        self.save_training_checkpoint(
+            completed_round=self.server_epochs,
+            final_evaluated=True,
+        )
 
     def evaluate_global_model(self, data_loader):
         """ 用给定的数据集(global_test)评估当前服务端模型。

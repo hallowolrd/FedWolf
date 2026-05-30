@@ -48,8 +48,9 @@ def build_logger(args):
     console_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
 
     # 文件日志：同时把训练过程保存到 save/result/logs/*.log。
-    # mode="w" 表示每次运行都会覆盖同名旧日志。
-    file_handler = logging.FileHandler(os.path.join(log_dir, f"{logger_name}.log"), mode="w")
+    # 断点续训时追加旧日志；普通训练仍覆盖同名旧日志。
+    log_mode = "a" if bool(getattr(args, "resume", False)) else "w"
+    file_handler = logging.FileHandler(os.path.join(log_dir, f"{logger_name}.log"), mode=log_mode)
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
 
@@ -170,12 +171,23 @@ def main():
         help="Disable automatic data partition checking and generation before training.",
     )
 
+    # 从 save/{run_name}/model/checkpoint.pth 恢复已完成的 server round。
+    cli_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume training from save/{run_name}/model/checkpoint.pth.",
+    )
+
     # 解析命令行参数。
     cli_args = cli_parser.parse_args()
 
     # Read experiment settings from the config.yaml passed by --config.
     # 从 YAML 配置文件中读取完整实验参数。
     args = load_args(config_path=cli_args.config)
+
+    # 命令行 --resume 优先开启断点续训，不需要修改 config.yaml。
+    if cli_args.resume:
+        args.resume = True
 
     # 检查输出路径配置是否合法，避免训练结果被写到错误位置。
     validate_output_paths(args, stage="train")
