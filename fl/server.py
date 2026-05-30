@@ -179,132 +179,141 @@ class Server:
             )
             return
 
-        # 外层循环是一轮轮服务端通信，也就是联邦学习中的 global round。
-        for c_T in range(self.start_round, self.server_epochs):
-            self.logger.info(f"============================== T:{c_T+1} start !!! ===============================\n")
+        total_client_steps = self.server_epochs * self.num_clients
+        completed_client_steps = self.start_round * self.num_clients
 
-            # 当前轮开始前，把服务端模型参数拷贝出来。
-            # 之后传给客户端，客户端本地训练前会加载这份全局参数。
-            server_state_dict = {
-                key: value.detach().cpu().clone()
-                for key, value in self.model.state_dict().items()
-            }
+        # 进度条覆盖全部 server round 中的 client 训练，ETA 对应整段训练剩余时间。
+        with tqdm(
+            total=total_client_steps,
+            initial=completed_client_steps,
+            desc="training clients",
+            unit="client",
+            dynamic_ncols=True,
+        ) as progress_bar:
+            # 外层循环是一轮轮服务端通信，也就是联邦学习中的 global round。
+            for c_T in range(self.start_round, self.server_epochs):
+                self.logger.info(f"============================== T:{c_T+1} start !!! ===============================\n")
 
-            # 统计本轮所有客户端总体 expert 使用次数。
-            round_expert_usage_summary = torch.zeros(self.args.num_experts)
-
-            # 统计本轮所有客户端按层的 expert 使用信息。
-            round_layer_stats = {}
-
-            # 保存每个客户端返回的 expert usage / Fisher score 等统计信息。
-            # 聚合器会用这些信息做 expert 级别加权。
-            round_client_expert_usages = []
-
-            # 保存每个客户端本地训练后的模型参数。
-            round_client_states = []
-
-            # 保存每个客户端训练集大小，FedAvg 会用它作为聚合权重。
-            round_client_sizes = []
-
-            for id in tqdm(
-                self.clientsID_list,
-                desc=f"T:{c_T + 1}/{self.server_epochs} clients",
-                unit="client",
-                dynamic_ncols=True,
-            ):
-                # 每个客户端执行本地训练，并返回本轮信息。
-                client_stats = Client(
-                    args=self.args,
-                    client_id=id,
-                    logger=self.logger,
-                    c_T=c_T,
-                    partition_meta=self.partition_meta,
-                    server_state_dict=server_state_dict,
-                ).train()
-
-                # local_state_dict 是客户端训练后的模型参数。
-                # pop 后 client_stats 中剩下的就是 expert usage / Fisher score 等统计信息。
-                client_state_dict = client_stats.pop("local_state_dict")
-
-                # 收集客户端模型参数，用于后续服务端聚合。
-                round_client_states.append(client_state_dict)
-
-                # 收集客户端训练样本数，用于 FedAvg 权重。
-                round_client_sizes.append(self.get_client_train_size(id))
-
-                # 当前客户端总 expert 激活次数。
-                client_expert_usage = client_stats["expert_activations"].float().cpu()
-
-                # 保存当前客户端 expert 统计信息，供 usage / Fisher 等专家聚合策略使用。
-                round_client_expert_usages.append(client_stats)
-
-                # 累加到本轮总 expert usage。
-                round_expert_usage_summary += client_expert_usage
-
-                # 累加按层 expert 统计信息。
-                for layer_id, stats in client_stats.get("expert_stats_by_layer", {}).items():
-                    # 第一次遇到该 layer 时，初始化本轮该层统计容器。
-                    if layer_id not in round_layer_stats:
-                        round_layer_stats[layer_id] = {
-                            "expert_activations": torch.zeros(self.args.num_experts),
-                            "overflow_counts": torch.zeros(self.args.num_experts),
-                            "capacity": stats.get("capacity", 0),
-                        }
-
-                    # 累加该层每个 expert 的激活次数。
-                    round_layer_stats[layer_id]["expert_activations"] += stats["expert_activations"].float().cpu()
-
-                    # 累加该层每个 expert 的 overflow 次数。
-                    round_layer_stats[layer_id]["overflow_counts"] += stats["overflow_counts"].float().cpu()
-
-                    # capacity 表示该层 expert 容量配置，不是累计量，直接保留即可。
-                    round_layer_stats[layer_id]["capacity"] = stats.get("capacity", round_layer_stats[layer_id]["capacity"])
-
-            # 将本轮总 expert usage 转成 int list，方便日志阅读。
-            usage_list = [int(v) for v in round_expert_usage_summary.tolist()]
-            self.logger.info(f"--round_expert_usage_summary : {usage_list}\n")
-
-            # 保存最近一轮所有客户端的 expert 统计。
-            # aggregation_by_method 中会通过 self.last_client_expert_usages 传给聚合器。
-            self.last_client_expert_usages = round_client_expert_usages
-
-            # 每个客户端各自的 expert usage，便于检查 expert 是否极度不均衡。
-            client_usage_list = [
-                [int(v) for v in stats["expert_activations"].tolist()]
-                for stats in round_client_expert_usages
-            ]
-
-            # 按层 expert 统计日志，包括 expert 激活、overflow 和 capacity。
-            layer_stats_log = {
-                layer_id: {
-                    "expert_activations": [int(v) for v in stats["expert_activations"].tolist()],
-                    "overflow_counts": [int(v) for v in stats["overflow_counts"].tolist()],
-                    "capacity": int(stats["capacity"]),
+                # 当前轮开始前，把服务端模型参数拷贝出来。
+                # 之后传给客户端，客户端本地训练前会加载这份全局参数。
+                server_state_dict = {
+                    key: value.detach().cpu().clone()
+                    for key, value in self.model.state_dict().items()
                 }
-                for layer_id, stats in round_layer_stats.items()
-            }
 
-            # 打印客户端级别和层级别的 expert 使用情况。
-            self.logger.info(f"--client_expert_usage_summary : {client_usage_list}\n")
-            self.logger.info(f"--round_expert_stats_by_layer : {layer_stats_log}\n")
+                # 统计本轮所有客户端总体 expert 使用次数。
+                round_expert_usage_summary = torch.zeros(self.args.num_experts)
 
-            # 所有客户端本地训练完成后，服务端通过聚合器更新全局模型。
-            self.aggregation(
-                client_states=round_client_states,
-                client_sizes=round_client_sizes,
-            )
+                # 统计本轮所有客户端按层的 expert 使用信息。
+                round_layer_stats = {}
 
-            # 每轮结束保存当前服务端模型，供下一轮客户端同步。
-            self.save_server_model()
+                # 保存每个客户端返回的 expert usage / Fisher score 等统计信息。
+                # 聚合器会用这些信息做 expert 级别加权。
+                round_client_expert_usages = []
 
-            # 每轮聚合后在 global_test 上评估一次，用来观察训练曲线。
-            self.evaluate_round_on_global_test(round_id=c_T + 1)
+                # 保存每个客户端本地训练后的模型参数。
+                round_client_states = []
 
-            # checkpoint 记录已经完整完成的 server round。
-            self.save_training_checkpoint(completed_round=c_T + 1)
+                # 保存每个客户端训练集大小，FedAvg 会用它作为聚合权重。
+                round_client_sizes = []
 
-            # 清理 CUDA 缓存，降低多轮训练中的显存占用波动。
-            torch.cuda.empty_cache()
+                progress_bar.set_description(f"T:{c_T + 1}/{self.server_epochs} clients")
+                for id in self.clientsID_list:
+                    # 每个客户端执行本地训练，并返回本轮信息。
+                    client_stats = Client(
+                        args=self.args,
+                        client_id=id,
+                        logger=self.logger,
+                        c_T=c_T,
+                        partition_meta=self.partition_meta,
+                        server_state_dict=server_state_dict,
+                    ).train()
+
+                    # local_state_dict 是客户端训练后的模型参数。
+                    # pop 后 client_stats 中剩下的就是 expert usage / Fisher score 等统计信息。
+                    client_state_dict = client_stats.pop("local_state_dict")
+
+                    # 收集客户端模型参数，用于后续服务端聚合。
+                    round_client_states.append(client_state_dict)
+
+                    # 收集客户端训练样本数，用于 FedAvg 权重。
+                    round_client_sizes.append(self.get_client_train_size(id))
+
+                    # 当前客户端总 expert 激活次数。
+                    client_expert_usage = client_stats["expert_activations"].float().cpu()
+
+                    # 保存当前客户端 expert 统计信息，供 usage / Fisher 等专家聚合策略使用。
+                    round_client_expert_usages.append(client_stats)
+
+                    # 累加到本轮总 expert usage。
+                    round_expert_usage_summary += client_expert_usage
+
+                    # 累加按层 expert 统计信息。
+                    for layer_id, stats in client_stats.get("expert_stats_by_layer", {}).items():
+                        # 第一次遇到该 layer 时，初始化本轮该层统计容器。
+                        if layer_id not in round_layer_stats:
+                            round_layer_stats[layer_id] = {
+                                "expert_activations": torch.zeros(self.args.num_experts),
+                                "overflow_counts": torch.zeros(self.args.num_experts),
+                                "capacity": stats.get("capacity", 0),
+                            }
+
+                        # 累加该层每个 expert 的激活次数。
+                        round_layer_stats[layer_id]["expert_activations"] += stats["expert_activations"].float().cpu()
+
+                        # 累加该层每个 expert 的 overflow 次数。
+                        round_layer_stats[layer_id]["overflow_counts"] += stats["overflow_counts"].float().cpu()
+
+                        # capacity 表示该层 expert 容量配置，不是累计量，直接保留即可。
+                        round_layer_stats[layer_id]["capacity"] = stats.get("capacity", round_layer_stats[layer_id]["capacity"])
+
+                    progress_bar.update(1)
+
+                # 将本轮总 expert usage 转成 int list，方便日志阅读。
+                usage_list = [int(v) for v in round_expert_usage_summary.tolist()]
+                self.logger.info(f"--round_expert_usage_summary : {usage_list}\n")
+
+                # 保存最近一轮所有客户端的 expert 统计。
+                # aggregation_by_method 中会通过 self.last_client_expert_usages 传给聚合器。
+                self.last_client_expert_usages = round_client_expert_usages
+
+                # 每个客户端各自的 expert usage，便于检查 expert 是否极度不均衡。
+                client_usage_list = [
+                    [int(v) for v in stats["expert_activations"].tolist()]
+                    for stats in round_client_expert_usages
+                ]
+
+                # 按层 expert 统计日志，包括 expert 激活、overflow 和 capacity。
+                layer_stats_log = {
+                    layer_id: {
+                        "expert_activations": [int(v) for v in stats["expert_activations"].tolist()],
+                        "overflow_counts": [int(v) for v in stats["overflow_counts"].tolist()],
+                        "capacity": int(stats["capacity"]),
+                    }
+                    for layer_id, stats in round_layer_stats.items()
+                }
+
+                # 打印客户端级别和层级别的 expert 使用情况。
+                self.logger.info(f"--client_expert_usage_summary : {client_usage_list}\n")
+                self.logger.info(f"--round_expert_stats_by_layer : {layer_stats_log}\n")
+
+                # 所有客户端本地训练完成后，服务端通过聚合器更新全局模型。
+                self.aggregation(
+                    client_states=round_client_states,
+                    client_sizes=round_client_sizes,
+                )
+
+                # 每轮结束保存当前服务端模型，供下一轮客户端同步。
+                self.save_server_model()
+
+                # 每轮聚合后在 global_test 上评估一次，用来观察训练曲线。
+                self.evaluate_round_on_global_test(round_id=c_T + 1)
+
+                # checkpoint 记录已经完整完成的 server round。
+                self.save_training_checkpoint(completed_round=c_T + 1)
+
+                # 清理 CUDA 缓存，降低多轮训练中的显存占用波动。
+                torch.cuda.empty_cache()
 
         # 所有 server round 结束后，再做一次最终测试。
         self.evaluate_final_on_global_test()
