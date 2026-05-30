@@ -6,7 +6,7 @@ data:
   data_path: ./data
 
   # DataLoader 的 batch size
-  batch_size: 32
+  batch_size: 64
 
   # Dirichlet 分布参数，越小表示客户端间数据越不均匀；
   # 官方 train 会全部按这个参数划分给各客户端
@@ -36,7 +36,7 @@ model:
 
 
   # 每个 Switch FFN 中的专家数量
-  num_experts: 8
+  num_experts: 4
 
   # Transformer / MLP 中使用的 dropout 比例
   dropout: 0.1
@@ -74,7 +74,7 @@ train:
   num_clients: 10
 
   # 服务端通信轮数，也就是全局训练轮数
-  server_epochs: 50
+  server_epochs: 100
 
   # 每轮中每个客户端本地训练的 epoch 数
   client_epochs: 1
@@ -98,10 +98,11 @@ train:
 
   # 聚合方法：
   # - fedavg: 全模型按客户端样本数做 FedAvg
+  # - equal_avg: shared/router/expert 全部按客户端数等权平均
   # - expert_fedavg: shared/router 按样本数 FedAvg，expert 按 expert usage/token usage 加权
   # - expert_equal_avg: shared/router 按样本数 FedAvg，expert 按客户端数等权平均
   # - fedwolf_fisher_only: shared/router FedAvg，expert 按 Fisher raw score s 加权
-  agg_method: fedwolf_fisher_only
+  agg_method: fedavg
 
   # FedWoLF expert Fisher evidence 使用的数据加载模式：
   # - deterministic: 使用确定性 transform，不做随机增强，不 shuffle

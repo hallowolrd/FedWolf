@@ -64,6 +64,8 @@ CUDA_VISIBLE_DEVICES=1 python train.py --config configs/test1/config.yaml
 
 - `fedavg`
   - 全模型按客户端训练样本数加权平均。
+- `equal_avg`
+  - 全模型按客户端数等权平均。
 - `expert_fedavg`
   - shared/backbone/router/classifier 按客户端样本数 FedAvg。
   - expert 参数按 expert usage / token usage 加权。
@@ -96,7 +98,7 @@ CUDA_VISIBLE_DEVICES=1 python train.py --config configs/test1/config.yaml
 Fisher evidence 参数放在 `config.yaml` 的 `train` section：
 
 - `agg_method`
-  - 可选：`fedavg`、`expert_fedavg`、`expert_equal_avg`、`fedwolf_fisher_only`
+  - 可选：`fedavg`、`equal_avg`、`expert_fedavg`、`expert_equal_avg`、`fedwolf_fisher_only`
 - `fedwolf_evidence_loader_mode`
   - 可选：`deterministic`、`train_loader`
   - 默认 `deterministic`：使用同一份客户端 `client_train_indices`，但采用 `ToTensor + Normalize` 的确定性 transform，不做 `RandomCrop` / `RandomHorizontalFlip`，并且 `shuffle=False`
@@ -123,7 +125,7 @@ Fisher evidence 参数放在 `config.yaml` 的 `train` section：
 - 切 CIFAR10 / CIFAR100：修改当前 `config.yaml` 的 `data.data_name`
 - 改 `alpha`：修改当前 `config.yaml` 的 `data.alpha`
 - 改客户端数量：修改当前 `config.yaml` 的 `data.num_clients`
-- 切聚合方法：修改当前 `config.yaml` 的 `train.agg_method`，可选 `fedavg`、`expert_fedavg`、`expert_equal_avg`、`fedwolf_fisher_only`
+- 切聚合方法：修改当前 `config.yaml` 的 `train.agg_method`，可选 `fedavg`、`equal_avg`、`expert_fedavg`、`expert_equal_avg`、`fedwolf_fisher_only`
 - 开新实验：复制一个 `config.yaml`，并修改 `train.run_name`
 - 故意覆盖旧实验：保留同一个 `run_name`，并设置 `train.allow_overwrite: true`
 - 切模型：修改当前 `config.yaml` 的 `model.model_type`
@@ -195,6 +197,11 @@ allow_overwrite: false
 ```yaml
 agg_method: fedavg
 run_name: smoke_fedavg
+```
+
+```yaml
+agg_method: equal_avg
+run_name: smoke_equal_avg
 ```
 
 ```yaml
