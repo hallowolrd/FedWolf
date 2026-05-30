@@ -9,8 +9,12 @@ from model import build_model_from_args
 from utils.utils import record_result
 
 
-# 只有专家参数按 Fisher raw score 聚合时，客户端才需要额外计算 Fisher evidence。
-FISHER_EVIDENCE_EXPERT_AGG_METHODS = {"fisher_raw_score"}
+# Methods that require client-side Fisher evidence.
+# fisher_history_wolf reuses the Fisher evidence before server-side History-WoLF filtering.
+FISHER_EVIDENCE_EXPERT_AGG_METHODS = {
+    "fisher_raw_score",
+    "fisher_history_wolf",
+}
 
 
 class Client:

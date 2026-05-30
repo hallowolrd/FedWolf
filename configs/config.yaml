@@ -107,6 +107,14 @@ train:
   # - fisher_raw_score: 按客户端上传的 Fisher raw score s 加权
   expert_agg_method: sample_weighted_avg
 
+  # History-WoLF expert filter:
+  # Used by expert_agg_method: history_wolf_filter / fisher_history_wolf.
+  # The filter maintains scalar mu/P reliability states per client-layer-expert.
+  history_wolf_min_usage: 1        # Minimum expert usage required to update/use a client-expert contribution.
+  history_wolf_c: 2.0              # WoLF residual soft threshold. Larger means less aggressive down-weighting.
+  history_wolf_process_noise: 0.01 # Scalar P process noise; lets old history slowly become uncertain.
+  history_wolf_obs_noise: 0.05     # Observation noise scale; usage confidence divides this value.
+
   # FedWoLF expert Fisher evidence 使用的数据加载模式：
   # - deterministic: 使用确定性 transform，不做随机增强，不 shuffle
   # - train_loader: 复用训练 loader，包含随机增强和 shuffle，用于消融

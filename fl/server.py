@@ -118,6 +118,9 @@ class Server:
             "completed_round": int(completed_round),
             "final_evaluated": bool(final_evaluated),
             "server_state_dict": self.get_server_state_dict(),
+            "aggregator_state": self.aggregator.state_dict()
+            if hasattr(self.aggregator, "state_dict")
+            else {},
         }
         torch.save(checkpoint, self.checkpoint_path)
 
@@ -145,6 +148,10 @@ class Server:
             )
 
         self.model.load_state_dict(checkpoint["server_state_dict"])
+        aggregator_state = checkpoint.get("aggregator_state", {})
+        if aggregator_state and hasattr(self.aggregator, "load_state_dict"):
+            self.aggregator.load_state_dict(aggregator_state)
+
         self.start_round = completed_round
         self.final_evaluated = bool(checkpoint.get("final_evaluated", False))
         self.save_server_model()
@@ -468,6 +475,10 @@ class Server:
 
         # 将聚合后的参数加载回服务端模型，完成本轮全局模型更新。
         self.model.load_state_dict(aggregated_state)
+
+        history_summary = getattr(self.aggregator, "last_history_wolf_summary", None)
+        if history_summary:
+            self.logger.info(f"--history_wolf_summary : {history_summary}\n")
 
         # 打印当前聚合方法和客户端样本数，方便检查实验配置。
         self.logger.info(f"--aggregation_method : {self.args.agg_method}\n")

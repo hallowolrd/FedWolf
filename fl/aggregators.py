@@ -4,6 +4,8 @@ from abc import ABC, abstractmethod
 
 import torch
 
+from fl.history_wolf_filter import HistoryWolfExpertFilter
+
 
 # 从模型参数名中解析 expert 所在的 block 层号和 expert 编号。
 # 典型 key 形如：blocks.0.ffn.experts.3.xxx
@@ -58,6 +60,10 @@ _SPLIT_EXPERT_AGG_ALIASES = {
     "fisher": "fisher_raw_score",
     "fisher_raw_score": "fisher_raw_score",
     "fedwolf_fisher_only": "fisher_raw_score",
+    "history_wolf_filter": "history_wolf_filter",
+    "fedwolf_history_wolf": "history_wolf_filter",
+    "fisher_history_wolf": "fisher_history_wolf",
+    "fedwolf_fisher_history_wolf": "fisher_history_wolf",
 }
 _SPLIT_LEGACY_AGG_METHOD_MAP = {
     "fedavg": ("sample_weighted_avg", "sample_weighted_avg"),
@@ -65,6 +71,12 @@ _SPLIT_LEGACY_AGG_METHOD_MAP = {
     "expert_fedavg": ("sample_weighted_avg", "expert_usage"),
     "expert_equal_avg": ("sample_weighted_avg", "equal_avg"),
     "fedwolf_fisher_only": ("sample_weighted_avg", "fisher_raw_score"),
+    "fedwolf_history_wolf": ("sample_weighted_avg", "history_wolf_filter"),
+    "fedwolf_fisher_history_wolf": ("sample_weighted_avg", "fisher_history_wolf"),
+}
+HISTORY_WOLF_EXPERT_AGG_METHODS = {
+    "history_wolf_filter",
+    "fisher_history_wolf",
 }
 
 
@@ -116,13 +128,28 @@ class SplitAggregator(Aggregator):
     def __init__(self, args=None):
         self.non_expert_agg_method, self.expert_agg_method = _get_split_agg_methods(args)
         self.eps = float(getattr(args, "fedwolf_eps", 1e-8))
+        self.history_wolf_filter = HistoryWolfExpertFilter(args, eps=self.eps)
+        self._history_wolf_weights_cache = None
 
     def aggregate(self, client_updates, client_weights, global_model=None, **kwargs):
         self._validate_inputs(client_updates, client_weights)
+        self._history_wolf_weights_cache = None
 
         client_stats = kwargs.get("client_stats")
         if client_stats is None:
             client_stats = kwargs.get("expert_weights")
+
+        is_history_wolf_method = self.expert_agg_method in HISTORY_WOLF_EXPERT_AGG_METHODS
+        global_state = None
+
+        if is_history_wolf_method:
+            global_state = global_model.state_dict() if global_model is not None else None
+            if global_state is None:
+                raise ValueError(
+                    "history_wolf_filter requires global_state for expert delta computation."
+                )
+            if client_stats is None:
+                raise ValueError("history_wolf_filter requires client_stats.")
 
         if self._expert_method_needs_stats():
             if client_stats is None:
@@ -132,7 +159,19 @@ class SplitAggregator(Aggregator):
             if len(client_stats) != len(client_updates):
                 raise ValueError("client expert stats and client_updates must have the same length")
 
-        global_state = global_model.state_dict() if global_model is not None else None
+        if not is_history_wolf_method:
+            global_state = global_model.state_dict() if global_model is not None else None
+
+        if is_history_wolf_method:
+            expert_keys_by_ref = self._collect_expert_keys_by_ref(client_updates[0].keys())
+            self._history_wolf_weights_cache = self.history_wolf_filter.compute_weights(
+                client_updates=client_updates,
+                client_stats=client_stats,
+                global_state=global_state,
+                expert_keys_by_ref=expert_keys_by_ref,
+                use_fisher=(self.expert_agg_method == "fisher_history_wolf"),
+            )
+
         aggregated_state = collections.OrderedDict()
 
         for key in client_updates[0].keys():
@@ -167,6 +206,34 @@ class SplitAggregator(Aggregator):
 
         return aggregated_state
 
+    @property
+    def last_history_wolf_summary(self):
+        if hasattr(self, "history_wolf_filter"):
+            return getattr(self.history_wolf_filter, "last_summary", None)
+        return None
+
+    def state_dict(self):
+        state = {}
+        if hasattr(self, "history_wolf_filter"):
+            state["history_wolf_filter"] = self.history_wolf_filter.state_dict()
+        return state
+
+    def load_state_dict(self, state):
+        if not state:
+            return
+        if hasattr(self, "history_wolf_filter"):
+            self.history_wolf_filter.load_state_dict(
+                state.get("history_wolf_filter", {})
+            )
+
+    def _collect_expert_keys_by_ref(self, keys):
+        expert_keys_by_ref = collections.defaultdict(list)
+        for key in keys:
+            expert_ref = parse_expert_ref_from_key(key)
+            if expert_ref is not None:
+                expert_keys_by_ref[expert_ref].append(key)
+        return dict(expert_keys_by_ref)
+
     def _validate_inputs(self, client_updates, client_weights):
         if len(client_updates) == 0:
             raise ValueError("SplitAggregator requires at least one client update")
@@ -182,7 +249,9 @@ class SplitAggregator(Aggregator):
                 raise ValueError("sample-weighted aggregation requires positive client weights")
 
     def _expert_method_needs_stats(self):
-        return self.expert_agg_method in {"expert_usage", "fisher_raw_score"}
+        return self.expert_agg_method in (
+            {"expert_usage", "fisher_raw_score"} | HISTORY_WOLF_EXPERT_AGG_METHODS
+        )
 
     def _get_non_expert_weights(self, client_weights):
         if self.non_expert_agg_method == "equal_avg":
@@ -197,6 +266,18 @@ class SplitAggregator(Aggregator):
             return [1.0 for _ in client_weights], False
         if self.expert_agg_method == "sample_weighted_avg":
             return [float(weight) for weight in client_weights], False
+
+        if self.expert_agg_method in HISTORY_WOLF_EXPERT_AGG_METHODS:
+            if self._history_wolf_weights_cache is None:
+                raise RuntimeError(
+                    "History-WoLF weights cache is empty. compute_weights must be called "
+                    "before per-key aggregation."
+                )
+            weights = self._history_wolf_weights_cache.get(
+                expert_ref,
+                [0.0 for _ in client_weights],
+            )
+            return weights, False
 
         layer_id, expert_id = expert_ref
         if self.expert_agg_method == "expert_usage":

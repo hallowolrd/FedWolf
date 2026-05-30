@@ -63,6 +63,10 @@ _EXPERT_AGG_ALIASES = {
     "fisher": "fisher_raw_score",
     "fisher_raw_score": "fisher_raw_score",
     "fedwolf_fisher_only": "fisher_raw_score",
+    "history_wolf_filter": "history_wolf_filter",
+    "fedwolf_history_wolf": "history_wolf_filter",
+    "fisher_history_wolf": "fisher_history_wolf",
+    "fedwolf_fisher_history_wolf": "fisher_history_wolf",
 }
 _LEGACY_AGG_METHOD_MAP = {
     "fedavg": ("sample_weighted_avg", "sample_weighted_avg"),
@@ -70,6 +74,8 @@ _LEGACY_AGG_METHOD_MAP = {
     "expert_fedavg": ("sample_weighted_avg", "expert_usage"),
     "expert_equal_avg": ("sample_weighted_avg", "equal_avg"),
     "fedwolf_fisher_only": ("sample_weighted_avg", "fisher_raw_score"),
+    "fedwolf_history_wolf": ("sample_weighted_avg", "history_wolf_filter"),
+    "fedwolf_fisher_history_wolf": ("sample_weighted_avg", "fisher_history_wolf"),
 }
 _SPLIT_AGG_METHOD_NAME_MAP = {
     value: key
