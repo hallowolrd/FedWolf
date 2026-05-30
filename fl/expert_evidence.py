@@ -21,6 +21,16 @@ FISHER_SCORE_MODE_ALIASES = {
     "sum_raw": "trace_raw",
 }
 
+# Fisher evidence 计算器别名表。
+FISHER_ESTIMATOR_ALIASES = {
+    "per_sample_backward": "per_sample_backward",
+    "per_sample": "per_sample_backward",
+    "linear_hook_token_fast": "linear_hook_token_fast",
+    "token_fast": "linear_hook_token_fast",
+    "linear_hook_sample_fast": "linear_hook_sample_fast",
+    "sample_fast": "linear_hook_sample_fast",
+}
+
 # 内部真正支持的 Fisher score 标准模式。
 FISHER_SCORE_MODES = (
     "mean_diag",
@@ -156,6 +166,20 @@ def canonicalize_fisher_score_mode(score_mode):
     return canonical_mode
 
 
+def canonicalize_fisher_estimator(estimator):
+    # 将用户配置的 Fisher evidence 计算器规范化成内部标准取值。
+    raw_estimator = "per_sample_backward" if estimator is None else str(estimator).strip().lower()
+    canonical_estimator = FISHER_ESTIMATOR_ALIASES.get(raw_estimator)
+    if canonical_estimator is None:
+        supported = ", ".join(sorted(FISHER_ESTIMATOR_ALIASES))
+        raise ValueError(
+            f"fedwolf_fisher_estimator must be one of: {supported}. "
+            f"Got {estimator!r}."
+        )
+
+    return canonical_estimator
+
+
 def compute_fisher_scalar_from_sums(
     grad_square_sum,
     param_count,
@@ -283,6 +307,34 @@ def _compute_per_sample_supervised_losses(criterion, outputs, labels):
     return _reduce_loss_to_per_sample(per_element_losses, batch_size)
 
 
+def _collect_expert_linear_entries(model, num_experts):
+    # 收集 expert 内部的 Linear 模块，用于 fast Fisher hook。
+    linear_entries = []
+    module_by_name = dict(model.named_modules())
+
+    for name, module in module_by_name.items():
+        if not isinstance(module, torch.nn.Linear):
+            continue
+
+        expert_ref = parse_expert_param_ref(name)
+        if expert_ref is None:
+            continue
+
+        layer_id, expert_id = expert_ref
+        if expert_id >= num_experts:
+            continue
+
+        parts = name.split(".")
+        experts_idx = parts.index("experts")
+        expert_module_name = ".".join(parts[: experts_idx + 2])
+        expert_module = module_by_name[expert_module_name]
+        block_prefix = ".".join(parts[experts_idx + 2:])
+
+        linear_entries.append((name, module, layer_id, expert_id, expert_module, block_prefix))
+
+    return linear_entries
+
+
 def compute_expert_fisher_evidence(
     model,
     data_loader,
@@ -294,6 +346,7 @@ def compute_expert_fisher_evidence(
     model_mode="eval",
     score_mode="mean_diag",
     debug_batches=0,
+    fisher_estimator="per_sample_backward",
 ):
     """Compute per-sample empirical diagonal Fisher scalar evidence for experts.
 
@@ -309,8 +362,9 @@ def compute_expert_fisher_evidence(
     if model_mode not in {"eval", "train"}:
         raise ValueError(f"model_mode must be either 'eval' or 'train', got {model_mode!r}.")
 
-    # 规范化 Fisher score 模式。
+    # 规范化 Fisher score 模式和 Fisher evidence 计算器。
     canonical_score_mode = canonicalize_fisher_score_mode(score_mode)
+    canonical_fisher_estimator = canonicalize_fisher_estimator(fisher_estimator)
 
     # debug_batches 小于 0 时按 0 处理。
     debug_batches = max(int(debug_batches), 0)
@@ -339,7 +393,9 @@ def compute_expert_fisher_evidence(
         "score_scientific_by_layer": {},
         "total_samples": 0,
         "num_batches": 0,
-        "fisher_estimator": "per_sample_empirical_diagonal_fisher",
+        "fisher_estimator": canonical_fisher_estimator,
+        "fisher_estimator_raw": fisher_estimator,
+        "fisher_estimator_impl": canonical_fisher_estimator,
         "fisher_score_mode": canonical_score_mode,
         "fisher_score_mode_raw": score_mode,
         "normalization": FISHER_SCORE_NORMALIZATION[canonical_score_mode],
@@ -359,6 +415,8 @@ def compute_expert_fisher_evidence(
         "score_trace_per_sample_by_layer": {},
         "score_trace_per_active_sample_by_layer": {},
         "score_trace_raw_by_layer": {},
+        "fast_fisher_active_token_count_by_layer": {},
+        "fast_fisher_active_sample_count_by_layer": {},
     }
 
     # 如果一个 expert 参数都没匹配到，说明模型结构或参数命名不符合预期。
@@ -393,7 +451,147 @@ def compute_expert_fisher_evidence(
     num_batches = 0
     total_samples = 0
 
+    hook_handles = []
+    activation_cache = {}
+    fast_batch_token_counts = {}
+    fast_sample_counted_experts = set()
+    fast_active_token_counts = {
+        layer_id: torch.zeros(num_experts, dtype=torch.long)
+        for layer_id in expert_entries
+    }
+    fast_active_sample_counts = {
+        layer_id: torch.zeros(num_experts, dtype=torch.long)
+        for layer_id in expert_entries
+    }
+
     try:
+        if canonical_fisher_estimator in {"linear_hook_token_fast", "linear_hook_sample_fast"}:
+            linear_entries = _collect_expert_linear_entries(model, num_experts)
+            diagnostics["fast_fisher_hooked_linear_count"] = len(linear_entries)
+            diagnostics["fast_fisher_hooked_linear_names"] = [
+                name for name, _, _, _, _, _ in linear_entries
+            ]
+            experts_with_net0 = {
+                (layer_id, expert_id)
+                for _, _, layer_id, expert_id, _, block_prefix in linear_entries
+                if block_prefix == "net.0"
+            }
+
+            def make_forward_hook(module_name, layer_id, expert_id):
+                def forward_hook(module, inputs, output):
+                    if not inputs or inputs[0] is None:
+                        return
+
+                    activation = inputs[0].detach()
+                    if activation.numel() == 0:
+                        return
+
+                    activation = activation.reshape(-1, activation.shape[-1])
+                    activation_cache.setdefault(module_name, []).append(activation)
+
+                    expert_key = (layer_id, expert_id)
+                    token_count = int(activation.size(0))
+                    fast_batch_token_counts[expert_key] = max(
+                        fast_batch_token_counts.get(expert_key, 0),
+                        token_count,
+                    )
+
+                return forward_hook
+
+            def make_backward_hook(module_name, layer_id, expert_id, expert_module, block_prefix):
+                def backward_hook(module, grad_input, grad_output):
+                    if not grad_output or grad_output[0] is None:
+                        return
+
+                    cached_activations = activation_cache.get(module_name)
+                    if not cached_activations:
+                        return
+
+                    activation = cached_activations.pop()
+                    delta = grad_output[0].detach()
+                    if delta.numel() == 0:
+                        return
+
+                    delta = delta.reshape(-1, delta.shape[-1])
+                    if delta.size(0) != activation.size(0):
+                        raise RuntimeError(
+                            f"{canonical_fisher_estimator} expected activation and grad_output to have "
+                            f"the same token dimension for {module_name}, got "
+                            f"{activation.size(0)} and {delta.size(0)}."
+                        )
+
+                    activation = activation.to(device=delta.device, dtype=delta.dtype)
+                    with torch.no_grad():
+                        if canonical_fisher_estimator == "linear_hook_token_fast":
+                            weight_grad_square_sum = torch.einsum(
+                                "to,ti->",
+                                delta.pow(2),
+                                activation.pow(2),
+                            )
+                            grad_square_sum = float(weight_grad_square_sum.detach().cpu())
+
+                            if module.bias is not None:
+                                grad_square_sum += float(delta.pow(2).sum().detach().cpu())
+
+                            score_sums[layer_id][expert_id] += grad_square_sum
+                            return
+
+                        sample_ids = getattr(expert_module, "_fedwolf_accepted_sample_ids", None)
+                        if sample_ids is None:
+                            raise ValueError(
+                                "linear_hook_sample_fast requires expert._fedwolf_accepted_sample_ids. "
+                                "Please expose accepted sample ids in TokenSwitchFFN.forward before using this estimator."
+                            )
+
+                        sample_ids = sample_ids.detach().to(device=delta.device).reshape(-1)
+                        if sample_ids.numel() != delta.size(0):
+                            raise RuntimeError(
+                                "linear_hook_sample_fast expected sample_ids to match token dimension for "
+                                f"{module_name}, got {sample_ids.numel()} and {delta.size(0)}."
+                            )
+
+                        grad_square_sum = 0.0
+                        unique_sample_ids = torch.unique(sample_ids, sorted=False)
+                        for sample_id in unique_sample_ids:
+                            sample_mask = sample_ids == sample_id
+                            delta_s = delta[sample_mask]
+                            activation_s = activation[sample_mask]
+                            sample_grad_w = torch.einsum("to,ti->oi", delta_s, activation_s)
+                            grad_square_sum += float(sample_grad_w.pow(2).sum().detach().cpu())
+                            if module.bias is not None:
+                                sample_grad_b = delta_s.sum(dim=0)
+                                grad_square_sum += float(sample_grad_b.pow(2).sum().detach().cpu())
+
+                        score_sums[layer_id][expert_id] += grad_square_sum
+
+                        expert_key = (layer_id, expert_id)
+                        if expert_key in experts_with_net0:
+                            should_count = block_prefix == "net.0"
+                        else:
+                            should_count = expert_key not in fast_sample_counted_experts
+
+                        if should_count:
+                            fast_sample_counted_experts.add(expert_key)
+                            token_count = int(sample_ids.numel())
+                            sample_count = int(unique_sample_ids.numel())
+                            samples_with_grad[layer_id][expert_id] += sample_count
+                            fast_active_token_counts[layer_id][expert_id] += token_count
+                            fast_active_sample_counts[layer_id][expert_id] += sample_count
+
+                return backward_hook
+
+            for module_name, module, layer_id, expert_id, expert_module, block_prefix in linear_entries:
+                hook_handles.append(
+                    module.register_forward_hook(
+                        make_forward_hook(module_name, layer_id, expert_id)
+                    )
+                )
+                hook_handles.append(
+                    module.register_full_backward_hook(
+                        make_backward_hook(module_name, layer_id, expert_id, expert_module, block_prefix)
+                    )
+                )
+
         for inputs, labels in data_loader:
             # 将数据移动到指定设备。
             inputs = inputs.to(device)
@@ -401,6 +599,9 @@ def compute_expert_fisher_evidence(
 
             # 清空旧梯度，避免和之前训练或上一个 batch 的梯度混在一起。
             model.zero_grad(set_to_none=True)
+            activation_cache.clear()
+            fast_batch_token_counts.clear()
+            fast_sample_counted_experts.clear()
 
             # 前向传播。
             result = model(inputs)
@@ -415,56 +616,86 @@ def compute_expert_fisher_evidence(
             num_batches += 1
             total_samples += batch_size
 
-            # Important:
-            # We intentionally compute grad(loss_i)^2 for each sample and then average.
-            # This is different from grad(mean_i loss_i)^2, which underestimates Fisher
-            # because gradients from different samples can cancel before squaring.
-            # 这里逐样本 backward，得到 grad(loss_i)^2 后再累计。
-            # 不能先对 batch loss 求平均再 backward，否则不同样本的梯度可能互相抵消。
-            for sample_idx in range(batch_size):
-                # 每个样本单独 backward 前都要清空梯度。
+            if canonical_fisher_estimator == "per_sample_backward":
+                # Important:
+                # We intentionally compute grad(loss_i)^2 for each sample and then average.
+                # This is different from grad(mean_i loss_i)^2, which underestimates Fisher
+                # because gradients from different samples can cancel before squaring.
+                # 这里逐样本 backward，得到 grad(loss_i)^2 后再累计。
+                # 不能先对 batch loss 求平均再 backward，否则不同样本的梯度可能互相抵消。
+                for sample_idx in range(batch_size):
+                    # 每个样本单独 backward 前都要清空梯度。
+                    model.zero_grad(set_to_none=True)
+
+                    # 除最后一个样本外，都需要保留计算图，供后续样本继续 backward。
+                    retain_graph = sample_idx < batch_size - 1
+
+                    # 对单个样本 loss 做反向传播。
+                    per_sample_losses[sample_idx].backward(retain_graph=retain_graph)
+
+                    # 遍历每层每个 expert，累计该 expert 参数的梯度平方和。
+                    for layer_id, experts in expert_entries.items():
+                        for expert_id, entries in experts.items():
+                            grad_square_sum = 0.0
+                            has_grad_param_count = 0
+                            none_grad_param_count = 0
+
+                            # 当前 expert 可能包含多个参数张量，例如 Linear weight / bias。
+                            for _, param in entries:
+                                if param.grad is not None:
+                                    # 累加当前参数张量的 grad^2 sum。
+                                    grad_square_sum += float(param.grad.detach().pow(2).sum().cpu())
+                                    has_grad_param_count += 1
+                                else:
+                                    # 记录没有梯度的参数数量，目前主要用于调试时理解代码。
+                                    none_grad_param_count += 1
+
+                            # 只要当前 expert 中至少一个参数有梯度，就认为该样本激活了该 expert 的梯度。
+                            if has_grad_param_count > 0:
+                                samples_with_grad[layer_id][expert_id] += 1
+
+                            # 累加当前样本对该 expert 的梯度平方和。
+                            score_sums[layer_id][expert_id] += grad_square_sum
+
+                # 只在前 debug_batches 个 batch 中记录简要调试信息。
+                if num_batches <= debug_batches:
+                    diagnostics["batch_grad_status"].append(
+                        {
+                            "batch_index": num_batches,
+                            "batch_size": int(batch_size),
+                            "sample_count": int(batch_size),
+                        }
+                    )
+            elif canonical_fisher_estimator in {"linear_hook_token_fast", "linear_hook_sample_fast"}:
+                # fast Fisher 一个 batch 只 backward 一次，hook 内累计 Linear Fisher。
+                per_sample_losses.sum().backward()
+
+                if canonical_fisher_estimator == "linear_hook_token_fast":
+                    for (layer_id, expert_id), token_count in fast_batch_token_counts.items():
+                        samples_with_grad[layer_id][expert_id] += int(token_count)
+
+                if num_batches <= debug_batches:
+                    diagnostics["batch_grad_status"].append(
+                        {
+                            "batch_index": num_batches,
+                            "batch_size": int(batch_size),
+                            "sample_count": int(batch_size),
+                        }
+                    )
+
+                activation_cache.clear()
+                fast_batch_token_counts.clear()
+                fast_sample_counted_experts.clear()
                 model.zero_grad(set_to_none=True)
-
-                # 除最后一个样本外，都需要保留计算图，供后续样本继续 backward。
-                retain_graph = sample_idx < batch_size - 1
-
-                # 对单个样本 loss 做反向传播。
-                per_sample_losses[sample_idx].backward(retain_graph=retain_graph)
-
-                # 遍历每层每个 expert，累计该 expert 参数的梯度平方和。
-                for layer_id, experts in expert_entries.items():
-                    for expert_id, entries in experts.items():
-                        grad_square_sum = 0.0
-                        has_grad_param_count = 0
-                        none_grad_param_count = 0
-
-                        # 当前 expert 可能包含多个参数张量，例如 Linear weight / bias。
-                        for _, param in entries:
-                            if param.grad is not None:
-                                # 累加当前参数张量的 grad^2 sum。
-                                grad_square_sum += float(param.grad.detach().pow(2).sum().cpu())
-                                has_grad_param_count += 1
-                            else:
-                                # 记录没有梯度的参数数量，目前主要用于调试时理解代码。
-                                none_grad_param_count += 1
-
-                        # 只要当前 expert 中至少一个参数有梯度，就认为该样本激活了该 expert 的梯度。
-                        if has_grad_param_count > 0:
-                            samples_with_grad[layer_id][expert_id] += 1
-
-                        # 累加当前样本对该 expert 的梯度平方和。
-                        score_sums[layer_id][expert_id] += grad_square_sum
-
-            # 只在前 debug_batches 个 batch 中记录简要调试信息。
-            if num_batches <= debug_batches:
-                diagnostics["batch_grad_status"].append(
-                    {
-                        "batch_index": num_batches,
-                        "batch_size": int(batch_size),
-                        "sample_count": int(batch_size),
-                    }
-                )
+            else:
+                raise ValueError(f"Unsupported Fisher estimator: {canonical_fisher_estimator!r}.")
     finally:
+        for handle in hook_handles:
+            handle.remove()
+        activation_cache.clear()
+        fast_batch_token_counts.clear()
+        fast_sample_counted_experts.clear()
+
         # 无论中间是否报错，都清空梯度，避免污染后续训练或评估。
         model.zero_grad(set_to_none=True)
 
@@ -477,6 +708,15 @@ def compute_expert_fisher_evidence(
     # 写入总样本数和 batch 数。
     diagnostics["total_samples"] = int(total_samples)
     diagnostics["num_batches"] = int(num_batches)
+    if canonical_fisher_estimator == "linear_hook_sample_fast":
+        diagnostics["fast_fisher_active_token_count_by_layer"] = {
+            str(layer_id): [int(value) for value in counts.tolist()]
+            for layer_id, counts in fast_active_token_counts.items()
+        }
+        diagnostics["fast_fisher_active_sample_count_by_layer"] = {
+            str(layer_id): [int(value) for value in counts.tolist()]
+            for layer_id, counts in fast_active_sample_counts.items()
+        }
 
     # 最终返回的 Fisher score。
     score_by_layer = {}

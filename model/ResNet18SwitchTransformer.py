@@ -157,6 +157,10 @@ class TokenSwitchFFN(nn.Module):
 
         # 逐个 expert 处理分配给自己的 token。
         for expert_id, expert in enumerate(self.experts):
+            # 清理上一轮 forward 临时挂载的 sample id，避免 stale state。
+            if hasattr(expert, "_fedwolf_accepted_sample_ids"):
+                delattr(expert, "_fedwolf_accepted_sample_ids")
+
             # 找到当前 expert 被分配到的 token 位置。
             token_positions = torch.nonzero(flat_indices == expert_id, as_tuple=False).flatten()
 
@@ -180,6 +184,7 @@ class TokenSwitchFFN(nn.Module):
 
             # 当前 expert 对分配给它的 token 做 FFN 计算。
             if accepted_positions.numel() > 0:
+                expert._fedwolf_accepted_sample_ids = (accepted_positions // num_tokens).detach()
                 expert_output = expert(flat_x[accepted_positions])
 
                 # Switch Transformer 中通常会用 router probability 对 expert 输出做缩放。

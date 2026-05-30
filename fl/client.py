@@ -120,6 +120,12 @@ class Client:
             "total_samples",
             "num_batches",
             "fisher_estimator",
+            "fisher_estimator_raw",
+            "fisher_estimator_impl",
+            "fast_fisher_hooked_linear_count",
+            "fast_fisher_hooked_linear_names",
+            "fast_fisher_active_token_count_by_layer",
+            "fast_fisher_active_sample_count_by_layer",
             "fisher_score_mode",
             "fisher_score_mode_raw",
             "normalization",
@@ -453,6 +459,7 @@ class Client:
             evidence_loader_mode = getattr(self.args, "fedwolf_evidence_loader_mode", "deterministic")
             evidence_model_mode = getattr(self.args, "fedwolf_evidence_model_mode", "eval")
             fisher_score_mode = getattr(self.args, "fedwolf_fisher_score_mode", "mean_diag")
+            fisher_estimator = getattr(self.args, "fedwolf_fisher_estimator", "per_sample_backward")
             fisher_debug_batches = getattr(self.args, "fedwolf_fisher_debug_batches", 0)
 
             # 根据配置选择 Fisher evidence 使用的数据加载器。
@@ -463,7 +470,8 @@ class Client:
                 f"--client: {self.client_id} "
                 f"--fedwolf_evidence_loader_mode : {evidence_loader_mode} "
                 f"--fedwolf_evidence_model_mode : {evidence_model_mode} "
-                f"--fedwolf_fisher_score_mode : {fisher_score_mode}"
+                f"--fedwolf_fisher_score_mode : {fisher_score_mode} "
+                f"--fedwolf_fisher_estimator : {fisher_estimator}"
             )
 
             # 计算当前客户端本地模型中每层每个 expert 的 Fisher evidence。
@@ -478,6 +486,7 @@ class Client:
                 model_mode=evidence_model_mode,
                 score_mode=fisher_score_mode,
                 debug_batches=fisher_debug_batches,
+                fisher_estimator=fisher_estimator,
             )
 
             # 将 Fisher score 转成科学计数法字符串，避免日志中小数过小看不清。
