@@ -128,7 +128,9 @@ class SplitAggregator(Aggregator):
     def __init__(self, args=None):
         self.non_expert_agg_method, self.expert_agg_method = _get_split_agg_methods(args)
         self.eps = float(getattr(args, "fedwolf_eps", 1e-8))
+        # History-WoLF 需要跨轮保存 mu/P 历史，因此聚合器持有同一个 filter 实例。
         self.history_wolf_filter = HistoryWolfExpertFilter(args, eps=self.eps)
+        # 每轮聚合开始前清空；本轮内按 expert_ref 复用，避免同一 expert 多个参数重复更新历史。
         self._history_wolf_weights_cache = None
 
     def aggregate(self, client_updates, client_weights, global_model=None, **kwargs):
@@ -142,6 +144,7 @@ class SplitAggregator(Aggregator):
         is_history_wolf_method = self.expert_agg_method in HISTORY_WOLF_EXPERT_AGG_METHODS
         global_state = None
 
+        # History-WoLF 要比较 client update 与当前 global state 的 expert delta。
         if is_history_wolf_method:
             global_state = global_model.state_dict() if global_model is not None else None
             if global_state is None:
@@ -163,6 +166,7 @@ class SplitAggregator(Aggregator):
             global_state = global_model.state_dict() if global_model is not None else None
 
         if is_history_wolf_method:
+            # 按 layer/expert 先分组参数 key，再一次性计算本轮 expert 权重。
             expert_keys_by_ref = self._collect_expert_keys_by_ref(client_updates[0].keys())
             self._history_wolf_weights_cache = self.history_wolf_filter.compute_weights(
                 client_updates=client_updates,
@@ -213,6 +217,7 @@ class SplitAggregator(Aggregator):
         return None
 
     def state_dict(self):
+        # checkpoint 只保存 filter 的历史状态，不保存本轮日志 summary/cache。
         state = {}
         if hasattr(self, "history_wolf_filter"):
             state["history_wolf_filter"] = self.history_wolf_filter.state_dict()
@@ -227,6 +232,7 @@ class SplitAggregator(Aggregator):
             )
 
     def _collect_expert_keys_by_ref(self, keys):
+        # 只负责把参数名分桶到 (layer_id, expert_id)，不计算任何权重。
         expert_keys_by_ref = collections.defaultdict(list)
         for key in keys:
             expert_ref = parse_expert_ref_from_key(key)
@@ -268,6 +274,7 @@ class SplitAggregator(Aggregator):
             return [float(weight) for weight in client_weights], False
 
         if self.expert_agg_method in HISTORY_WOLF_EXPERT_AGG_METHODS:
+            # History-WoLF 权重必须来自本轮预计算 cache，禁止退化成 uniform/usage/Fisher。
             if self._history_wolf_weights_cache is None:
                 raise RuntimeError(
                     "History-WoLF weights cache is empty. compute_weights must be called "

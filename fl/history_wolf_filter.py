@@ -49,6 +49,7 @@ class HistoryWolfExpertFilter:
         weights_by_ref[(layer_id, expert_id)] = [w_client_0, w_client_1, ...]
         """
 
+        # 基础输入校验：filter 只产出 raw weights，不在这里做归一化。
         num_clients = len(client_updates)
         if num_clients == 0:
             self._update_summary(
@@ -70,6 +71,7 @@ class HistoryWolfExpertFilter:
             return {}
 
         weights_by_ref: dict[tuple[str, int], list[float]] = {}
+        # summary 只统计真正参与贡献的 client-expert，避免无效样本污染均值。
         summary_values: dict[str, list[float]] = {
             "usage_conf": [],
             "q": [],
@@ -85,9 +87,11 @@ class HistoryWolfExpertFilter:
             "fisher_multiplier": [],
         }
         valid_contrib_count = 0
+        skipped_zero_delta_count = 0
         fisher_all_zero_expert_count = 0
 
         with torch.no_grad():
+            # 每个 expert_ref 独立计算一组 client raw weights。
             for expert_ref, param_keys in expert_keys_by_ref.items():
                 layer_id, expert_id = expert_ref
                 weights = [0.0 for _ in range(num_clients)]
@@ -95,6 +99,7 @@ class HistoryWolfExpertFilter:
                     weights_by_ref[expert_ref] = weights
                     continue
 
+                # usage 只用于判断观测是否可信，并不直接进入 q_i 质量分。
                 usages = [
                     self._get_expert_usage(stats, layer_id, expert_id)
                     for stats in client_stats
@@ -109,6 +114,7 @@ class HistoryWolfExpertFilter:
                     weights_by_ref[expert_ref] = weights
                     continue
 
+                # 用相对 usage 得到置信度 u_i；高 usage 不超过 1，低 usage 会降低最终 raw weight。
                 valid_usages = [usages[client_index] for client_index in valid_indices]
                 median_usage = statistics.median(valid_usages)
                 usage_conf_by_client = {
@@ -120,6 +126,7 @@ class HistoryWolfExpertFilter:
                     for client_index in valid_indices
                 }
 
+                # 逐参数流式计算 delta norm，不拼接大向量，降低额外内存占用。
                 delta_by_client: dict[int, dict[str, Any]] = {}
                 delta_norm_by_client: dict[int, float] = {}
                 total_delta_by_key: dict[str, Any] = {}
@@ -146,41 +153,67 @@ class HistoryWolfExpertFilter:
                     delta_by_client[client_index] = client_delta_by_key
                     delta_norm_by_client[client_index] = math.sqrt(max(norm_sq, 0.0))
 
+                # near-zero delta 表示该 client-expert 基本没有实际更新：权重为 0，且不更新历史。
+                contributing_indices = []
+                for client_index in valid_indices:
+                    delta_norm = delta_norm_by_client[client_index]
+                    if delta_norm <= self.eps or not self._is_finite(delta_norm):
+                        weights[client_index] = 0.0
+                        skipped_zero_delta_count += 1
+                        continue
+                    contributing_indices.append(client_index)
+
+                if not contributing_indices:
+                    weights_by_ref[expert_ref] = weights
+                    continue
+
+                # leave-one-out 方向分只使用真正有更新的贡献者，避免 no-op 稀释参考方向。
+                total_delta_by_key = {}
+                for client_index in contributing_indices:
+                    for key, delta in delta_by_client[client_index].items():
+                        if key in total_delta_by_key:
+                            total_delta_by_key[key] = total_delta_by_key[key] + delta
+                        else:
+                            total_delta_by_key[key] = delta.clone()
+
+                # magnitude health 只惩罚异常大的更新，参考尺度来自有效 delta 的中位数。
                 valid_norms = [
                     delta_norm_by_client[client_index]
-                    for client_index in valid_indices
+                    for client_index in contributing_indices
                     if self._is_finite(delta_norm_by_client[client_index])
                 ]
                 median_norm = statistics.median(valid_norms) if valid_norms else 0.0
+                # fisher_history_wolf 只在 filter raw weight 之后乘 sqrt multiplier，不覆盖滤波器判断。
                 fisher_scores = {
                     client_index: self._get_fisher_score(
                         client_stats[client_index],
                         layer_id,
                         expert_id,
                     )
-                    for client_index in valid_indices
+                    for client_index in contributing_indices
                 }
                 fisher_multipliers = self._get_fisher_multipliers(
                     fisher_scores=fisher_scores,
-                    valid_indices=valid_indices,
+                    valid_indices=contributing_indices,
                     use_fisher=use_fisher,
                 )
-                if use_fisher and all(fisher_scores[index] <= 0 for index in valid_indices):
+                if use_fisher and all(fisher_scores[index] <= 0 for index in contributing_indices):
                     fisher_all_zero_expert_count += 1
 
-                for client_index in valid_indices:
+                for client_index in contributing_indices:
                     usage_conf = usage_conf_by_client[client_index]
                     delta_norm = delta_norm_by_client[client_index]
                     direction = self._compute_direction_score(
                         client_delta_by_key=delta_by_client[client_index],
                         total_delta_by_key=total_delta_by_key,
                         delta_norm=delta_norm,
-                        num_valid_clients=len(valid_indices),
+                        num_valid_clients=len(contributing_indices),
                     )
                     magnitude = self._compute_magnitude_health(
                         delta_norm=delta_norm,
                         median_norm=median_norm,
                     )
+                    # 当前质量 q_i 由方向一致性和幅度健康度组合；usage 不参与 q_i。
                     q_value = self._clip(
                         self.direction_weight * direction
                         + self.magnitude_weight * magnitude,
@@ -188,6 +221,7 @@ class HistoryWolfExpertFilter:
                         1.0,
                     )
 
+                    # mu/P 是每个 client-layer-expert 的跨轮可靠性状态。
                     history_key = (client_index, str(layer_id), int(expert_id))
                     mu_old = self._clip(
                         self._as_finite_float(
@@ -205,12 +239,14 @@ class HistoryWolfExpertFilter:
                         self.p_min,
                         self.p_max,
                     )
+                    # 先使用预测态 mu_pred/p_pred 计算本轮权重，再用观测 q_i 更新历史。
                     mu_pred = mu_old
                     p_pred = self._clip(
                         p_old + max(self.process_noise, 0.0),
                         self.p_min,
                         self.p_max,
                     )
+                    # usage_conf 越高，观测噪声越小；WoLF omega 会软抑制大残差。
                     obs_noise = max(self.obs_noise, self.eps) / (usage_conf + self.eps)
                     residual = (q_value - mu_pred) / math.sqrt(
                         p_pred + obs_noise + self.eps
@@ -237,6 +273,7 @@ class HistoryWolfExpertFilter:
                     self.history_mu[history_key] = mu_new
                     self.history_p[history_key] = p_new
 
+                    # P 越小代表历史越可信；P 大时 mu_eff 回到 0.5 的中性可靠性。
                     history_conf = 1.0 - self._clip(p_pred / self.p_max, 0.0, 1.0)
                     mu_eff = history_conf * mu_pred + (1.0 - history_conf) * 0.5
                     filter_raw = usage_conf * (
@@ -247,6 +284,7 @@ class HistoryWolfExpertFilter:
                     if not self._is_finite(filter_raw) or filter_raw < 0:
                         filter_raw = 0.0
 
+                    # filter-only 时 multiplier 为 1；fisher 组合模式只做温和缩放。
                     fisher_multiplier = fisher_multipliers[client_index]
                     final_raw = filter_raw * fisher_multiplier
                     if not self._is_finite(final_raw) or final_raw < 0:
@@ -277,6 +315,7 @@ class HistoryWolfExpertFilter:
             valid_contrib_count=valid_contrib_count,
             summary_values=summary_values,
             fisher_all_zero_expert_count=fisher_all_zero_expert_count,
+            skipped_zero_delta_count=skipped_zero_delta_count,
         )
         return weights_by_ref
 
@@ -294,6 +333,7 @@ class HistoryWolfExpertFilter:
         self.history_p = dict(state.get("history_p") or {})
 
     def _get_expert_usage(self, stats: dict[str, Any], layer_id: str, expert_id: int) -> float:
+        # 兼容 client_stats 的新旧结构，缺失或非法值都按 0 usage 处理。
         value = None
         if isinstance(stats, dict):
             layer_stats_by_layer = stats.get("expert_stats_by_layer") or {}
@@ -341,6 +381,7 @@ class HistoryWolfExpertFilter:
         global_state: dict[str, Any],
         key: str,
     ) -> Any | None:
+        # 只比较双方都存在的浮点参数；buffer/整数状态直接跳过。
         if key not in client_update or key not in global_state:
             return None
 
@@ -366,6 +407,7 @@ class HistoryWolfExpertFilter:
         delta_norm: float,
         num_valid_clients: int,
     ) -> float:
+        # 单个贡献者或参考方向过小时，没有可靠方向信号，返回中性分。
         if num_valid_clients < 2 or delta_norm <= self.eps:
             return 0.5
 
@@ -434,13 +476,16 @@ class HistoryWolfExpertFilter:
         valid_contrib_count: int = 0,
         summary_values: dict[str, list[float]] | None = None,
         fisher_all_zero_expert_count: int = 0,
+        skipped_zero_delta_count: int = 0,
     ) -> None:
+        # summary 只保存 Python 标量，便于 server 日志打印和 checkpoint 外使用。
         summary_values = summary_values or {}
         self.last_summary = {
             "num_experts": int(num_experts),
             "num_clients": int(num_clients),
             "use_fisher": bool(use_fisher),
             "valid_contrib_count": int(valid_contrib_count),
+            "skipped_zero_delta_count": int(skipped_zero_delta_count),
             "mean_usage_conf": self._safe_mean(summary_values.get("usage_conf", [])),
             "mean_q": self._safe_mean(summary_values.get("q", [])),
             "mean_direction": self._safe_mean(summary_values.get("direction", [])),
