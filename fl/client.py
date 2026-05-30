@@ -9,9 +9,8 @@ from model import build_model_from_args
 from utils.utils import record_result
 
 
-# 需要计算 Fisher evidence 的聚合方法集合。
-# 当前只有 fedwolf_fisher_only 会在客户端训练结束后额外计算 expert Fisher score。
-FISHER_EVIDENCE_AGG_METHODS = {"fedwolf_fisher_only"}
+# 只有专家参数按 Fisher raw score 聚合时，客户端才需要额外计算 Fisher evidence。
+FISHER_EVIDENCE_EXPERT_AGG_METHODS = {"fisher_raw_score"}
 
 
 class Client:
@@ -86,8 +85,11 @@ class Client:
         self.logger = logger
 
     def should_compute_fisher_evidence(self):
-        # 判断当前聚合方法是否需要客户端额外计算 Fisher evidence。
-        return getattr(self.args, "agg_method", None) in FISHER_EVIDENCE_AGG_METHODS
+        # 判断专家聚合策略是否需要客户端额外计算 Fisher evidence。
+        return (
+            getattr(self.args, "expert_agg_method", None)
+            in FISHER_EVIDENCE_EXPERT_AGG_METHODS
+        )
 
     def get_fisher_data_loader(self):
         # 选择用于 Fisher evidence 估计的数据加载器。
@@ -517,7 +519,8 @@ class Client:
             # 当前聚合方法不需要 Fisher evidence 时，只打印跳过信息。
             self.logger.info(
                 f"--client: {self.client_id} "
-                f"--skip_expert_fisher_evidence : agg_method={getattr(self.args, 'agg_method', None)}"
+                "--skip_expert_fisher_evidence : "
+                f"expert_agg_method={getattr(self.args, 'expert_agg_method', None)}"
             )
 
         # 获取训练结束后的本地模型参数快照。

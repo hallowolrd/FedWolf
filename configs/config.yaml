@@ -34,7 +34,6 @@ model:
   # resnet18_switch_transformer = ResNet-18 backbone + Transformer
   model_type: resnet18_switch_transformer
 
-
   # 每个 Switch FFN 中的专家数量
   num_experts: 4
 
@@ -42,7 +41,7 @@ model:
   dropout: 0.1
 
   # 优化器学习率
-  learning_rate: 0.0005
+  learning_rate: 0.05
 
   # token / hidden 的嵌入维度
   embed_dim: 128
@@ -96,13 +95,17 @@ train:
   # true: 调试/兼容旧流程时保存客户端模型。
   save_client_models: false
 
-  # 聚合方法：
-  # - fedavg: 全模型按客户端样本数做 FedAvg
-  # - equal_avg: shared/router/expert 全部按客户端数等权平均
-  # - expert_fedavg: shared/router 按样本数 FedAvg，expert 按 expert usage/token usage 加权
-  # - expert_equal_avg: shared/router 按样本数 FedAvg，expert 按客户端数等权平均
-  # - fedwolf_fisher_only: shared/router FedAvg，expert 按 Fisher raw score s 加权
-  agg_method: fedavg
+  # 非专家参数聚合方法：
+  # - equal_avg: 客户端直接平均，不按样本数加权
+  # - sample_weighted_avg: 按客户端训练样本数加权平均
+  non_expert_agg_method: sample_weighted_avg
+
+  # 专家参数聚合方法：
+  # - equal_avg: 客户端直接平均，不按样本数加权
+  # - sample_weighted_avg: 按客户端训练样本数加权平均
+  # - expert_usage: 按该 layer/expert 的实际 token usage 加权
+  # - fisher_raw_score: 按客户端上传的 Fisher raw score s 加权
+  expert_agg_method: sample_weighted_avg
 
   # FedWoLF expert Fisher evidence 使用的数据加载模式：
   # - deterministic: 使用确定性 transform，不做随机增强，不 shuffle

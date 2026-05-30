@@ -26,8 +26,7 @@ class Server:
 
         self.args = args
 
-        # 根据配置 args.agg_method 构建对应的聚合器。
-        # 例如 fedavg / expert_fedavg / fedwolf_fisher_only 等。
+        # 根据非专家参数和专家参数的聚合策略构建聚合器。
         self.aggregator = build_aggregator(self.args)
 
         # 基础联邦训练配置。
@@ -151,7 +150,7 @@ class Server:
                 # 当前客户端总 expert 激活次数。
                 client_expert_usage = client_stats["expert_activations"].float().cpu()
 
-                # 保存当前客户端 expert 统计信息，供 expert_fedavg / fisher_only 等聚合方法使用。
+                # 保存当前客户端 expert 统计信息，供 usage / Fisher 等专家聚合策略使用。
                 round_client_expert_usages.append(client_stats)
 
                 # 累加到本轮总 expert usage。
@@ -324,12 +323,7 @@ class Server:
         return get_client_train_size(self.args, client_id, meta=self.partition_meta)
 
     def aggregation_by_method(self, client_states=None, client_sizes=None):
-        """ 聚合器接口：按当前配置的聚合方法执行参数聚合
-        - fedavg:对完整 state_dict 按客户端训练样本数加权平均；
-        - equal_avg:对完整 state_dict 按客户端数等权平均；
-        - expert_fedavg:普通层按客户端样本数聚合,专家层按每个 expert 实际处理样本数聚合；
-        - expert_equal_avg:普通层按客户端样本数聚合,专家层按客户端数等权平均；
-        - fedwolf_fisher_only:普通层按客户端样本数聚合,专家层按 Fisher score 聚合。 """
+        """聚合器接口：分别按非专家参数策略和专家参数策略执行参数聚合。"""
 
         if client_states is None:
             # 如果没有从内存传入客户端模型参数，就从磁盘读取每个客户端保存的 .pth。
@@ -352,28 +346,32 @@ class Server:
                 for id in self.clientsID_list
             ]
 
-        # 所有客户端训练样本数之和。
+        # 所有客户端训练样本数之和，样本数加权聚合会使用它。
         total_size = sum(client_sizes)
         if total_size <= 0:
-            raise ValueError("FedAvg requires at least one training sample across clients")
+            raise ValueError("Aggregation requires at least one training sample across clients")
 
         # 调用具体聚合器完成聚合。
         # client_updates：客户端本地训练后的模型参数；
         # client_weights：客户端训练样本数；
         # global_model：当前服务端模型，用于某些聚合方法在无有效更新时保留旧参数；
-        # expert_weights：客户端 expert usage / Fisher score 等统计信息。
-        fedavg_state = self.aggregator.aggregate(
+        # client_stats：客户端 expert usage / Fisher score 等统计信息。
+        client_stats = getattr(self, "last_client_expert_usages", None)
+        aggregated_state = self.aggregator.aggregate(
             client_updates=client_states,
             client_weights=client_sizes,
             global_model=self.model,
-            expert_weights=getattr(self, "last_client_expert_usages", None),
+            client_stats=client_stats,
+            expert_weights=client_stats,
         )
 
         # 将聚合后的参数加载回服务端模型，完成本轮全局模型更新。
-        self.model.load_state_dict(fedavg_state)
+        self.model.load_state_dict(aggregated_state)
 
         # 打印当前聚合方法和客户端样本数，方便检查实验配置。
         self.logger.info(f"--aggregation_method : {self.args.agg_method}\n")
+        self.logger.info(f"--non_expert_agg_method : {self.args.non_expert_agg_method}\n")
+        self.logger.info(f"--expert_agg_method : {self.args.expert_agg_method}\n")
         self.logger.info(f"--client_train_sizes : {client_sizes}\n")
 
     def aggregation(self, client_states=None, client_sizes=None):

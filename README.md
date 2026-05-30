@@ -60,21 +60,16 @@ CUDA_VISIBLE_DEVICES=1 python train.py --config configs/test1/config.yaml
 
 ## 支持的聚合方法
 
-在 `config.yaml` 的 `train.agg_method` 中切换：
+在 `config.yaml` 的 train section 中拆成两个字段切换：
 
-- `fedavg`
-  - 全模型按客户端训练样本数加权平均。
-- `equal_avg`
-  - 全模型按客户端数等权平均。
-- `expert_fedavg`
-  - shared/backbone/router/classifier 按客户端样本数 FedAvg。
-  - expert 参数按 expert usage / token usage 加权。
-- `expert_equal_avg`
-  - shared/backbone/router/classifier 按客户端样本数 FedAvg。
-  - expert 参数按客户端数等权平均。
-- `fedwolf_fisher_only`
-  - shared/backbone/router/classifier 按客户端样本数 FedAvg。
-  - expert 参数按客户端上传的 Fisher raw score `s` 加权。
+- `non_expert_agg_method`
+  - `equal_avg`：非 expert 参数按客户端数等权平均。
+  - `sample_weighted_avg`：非 expert 参数按客户端训练样本数加权平均。
+- `expert_agg_method`
+  - `equal_avg`：expert 参数按客户端数等权平均。
+  - `sample_weighted_avg`：expert 参数按客户端训练样本数加权平均。
+  - `expert_usage`：expert 参数按对应 layer/expert 的 expert usage / token usage 加权。
+  - `fisher_raw_score`：expert 参数按客户端上传的 Fisher raw score `s` 加权。
 
 ## Fisher-only 流程
 
@@ -89,7 +84,7 @@ CUDA_VISIBLE_DEVICES=1 python train.py --config configs/test1/config.yaml
 
 服务端：
 
-1. shared/backbone/router/classifier 继续普通 FedAvg。
+1. 非 expert 参数按 `non_expert_agg_method` 聚合。
 2. expert 参数按 Fisher raw score `s` 加权得到 `Theta_bar`。
 3. 如果某个 expert 本轮 Fisher 总权重为 0，则保留旧 global expert，不用随机客户端参数覆盖。
 
@@ -97,8 +92,8 @@ CUDA_VISIBLE_DEVICES=1 python train.py --config configs/test1/config.yaml
 
 Fisher evidence 参数放在 `config.yaml` 的 `train` section：
 
-- `agg_method`
-  - 可选：`fedavg`、`equal_avg`、`expert_fedavg`、`expert_equal_avg`、`fedwolf_fisher_only`
+- `expert_agg_method`
+  - 设为 `fisher_raw_score` 时会额外计算 Fisher evidence
 - `fedwolf_evidence_loader_mode`
   - 可选：`deterministic`、`train_loader`
   - 默认 `deterministic`：使用同一份客户端 `client_train_indices`，但采用 `ToTensor + Normalize` 的确定性 transform，不做 `RandomCrop` / `RandomHorizontalFlip`，并且 `shuffle=False`
@@ -125,7 +120,7 @@ Fisher evidence 参数放在 `config.yaml` 的 `train` section：
 - 切 CIFAR10 / CIFAR100：修改当前 `config.yaml` 的 `data.data_name`
 - 改 `alpha`：修改当前 `config.yaml` 的 `data.alpha`
 - 改客户端数量：修改当前 `config.yaml` 的 `data.num_clients`
-- 切聚合方法：修改当前 `config.yaml` 的 `train.agg_method`，可选 `fedavg`、`equal_avg`、`expert_fedavg`、`expert_equal_avg`、`fedwolf_fisher_only`
+- 切聚合方法：修改当前 `config.yaml` 的 `train.non_expert_agg_method` 和 `train.expert_agg_method`
 - 开新实验：复制一个 `config.yaml`，并修改 `train.run_name`
 - 故意覆盖旧实验：保留同一个 `run_name`，并设置 `train.allow_overwrite: true`
 - 切模型：修改当前 `config.yaml` 的 `model.model_type`
@@ -195,28 +190,33 @@ allow_overwrite: false
 依次测试：
 
 ```yaml
-agg_method: fedavg
+non_expert_agg_method: sample_weighted_avg
+expert_agg_method: sample_weighted_avg
 run_name: smoke_fedavg
 ```
 
 ```yaml
-agg_method: equal_avg
+non_expert_agg_method: equal_avg
+expert_agg_method: equal_avg
 run_name: smoke_equal_avg
 ```
 
 ```yaml
-agg_method: expert_fedavg
-run_name: smoke_expert_fedavg
+non_expert_agg_method: sample_weighted_avg
+expert_agg_method: expert_usage
+run_name: smoke_expert_usage
 ```
 
 ```yaml
-agg_method: expert_equal_avg
+non_expert_agg_method: sample_weighted_avg
+expert_agg_method: equal_avg
 run_name: smoke_expert_equal_avg
 ```
 
 ```yaml
-agg_method: fedwolf_fisher_only
-run_name: smoke_fedwolf_fisher_only
+non_expert_agg_method: sample_weighted_avg
+expert_agg_method: fisher_raw_score
+run_name: smoke_fisher_raw_score
 ```
 
 如果修改了 `train.run_name`，输出目录会变化；直接运行 `train.py` 时会为该 run 自动检查并生成 partition。
@@ -285,7 +285,7 @@ CSV 和日志文件名都会包含：
 - `num_clients`
 - `alpha`
 - `seed`
-- `agg_method`
+- 派生的 `agg_method`
 - `run_name`
 
 Fisher-only 日志中可观察：

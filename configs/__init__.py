@@ -28,7 +28,6 @@ _REQUIRED_CONFIG_KEYS = (
     "client_epochs",
     "device",
     "run_name",
-    "agg_method",
     "model_type",
     "num_experts",
     "dropout",
@@ -44,6 +43,37 @@ _REQUIRED_CONFIG_KEYS = (
 )
 _DEFAULT_SAVE_ROOT = "save"
 _DEFAULT_ALLOW_OVERWRITE = False
+_NON_EXPERT_AGG_ALIASES = {
+    "equal_avg": "equal_avg",
+    "direct_avg": "equal_avg",
+    "fedavg": "sample_weighted_avg",
+    "sample_weighted": "sample_weighted_avg",
+    "sample_weighted_avg": "sample_weighted_avg",
+}
+_EXPERT_AGG_ALIASES = {
+    "equal_avg": "equal_avg",
+    "direct_avg": "equal_avg",
+    "fedavg": "sample_weighted_avg",
+    "sample_weighted": "sample_weighted_avg",
+    "sample_weighted_avg": "sample_weighted_avg",
+    "expert_usage": "expert_usage",
+    "token_usage": "expert_usage",
+    "expert_fedavg": "expert_usage",
+    "fisher": "fisher_raw_score",
+    "fisher_raw_score": "fisher_raw_score",
+    "fedwolf_fisher_only": "fisher_raw_score",
+}
+_LEGACY_AGG_METHOD_MAP = {
+    "fedavg": ("sample_weighted_avg", "sample_weighted_avg"),
+    "equal_avg": ("equal_avg", "equal_avg"),
+    "expert_fedavg": ("sample_weighted_avg", "expert_usage"),
+    "expert_equal_avg": ("sample_weighted_avg", "equal_avg"),
+    "fedwolf_fisher_only": ("sample_weighted_avg", "fisher_raw_score"),
+}
+_SPLIT_AGG_METHOD_NAME_MAP = {
+    value: key
+    for key, value in _LEGACY_AGG_METHOD_MAP.items()
+}
 
 
 def _resolve_config_path(path_str: str) -> Path:
@@ -102,6 +132,77 @@ def _raise_if_missing_required_keys(merged_config: dict) -> None:
             f"Missing required config keys: {missing_keys}. "
             "Please check the config.yaml passed by --config."
         )
+
+
+def _normalize_agg_choice(value: object, aliases: dict[str, str], field_name: str) -> str:
+    normalized = str(value).strip().lower()
+    if normalized in aliases:
+        return aliases[normalized]
+
+    valid_values = sorted(set(aliases))
+    raise ValueError(f"`{field_name}` must be one of {valid_values}, got {value!r}.")
+
+
+def _split_legacy_agg_method(agg_method: object) -> tuple[str, str]:
+    normalized = str(agg_method).strip().lower()
+    if normalized in _LEGACY_AGG_METHOD_MAP:
+        return _LEGACY_AGG_METHOD_MAP[normalized]
+
+    valid_values = sorted(_LEGACY_AGG_METHOD_MAP)
+    raise ValueError(f"`agg_method` must be one of {valid_values}, got {agg_method!r}.")
+
+
+def _derive_agg_method_name(non_expert_method: str, expert_method: str) -> str:
+    return _SPLIT_AGG_METHOD_NAME_MAP.get(
+        (non_expert_method, expert_method),
+        f"nonexpert_{non_expert_method}_expert_{expert_method}",
+    )
+
+
+def _normalize_aggregation_config(merged_config: dict) -> None:
+    """Normalize split aggregation config while keeping legacy agg_method usable."""
+
+    has_non_expert = "non_expert_agg_method" in merged_config
+    has_expert = "expert_agg_method" in merged_config
+
+    if has_non_expert or has_expert:
+        if not has_non_expert or not has_expert:
+            raise ValueError(
+                "`non_expert_agg_method` and `expert_agg_method` must be set together."
+            )
+
+        non_expert_method = _normalize_agg_choice(
+            merged_config["non_expert_agg_method"],
+            _NON_EXPERT_AGG_ALIASES,
+            "non_expert_agg_method",
+        )
+        expert_method = _normalize_agg_choice(
+            merged_config["expert_agg_method"],
+            _EXPERT_AGG_ALIASES,
+            "expert_agg_method",
+        )
+
+        if "agg_method" in merged_config:
+            legacy_pair = _split_legacy_agg_method(merged_config["agg_method"])
+            if legacy_pair != (non_expert_method, expert_method):
+                raise ValueError(
+                    "`agg_method` conflicts with `non_expert_agg_method` and "
+                    "`expert_agg_method`. Remove `agg_method` or make the settings match."
+                )
+
+    elif "agg_method" in merged_config:
+        non_expert_method, expert_method = _split_legacy_agg_method(
+            merged_config["agg_method"]
+        )
+    else:
+        raise ValueError(
+            "Missing aggregation config. Set `non_expert_agg_method` and "
+            "`expert_agg_method` in the train section."
+        )
+
+    merged_config["non_expert_agg_method"] = non_expert_method
+    merged_config["expert_agg_method"] = expert_method
+    merged_config["agg_method"] = _derive_agg_method_name(non_expert_method, expert_method)
 
 
 def _sanitize_run_name(run_name: object) -> str:
@@ -226,6 +327,7 @@ def load_args(config_path: str):
     for _, section_config in section_items:
         merged_config.update(section_config)
 
+    _normalize_aggregation_config(merged_config)
     _raise_if_missing_required_keys(merged_config)
     _derive_output_paths(merged_config)
 
