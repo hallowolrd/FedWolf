@@ -65,8 +65,8 @@ class Client:
         self.criterion = nn.CrossEntropyLoss()
 
         # 客户端本地优化器。
-        # 当前使用 Adam，学习率来自配置 args.learning_rate。
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+        # 当前使用 SGD，学习率来自配置 args.learning_rate。
+        self.optimizer = optim.SGD(self.model.parameters(), lr=self.args.learning_rate)
 
         self.batch_size = self.args.batch_size
 
