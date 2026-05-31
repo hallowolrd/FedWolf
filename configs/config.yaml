@@ -41,7 +41,7 @@ model:
   dropout: 0.1
 
   # 优化器学习率
-  learning_rate: 0.2
+  learning_rate: 0.1
 
   # 词元 / 隐藏状态的嵌入维度
   embed_dim: 128
@@ -73,10 +73,10 @@ train:
   num_clients: 10
 
   # 服务端通信轮数，也就是全局训练轮数
-  server_epochs: 100
+  server_epochs: 50
 
   # 每轮中每个客户端本地训练的轮次
-  client_epochs: 1
+  client_epochs: 8
 
   # 训练设备，例如 CPU 或 CUDA
   device: cuda
@@ -98,7 +98,7 @@ train:
   # 非专家参数聚合方法：
   # - equal_avg: 客户端直接平均，不按样本数加权
   # - sample_weighted_avg: 按客户端训练样本数加权平均
-  non_expert_agg_method: sample_weighted_avg
+  non_expert_agg_method: equal_avg
 
   # 专家参数聚合方法：
   # - equal_avg: 客户端直接平均，不按样本数加权
@@ -107,7 +107,7 @@ train:
   # - fisher_raw_score: 按客户端上传的 Fisher 原始分数 s 加权
   # - history_wolf_filter: 按 History-WoLF 筛选器计算的可靠性权重聚合
   # - fisher_history_wolf: 在 History-WoLF 可靠性权重基础上结合 Fisher 证据聚合
-  expert_agg_method: sample_weighted_avg
+  expert_agg_method: equal_avg
 
   # History-WoLF 专家筛选器：
   # 供 expert_agg_method 的 history_wolf_filter / fisher_history_wolf 模式使用。
