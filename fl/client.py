@@ -208,10 +208,12 @@ class Client:
         self.model.load_state_dict(server_state_dict)
 
     def get_auxiliary_losses(self, result):
-        """ 从模型 forward 的结果字典中，取出额外损失项。 """
+        """ 从模型 forward 结果中取出额外损失项。 """
 
         # 如果模型没有返回某些辅助损失，就用 0 代替，保证后续计算不会报错。
         zero = torch.tensor(0.0, device=self.device)
+        if not isinstance(result, dict):
+            return zero, zero, zero
 
         # router_aux_loss 兼容旧字段 aux_loss。
         router_aux_loss = result.get("router_aux_loss", result.get("aux_loss", zero))
@@ -228,7 +230,7 @@ class Client:
         """ 从模型输出结果里拿到 expert 的激活/使用统计。
         如果模型没有返回这个字段，就用全零向量代替。 """
         
-        usage = result.get("expert_activations")
+        usage = result.get("expert_activations") if isinstance(result, dict) else None
         if usage is None:
             usage = torch.zeros(self.args.num_experts, device=self.device)
 
@@ -239,7 +241,7 @@ class Client:
         """ 从模型输出结果里读取平均 router 概率。
         如果没有，就返回全零向量。 """
 
-        probs = result.get("avg_router_probs")
+        probs = result.get("avg_router_probs") if isinstance(result, dict) else None
         if probs is None:
             probs = torch.zeros(self.args.num_experts, device=self.device)
 
@@ -253,6 +255,9 @@ class Client:
         如果没有，就尝试从：
         - expert_activations_by_layer
         构造一个简化版本。 """
+
+        if not isinstance(result, dict):
+            return {}
 
         # 新格式：每一层都有完整 expert 统计信息。
         layer_stats = result.get("expert_stats_by_layer")
@@ -345,11 +350,11 @@ class Client:
                 # 清空上一轮 batch 的梯度。
                 self.optimizer.zero_grad()
 
-                # 前向传播，result 是模型返回的字典。
+                # 前向传播，result 可以是字典，也可以直接是 logits。
                 result = self.model(inputs)
 
                 # logits 用于分类损失和准确率计算。
-                outputs = result["logits"]
+                outputs = result["logits"] if isinstance(result, dict) else result
 
                 # 取出 router 相关辅助损失。
                 extra_loss, router_aux_loss, router_z_loss = self.get_auxiliary_losses(result)

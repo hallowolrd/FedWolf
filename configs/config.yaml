@@ -32,6 +32,7 @@ data:
 model:
   # 模型类型：
   # resnet18_switch_transformer = ResNet-18 主干网络 + Transformer 模块
+  # resnet_sparse_moe_head = ResNet-18 主干网络 + 单层 Top-K Sparse MoE 分类头
   model_type: resnet18_switch_transformer
 
   # 每个 Switch FFN 中的专家数量
@@ -58,7 +59,9 @@ model:
   # 使用 MoE/Switch FFN 的层，采用字符串形式，例如 "1,3"
   moe_layers: "1,3"
 
-  # 每个词元选择的专家数量，当前项目实际按 top-1 使用
+  # 每个词元 / 样本选择的专家数量：
+  # - resnet18_switch_transformer 当前只支持 top_k: 1
+  # - resnet_sparse_moe_head 建议使用 top_k: 2
   top_k: 1
 
   # 词元网格边长：

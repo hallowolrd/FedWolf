@@ -7,31 +7,40 @@ import torch
 from fl.history_wolf_filter import HistoryWolfExpertFilter
 
 
-# 从模型参数名中解析 expert 所在的 block 层号和 expert 编号。
-# 典型 key 形如：blocks.0.ffn.experts.3.xxx
+# 从模型参数名中解析 expert 所在的层号和 expert 编号。
+# 典型 key 形如：blocks.0.ffn.experts.3.xxx 或 moe_head.experts.3.xxx
 # 返回值：
 # - 如果是 expert 参数：返回 (layer_id, expert_id)
 # - 如果不是 expert 参数：返回 None
 def parse_expert_ref_from_key(key):
     parts = key.split(".")
-    if "blocks" not in parts or "experts" not in parts:
+    if "experts" not in parts:
         return None
 
-    # 找到参数名中 blocks 和 experts 的位置。
-    blocks_idx = parts.index("blocks")
+    # 找到参数名中 experts 的位置。
     experts_idx = parts.index("experts")
 
-    # 确保 blocks 后面有 layer id，experts 后面有 expert id。
-    if blocks_idx + 1 >= len(parts) or experts_idx + 1 >= len(parts):
+    # 确保 experts 后面有 expert id。
+    if experts_idx + 1 >= len(parts):
         return None
 
-    # layer id 和 expert id 必须是数字，否则说明不是标准 expert 参数名。
-    if not parts[blocks_idx + 1].isdigit() or not parts[experts_idx + 1].isdigit():
+    # expert id 必须是数字，否则说明不是标准 expert 参数名。
+    if not parts[experts_idx + 1].isdigit():
+        return None
+
+    if "blocks" in parts:
+        blocks_idx = parts.index("blocks")
+        if blocks_idx + 1 >= len(parts) or not parts[blocks_idx + 1].isdigit():
+            return None
+        layer_id = parts[blocks_idx + 1]
+    elif parts[:experts_idx] == ["moe_head"]:
+        layer_id = "moe_head"
+    else:
         return None
 
     # layer_id 保持字符串形式，方便后面匹配统计字典中的 key；
     # expert_id 转成 int，方便作为列表/张量下标。
-    return parts[blocks_idx + 1], int(parts[experts_idx + 1])
+    return layer_id, int(parts[experts_idx + 1])
 
 
 class Aggregator(ABC):

@@ -348,9 +348,9 @@ class Server:
                 # 将输入和标签移动到评估设备。
                 inputs, labels = inputs.to(self.device), labels.to(self.device)
 
-                # 前向推理，模型返回字典，其中 logits 用于分类。
+                # 前向推理，兼容字典结果和直接返回的 logits。
                 result = self.model(inputs)
-                outputs = result["logits"]
+                outputs = result["logits"] if isinstance(result, dict) else result
 
                 # 计算当前 batch 的分类损失。
                 loss = self.criterion(outputs, labels)

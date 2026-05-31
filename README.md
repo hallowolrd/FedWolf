@@ -125,6 +125,7 @@ Fisher evidence 参数放在 `config.yaml` 的 `train` section：
 - 故意覆盖旧实验：保留同一个 `run_name`，并设置 `train.allow_overwrite: true`
 - 切模型：修改当前 `config.yaml` 的 `model.model_type`
   - `resnet18_switch_transformer`：ResNet-18 style backbone + Switch Transformer
+  - `resnet_sparse_moe_head`：ResNet-18 backbone + 单层 Top-K Sparse MoE 分类头；建议设置 `model.top_k: 2`
 - 改完会影响数据划分的配置后，可以直接运行 `train.py`。例如 `data.data_name`、`data.alpha`、`data.num_clients`、`data.seed`、`data.data_path` 变化时，`train.py` 会检测旧 partition 是否与当前 config 匹配，不匹配就自动重新生成。
 - 如果希望无论是否匹配都重新划分，加 `--force_repartition`。
 - 如果只改 `model` 或 `train` 中不影响数据划分的参数，partition 会被复用。
@@ -141,7 +142,7 @@ python train.py
 python train.py --config configs/test1/config.yaml
 ```
 
-这些模型当前都提供一致的 MoE 辅助接口，包括 expert/router state dict 提取和 parameter groups。
+`resnet18_switch_transformer` 提供 expert/router 统计接口。`resnet_sparse_moe_head` 是干净的 MoE-FedAvg baseline，forward 只返回 logits，不额外返回辅助损失或 router 统计。
 
 ## 运行顺序
 

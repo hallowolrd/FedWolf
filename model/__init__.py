@@ -1,14 +1,19 @@
-"""Model package.""" 
+"""Model package."""
+
+
+_DATASET_MODEL_CONFIGS = {
+    "cifar10": {"num_classes": 10, "in_channels": 3, "img_size": 32},
+    "cifar100": {"num_classes": 100, "in_channels": 3, "img_size": 32},
+    "tinyimagenet": {"num_classes": 200, "in_channels": 3, "img_size": 64},
+    "femnist": {"num_classes": 62, "in_channels": 1, "img_size": 28},
+}
 
 
 def get_num_classes(data_name):
     # 根据数据集名称返回分类类别数。
-    if data_name == "cifar10":
-        return 10
-
-    # CIFAR-100 有 100 个类别。
-    if data_name == "cifar100":
-        return 100
+    dataset_config = _DATASET_MODEL_CONFIGS.get(data_name)
+    if dataset_config is not None:
+        return dataset_config["num_classes"]
 
     # 如果传入的数据集名称不支持，直接报错，避免后续模型分类头维度错误。
     raise ValueError(f"Unsupported dataset: {data_name}")
@@ -46,6 +51,21 @@ def parse_moe_layers(moe_layers, depth):
 
 def build_model_from_args(args):
     """Build the project model from a single shared args-based code path."""
+
+    dataset_config = _DATASET_MODEL_CONFIGS.get(args.data_name)
+    if dataset_config is None:
+        raise ValueError(f"Unsupported dataset: {args.data_name}")
+
+    if args.model_type == "resnet_sparse_moe_head":
+        from model.ResNetSparseMoEHead import ResNetSparseMoEHead
+
+        return ResNetSparseMoEHead(
+            in_channels=dataset_config["in_channels"],
+            num_classes=dataset_config["num_classes"],
+            img_size=dataset_config["img_size"],
+            num_experts=args.num_experts,
+            top_k=args.top_k,
+        )
 
     # Transformer block 的总层数。
     depth = args.depth
