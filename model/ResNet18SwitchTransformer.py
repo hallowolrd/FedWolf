@@ -179,10 +179,13 @@ class TokenSwitchFFN(nn.Module):
                 expert._fedwolf_accepted_sample_ids = (accepted_positions // num_tokens).detach()
                 expert_output = expert(flat_x[accepted_positions])
 
-                # Switch Transformer 中通常会用 router probability 对 expert 输出做缩放。
-                flat_output[accepted_positions] = (
-                    expert_output * flat_top1_probs[accepted_positions].unsqueeze(-1)
-                )
+                # Straight-through hard gate:
+                # forward: hard_gate == 1, so selected expert output is not scaled down.
+                # backward: d(hard_gate)/d(top1_prob) == 1, so router still receives task gradients.
+                gate = flat_top1_probs[accepted_positions].unsqueeze(-1)
+                hard_gate = gate + (1.0 - gate).detach()
+
+                flat_output[accepted_positions] = expert_output * hard_gate
 
         # 恢复成原始 token 形状。
         output = flat_output.reshape(batch_size, num_tokens, embed_dim)
