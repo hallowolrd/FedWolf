@@ -60,7 +60,6 @@ class TokenSwitchFFN(nn.Module):
         router_jitter_noise=0.0,
         capacity_factor=1.25,
         min_capacity=4,
-        drop_tokens=True,
         top_k=1,
     ):
         super(TokenSwitchFFN, self).__init__()
@@ -75,14 +74,11 @@ class TokenSwitchFFN(nn.Module):
         # router_jitter_noise 用于训练时给 router 输入加轻微扰动，增加 routing 随机性。
         self.router_jitter_noise = router_jitter_noise
 
-        # capacity_factor 控制每个 expert 最多接收多少 token。
+        # capacity_factor 用于计算 overflow 诊断阈值，不限制 expert 实际处理的 token 数。
         self.capacity_factor = capacity_factor
 
-        # 每个 expert 的最小容量。
+        # 每个 expert 的最小 overflow 诊断阈值。
         self.min_capacity = min_capacity
-
-        # 如果某个 expert 分到的 token 超过容量，是否丢弃超出的 token。
-        self.drop_tokens = drop_tokens
 
         # expert 内部 FFN 的 hidden 维度。
         hidden_dim = int(embed_dim * mlp_ratio)
@@ -135,15 +131,15 @@ class TokenSwitchFFN(nn.Module):
         # 当前 batch 的 token 总数。
         total_tokens = max(batch_size * num_tokens, 1)
 
-        # 计算每个 expert 的容量上限。
-        # capacity_factor 越大，每个 expert 能接收的 token 越多。
+        # 计算每个 expert 的参考容量，仅用于观察 router 是否倾斜。
+        # 超过该阈值的 token 仍然会由对应 expert 正常处理。
         capacity = max(
             self.min_capacity,
             math.ceil(self.capacity_factor * total_tokens / self.num_experts),
         )
 
         # selected_counts 表示每个 expert 被 router 选中的 token 数。
-        # 注意：这是被选中的数量，不一定等于最终实际处理的数量，因为可能发生 overflow。
+        # 当前不做硬容量截断，因此它也等于 expert 实际处理的 token 数。
         selected_counts = torch.bincount(
             flat_indices,
             minlength=self.num_experts,
@@ -172,12 +168,8 @@ class TokenSwitchFFN(nn.Module):
             overflow_count = max(token_positions.numel() - capacity, 0)
             overflow_counts[expert_id] = overflow_count
 
-            # 如果 drop_tokens=True，则只保留 capacity 范围内的 token。
-            # 否则当前 expert 处理所有分配到的 token。
-            if self.drop_tokens:
-                accepted_positions = token_positions[:capacity]
-            else:
-                accepted_positions = token_positions
+            # 不做硬容量截断：当前 expert 处理 router 分配给它的全部 token。
+            accepted_positions = token_positions
 
             # 记录当前 expert 实际处理的 token 数。
             expert_activations[expert_id] = accepted_positions.numel()
@@ -235,7 +227,6 @@ class TransformerBlock(nn.Module):
         router_jitter_noise=0.0,
         capacity_factor=1.25,
         min_capacity=4,
-        drop_tokens=True,
         top_k=1,
         layer_id=0,
     ):
@@ -273,7 +264,6 @@ class TransformerBlock(nn.Module):
                 router_jitter_noise=router_jitter_noise,
                 capacity_factor=capacity_factor,
                 min_capacity=min_capacity,
-                drop_tokens=drop_tokens,
                 top_k=top_k,
             )
         else:
@@ -451,7 +441,6 @@ class ResNet18SwitchTransformer(nn.Module):
         router_jitter_noise=0.0,
         capacity_factor=1.25,
         min_capacity=4,
-        drop_tokens=True,
         top_k=1,
         stem_channels=None,
         token_grid_size=8,
@@ -521,7 +510,6 @@ class ResNet18SwitchTransformer(nn.Module):
                 router_jitter_noise=router_jitter_noise,
                 capacity_factor=capacity_factor,
                 min_capacity=min_capacity,
-                drop_tokens=drop_tokens,
                 top_k=top_k,
                 layer_id=layer_id,
             )

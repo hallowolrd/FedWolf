@@ -5,45 +5,45 @@ data:
   # 原始数据下载或读取目录
   data_path: ./data
 
-  # DataLoader 的 batch size
+  # 数据加载器的批大小
   batch_size: 64
 
-  # Dirichlet 分布参数，越小表示客户端间数据越不均匀；
-  # 官方 train 会全部按这个参数划分给各客户端
+  # 狄利克雷分布参数，越小表示客户端间数据越不均匀；
+  # 官方训练集会全部按这个参数划分给各客户端
   alpha: 0.1
 
   # 全局随机种子，控制数据划分和训练可复现性
   seed: 1
 
   # 索引划分协议文件名；
-  # 当前协议只保存 client_train_indices 和 global_test_indices
+  # 当前协议只保存 client_train_indices 和 global_test_indices 两类索引
   partition_meta_name: partition_meta.pt
 
   # 划分统计信息文件名；
-  # official test 由 server 持有，训练结束后只在 global_test 上评估一次
+  # 官方测试集由服务端持有，训练结束后只在 global_test 上评估一次
   partition_stats_name: partition_stats.json
 
-  # DataLoader 的子进程数量，0 表示主进程加载
+  # 数据加载器的子进程数量，0 表示由主进程加载
   num_workers: 16
 
-  # 是否为 DataLoader 开启 pinned memory，加速 CPU->GPU 拷贝
+  # 是否为数据加载器开启锁页内存，以加速 CPU 到 GPU 的拷贝
   pin_memory: true
 
 model:
   # 模型类型：
-  # resnet18_switch_transformer = ResNet-18 backbone + Transformer
+  # resnet18_switch_transformer = ResNet-18 主干网络 + Transformer 模块
   model_type: resnet18_switch_transformer
 
   # 每个 Switch FFN 中的专家数量
   num_experts: 4
 
-  # Transformer / MLP 中使用的 dropout 比例
+  # Transformer / MLP 中使用的丢弃比例
   dropout: 0.1
 
   # 优化器学习率
   learning_rate: 0.2
 
-  # token / hidden 的嵌入维度
+  # 词元 / 隐藏状态的嵌入维度
   embed_dim: 128
 
   # 多头注意力的头数
@@ -52,20 +52,20 @@ model:
   # FFN 隐藏层扩张倍数，hidden_dim = embed_dim * mlp_ratio
   mlp_ratio: 4.0
 
-  # Transformer block 总层数
+  # Transformer 模块总层数
   depth: 4
 
-  # 哪些层使用 MoE/Switch FFN，字符串形式，例如 "1,3"
+  # 使用 MoE/Switch FFN 的层，采用字符串形式，例如 "1,3"
   moe_layers: "1,3"
 
-  # 每个 token 选择的专家数量，当前项目实际按 top-1 使用
+  # 每个词元选择的专家数量，当前项目实际按 top-1 使用
   top_k: 1
 
-  # token 网格边长：
-  # ResNet18 backbone 输出会被 pooling 到 token_grid_size x token_grid_size
+  # 词元网格边长：
+  # ResNet18 主干网络输出会被池化到 token_grid_size x token_grid_size
   token_grid_size: 8
 
-  # 是否使用 cls token 做分类；false 时用 token mean pooling
+  # 是否使用 cls 词元做分类；false 时使用词元均值池化
   use_cls_token: false
 
 train:
@@ -75,10 +75,10 @@ train:
   # 服务端通信轮数，也就是全局训练轮数
   server_epochs: 100
 
-  # 每轮中每个客户端本地训练的 epoch 数
+  # 每轮中每个客户端本地训练的轮次
   client_epochs: 1
 
-  # 训练设备，例如 cpu 或 cuda
+  # 训练设备，例如 CPU 或 CUDA
   device: cuda
 
   # 实验输出根目录；最终会派生出 save/{run_name}/data|model|result
@@ -91,8 +91,8 @@ train:
   allow_overwrite: false
 
   # 是否每轮保存每个客户端的本地模型 {client_id}.pth。
-  # false: 默认，不保存客户端模型，server 直接使用 Client.train() 返回的 state_dict 聚合，减少磁盘 I/O。
-  # true: 调试/兼容旧流程时保存客户端模型。
+  # false: 默认，不保存客户端模型，服务端直接使用 Client.train() 返回的 state_dict 聚合，减少磁盘 I/O。
+  # true: 调试或兼容旧流程时保存客户端模型。
   save_client_models: false
 
   # 非专家参数聚合方法：
@@ -103,50 +103,52 @@ train:
   # 专家参数聚合方法：
   # - equal_avg: 客户端直接平均，不按样本数加权
   # - sample_weighted_avg: 按客户端训练样本数加权平均
-  # - expert_usage: 按该 layer/expert 的实际 token usage 加权
-  # - fisher_raw_score: 按客户端上传的 Fisher raw score s 加权
+  # - expert_usage: 按该层/专家的实际词元使用量加权
+  # - fisher_raw_score: 按客户端上传的 Fisher 原始分数 s 加权
+  # - history_wolf_filter: 按 History-WoLF 筛选器计算的可靠性权重聚合
+  # - fisher_history_wolf: 在 History-WoLF 可靠性权重基础上结合 Fisher 证据聚合
   expert_agg_method: sample_weighted_avg
 
-  # History-WoLF expert filter:
-  # Used by expert_agg_method: history_wolf_filter / fisher_history_wolf.
-  # The filter maintains scalar mu/P reliability states per client-layer-expert.
-  history_wolf_min_usage: 1        # Minimum expert usage required to update/use a client-expert contribution.
-  history_wolf_c: 2.0              # WoLF residual soft threshold. Larger means less aggressive down-weighting.
-  history_wolf_process_noise: 0.01 # Scalar P process noise; lets old history slowly become uncertain.
-  history_wolf_obs_noise: 0.05     # Observation noise scale; usage confidence divides this value.
+  # History-WoLF 专家筛选器：
+  # 供 expert_agg_method 的 history_wolf_filter / fisher_history_wolf 模式使用。
+  # 筛选器为每个客户端-层-专家组合维护标量可靠性状态 mu/P。
+  history_wolf_min_usage: 1        # 更新或使用客户端专家贡献所需的最小专家使用量。
+  history_wolf_c: 2.0              # WoLF 残差软阈值。值越大，降权越温和。
+  history_wolf_process_noise: 0.01 # 标量 P 的过程噪声，使历史信息随时间逐渐增加不确定性。
+  history_wolf_obs_noise: 0.05     # 观测噪声尺度，使用量置信度会除以该值。
 
-  # FedWoLF expert Fisher evidence 使用的数据加载模式：
-  # - deterministic: 使用确定性 transform，不做随机增强，不 shuffle
-  # - train_loader: 复用训练 loader，包含随机增强和 shuffle，用于消融
+  # FedWoLF 专家 Fisher 证据使用的数据加载模式：
+  # - deterministic: 使用确定性数据变换，不做随机增强，不打乱顺序
+  # - train_loader: 复用训练数据加载器，包含随机增强和顺序打乱，用于消融
   fedwolf_evidence_loader_mode: deterministic
 
-  # FedWoLF expert Fisher evidence 的模型模式：
-  # - eval: 关闭 Dropout/BN 更新等训练态随机行为，但仍保留梯度计算
-  # - train: 使用训练模式计算 evidence，更贴近训练态但随机性更强
+  # FedWoLF 专家 Fisher 证据的模型模式：
+  # - eval: 关闭 Dropout/BN 更新等训练状态下的随机行为，但仍保留梯度计算
+  # - train: 使用训练模式计算证据，更贴近训练状态但随机性更强
   fedwolf_evidence_model_mode: eval
 
-  # FedWoLF/Fisher evidence 的计算器：
-  # - per_sample_backward: 逐样本 backward 后累计 expert 参数 grad^2，语义稳但速度慢
-  # - linear_hook_token_fast: token-level fast Fisher；一个 batch 只 backward 一次，速度快
-  # - linear_hook_sample_fast: sample-grouped fast Fisher；需要模型暴露 accepted sample ids
+  # FedWoLF/Fisher 证据的计算器：
+  # - per_sample_backward: 逐样本反向传播后累计专家参数的 grad^2，语义稳定但速度慢
+  # - linear_hook_token_fast: 词元级快速 Fisher；一个批次只反向传播一次，速度快
+  # - linear_hook_sample_fast: 按样本分组的快速 Fisher；需要模型暴露已接收样本编号
   fedwolf_fisher_estimator: linear_hook_sample_fast
 
-  # FedWoLF/Fisher evidence 标量压缩方式：
-  # - mean_diag: 旧逻辑/PDF 对齐，grad_square_sum / (param_count * total_samples)
-  # - mean_diag_active: 只在该 expert 有梯度的样本上做 mean diagonal
+  # FedWoLF/Fisher 证据的标量压缩方式：
+  # - mean_diag: 与旧逻辑/PDF 对齐，grad_square_sum / (param_count * total_samples)
+  # - mean_diag_active: 只在该专家有梯度的样本上计算对角均值
   # - trace_per_sample: 不除以参数量，只按 total_samples 平均
-  # - trace_per_active_sample: 不除以参数量，只按该 expert 有梯度的样本数平均
+  # - trace_per_active_sample: 不除以参数量，只按该专家有梯度的样本数平均
   # - trace_raw: 不做平均，直接使用 grad_square_sum，仅用于消融
   fedwolf_fisher_score_mode: trace_per_active_sample
 
-  # Fisher evidence 逐 batch 诊断记录数量：
-  # - 0: 不记录逐 batch 诊断，只保留 summary
-  # - N>0: 只记录前 N 个 batch
+  # Fisher 证据的逐批次诊断记录数量：
+  # - 0: 不记录逐批次诊断，只保留摘要
+  # - N>0: 只记录前 N 个批次
   fedwolf_fisher_debug_batches: 0
 
-  # 是否打印完整 Fisher diagnostics：
-  # - false: 正式实验默认，只打印精简 summary，不打印完整 diagnostics
-  # - true: 调试模式，打印完整 diagnostics，包括 batch_grad_status 等字段
+  # 是否打印完整的 Fisher 诊断信息：
+  # - false: 正式实验默认，只打印精简摘要，不打印完整诊断信息
+  # - true: 调试模式，打印完整诊断信息，包括 batch_grad_status 等字段
   fedwolf_fisher_debug: false
 
   # FedWoLF 数值稳定项；用于 Fisher 权重归一化、观测噪声分母等，防止除零
