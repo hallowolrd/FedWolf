@@ -360,9 +360,6 @@ class Client:
                 # 反向传播。
                 loss.backward()
 
-                # 梯度裁剪，避免梯度爆炸。
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1)
-
                 # 更新本地模型参数。
                 self.optimizer.step()
 
