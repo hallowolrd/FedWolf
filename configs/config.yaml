@@ -68,6 +68,12 @@ model:
   # 是否使用 cls 词元做分类；false 时使用词元均值池化
   use_cls_token: false
 
+  # router auxiliary loss 系数；0 表示关闭负载均衡损失对训练 loss 的影响
+  router_aux_loss_coef: 0.0
+
+  # router z-loss 系数；0 表示关闭 router logits 正则对训练 loss 的影响
+  router_z_loss_coef: 0.0
+
 train:
   # 联邦学习中的客户端数量
   num_clients: 10

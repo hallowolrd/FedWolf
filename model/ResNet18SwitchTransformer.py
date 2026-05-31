@@ -445,8 +445,8 @@ class ResNet18SwitchTransformer(nn.Module):
         stem_channels=None,
         token_grid_size=8,
         use_cls_token=False,
-        router_aux_loss_coef=0.01,
-        router_z_loss_coef=0.001,
+        router_aux_loss_coef=0.0,
+        router_z_loss_coef=0.0,
     ):
         super(ResNet18SwitchTransformer, self).__init__()
 

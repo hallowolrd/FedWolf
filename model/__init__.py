@@ -86,6 +86,12 @@ def build_model_from_args(args):
         # 是否使用 cls token 做分类。
         # false 时通常使用 token mean pooling。
         use_cls_token=args.use_cls_token,
+
+        # router auxiliary loss 系数，旧配置缺省时默认关闭。
+        router_aux_loss_coef=getattr(args, "router_aux_loss_coef", 0.0),
+
+        # router z-loss 系数，旧配置缺省时默认关闭。
+        router_z_loss_coef=getattr(args, "router_z_loss_coef", 0.0),
     )
 
     # 当前项目支持的模型类型：ResNet18 backbone + Switch Transformer。
