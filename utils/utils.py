@@ -112,6 +112,9 @@ def trim_result_csv_for_resume(args, completed_round, final_evaluated=False):
         "client_id",
         "train_loss",
         "train_acc",
+        "ce_loss",
+        "router_balance_loss",
+        "router_balance_loss_coef",
         "router_aux_loss",
         "router_z_loss",
     ]
@@ -167,7 +170,7 @@ def init_result_csv(args):
     # mode='w' 会覆盖同名旧文件，因此每次新训练都会重新写表头。
     with open(csv_path, 'w', newline='') as csvfile:
         # 客户端训练结果 CSV 的字段。
-        fieldnames = ['T', 'client_epoch', 'client_id',"train_loss","train_acc","router_aux_loss","router_z_loss"]
+        fieldnames = ['T', 'client_epoch', 'client_id',"train_loss","train_acc","ce_loss","router_balance_loss","router_balance_loss_coef","router_aux_loss","router_z_loss"]
 
         # 使用 DictWriter 按字段名写入字典格式记录。
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -217,7 +220,7 @@ def record_result(record_dic:dict, args):
     # 以追加模式打开文件，不覆盖已有记录。
     with open(csv_path, 'a', newline='') as csvfile:
         # 字段顺序需要和 init_result_csv 中保持一致。
-        fieldnames = ['T', 'client_epoch', 'client_id', "train_loss", "train_acc", "router_aux_loss", "router_z_loss"]
+        fieldnames = ['T', 'client_epoch', 'client_id', "train_loss", "train_acc", "ce_loss", "router_balance_loss", "router_balance_loss_coef", "router_aux_loss", "router_z_loss"]
 
         # 创建 CSV 字典写入器。
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)

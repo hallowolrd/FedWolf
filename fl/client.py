@@ -310,6 +310,9 @@ class Client:
         # 保存最后一个 epoch 的平均 router 概率。
         last_avg_router_probs = torch.zeros(self.args.num_experts, device=self.device)
 
+        # 默认关闭；仅模型显式返回 router_balance_loss 时才参与训练。
+        balance_coef = float(getattr(self.args, "router_balance_loss_coef", 0.0))
+
         # 累计整个本地训练过程中的 expert 使用次数。
         local_usage_total = torch.zeros(self.args.num_experts, device=self.device)
 
@@ -321,6 +324,12 @@ class Client:
 
             # 当前 epoch 的累计损失。
             running_loss = 0.0
+
+            # 当前 epoch 的分类损失累计值。
+            running_ce_loss = 0.0
+
+            # 当前 epoch 的 lightweight router balance loss 累计值。
+            running_router_balance_loss = 0.0
 
             # 当前 epoch 的 router auxiliary loss 累计值。
             running_aux_loss = 0.0
@@ -359,8 +368,16 @@ class Client:
                 # 取出 router 相关辅助损失。
                 extra_loss, router_aux_loss, router_z_loss = self.get_auxiliary_losses(result)
 
+                # Lightweight balance loss 独立于旧的 Switch 风格辅助损失。
+                router_balance_loss = outputs.new_tensor(0.0)
+                if isinstance(result, dict):
+                    router_balance_loss = result.get("router_balance_loss", router_balance_loss)
+
                 # 总训练损失 = 主分类损失 + router 额外损失。
-                loss = self.criterion(outputs, labels) + extra_loss
+                ce_loss = self.criterion(outputs, labels)
+                loss = ce_loss + extra_loss
+                if balance_coef > 0.0 and isinstance(result, dict) and "router_balance_loss" in result:
+                    loss = loss + balance_coef * router_balance_loss
 
                 # 反向传播。
                 loss.backward()
@@ -372,6 +389,8 @@ class Client:
 
                 # loss.item() 是 batch 平均 loss，这里乘 batch_size 后累加，方便后面算 epoch 平均。
                 running_loss += loss.item() * batch_size
+                running_ce_loss += ce_loss.item() * batch_size
+                running_router_balance_loss += router_balance_loss.item() * batch_size
                 running_aux_loss += router_aux_loss.item() * batch_size
                 running_z_loss += router_z_loss.item() * batch_size
                 total_samples += batch_size
@@ -393,6 +412,12 @@ class Client:
 
             # 当前 epoch 平均训练损失。
             train_loss = running_loss / len(self.train_loader.dataset)
+
+            # 当前 epoch 平均分类损失。
+            avg_ce_loss = running_ce_loss / max(total_samples, 1)
+
+            # 当前 epoch 平均 lightweight router balance loss。
+            avg_router_balance_loss = running_router_balance_loss / max(total_samples, 1)
 
             # 当前 epoch 训练准确率。
             train_acc = running_corrects.double() / len(self.train_loader.dataset)
@@ -418,12 +443,21 @@ class Client:
             # 将平均 router 概率转成保留 4 位小数的 list，方便日志查看。
             router_prob_list = [round(float(v), 4) for v in last_avg_router_probs.detach().cpu().tolist()]
 
+            balance_log = ""
+            if balance_coef > 0.0:
+                balance_log = (
+                    f" --ce_loss : {avg_ce_loss:.4f} "
+                    f"--router_balance_loss : {avg_router_balance_loss:.4f} "
+                    f"--router_balance_loss_coef : {balance_coef:g}"
+                )
+
             # 简单 CNN MoE 没有 router 辅助损失，普通日志只展示有效指标。
             if self.args.model_type == "simple_cnn_moe_head":
                 self.logger.info(
                     f"--client: {self.client_id} --epoch:{epoch+1}/{self.client_epochs} "
                     f"--train_loss :{train_loss:.4f} --train_acc :{train_acc:.4f} "
                     f"--expert_usage : {usage_list} --avg_router_probs : {router_prob_list}"
+                    f"{balance_log}"
                 )
             else:
                 # 其他模型保留 router loss 日志。
@@ -433,6 +467,7 @@ class Client:
                     f"--router_aux_loss : {avg_aux_loss:.4f} "
                     f"--router_z_loss : {avg_z_loss:.4f} "
                     f"--expert_usage : {usage_list} --avg_router_probs : {router_prob_list}"
+                    f"{balance_log}"
                 )
 
             # 如果当前模型返回了按层 expert 统计，就额外打印每层 expert 的使用情况。
@@ -461,6 +496,9 @@ class Client:
                 'client_id': self.client_id,
                 "train_loss": train_loss,
                 "train_acc": train_acc.item(),
+                "ce_loss": avg_ce_loss,
+                "router_balance_loss": avg_router_balance_loss,
+                "router_balance_loss_coef": balance_coef,
                 "router_aux_loss": avg_aux_loss,
                 "router_z_loss": avg_z_loss,
             }

@@ -20,6 +20,8 @@ _QUADRANT_VALUE_KEYS = (
     "mu_eff",
     "direction",
     "direction_cosine",
+    "positive_cosine",
+    "negative_cosine",
     "conflict_direction",
     "quality_usage_component",
     "magnitude",
@@ -60,10 +62,14 @@ class HistoryWolfExpertFilter:
         self.quality_variant = str(
             getattr(args, "history_wolf_quality_variant", "legacy")
         ).strip().lower()
-        if self.quality_variant not in {"legacy", "conflict_aware"}:
+        if self.quality_variant not in {
+            "legacy",
+            "conflict_aware",
+            "conflict_aware_soft",
+        }:
             raise ValueError(
                 "history_wolf_quality_variant must be one of "
-                "['legacy', 'conflict_aware'], "
+                "['legacy', 'conflict_aware', 'conflict_aware_soft'], "
                 f"got {self.quality_variant!r}."
             )
         conflict_weights = [
@@ -133,6 +139,8 @@ class HistoryWolfExpertFilter:
             "direction": [],
             "direction_cosine": [],
             "direction_has_reference": [],
+            "positive_cosine": [],
+            "negative_cosine": [],
             "quality_direction_component": [],
             "quality_magnitude_component": [],
             "quality_usage_component": [],
@@ -377,6 +385,12 @@ class HistoryWolfExpertFilter:
                     summary_values["direction_has_reference"].append(
                         1.0 if has_direction_reference else 0.0
                     )
+                    summary_values["positive_cosine"].append(
+                        1.0 if has_direction_reference and direction_cosine > 0 else 0.0
+                    )
+                    summary_values["negative_cosine"].append(
+                        1.0 if has_direction_reference and direction_cosine < 0 else 0.0
+                    )
                     summary_values["quality_direction_component"].append(
                         float(quality_diag["direction_component"])
                     )
@@ -417,6 +431,16 @@ class HistoryWolfExpertFilter:
                         values["mu_eff"].append(float(mu_eff))
                         values["direction"].append(float(direction))
                         values["direction_cosine"].append(float(direction_cosine))
+                        values["positive_cosine"].append(
+                            1.0
+                            if has_direction_reference and direction_cosine > 0
+                            else 0.0
+                        )
+                        values["negative_cosine"].append(
+                            1.0
+                            if has_direction_reference and direction_cosine < 0
+                            else 0.0
+                        )
                         values["conflict_direction"].append(
                             float(quality_diag["conflict_direction"])
                         )
@@ -593,7 +617,7 @@ class HistoryWolfExpertFilter:
                 0.0,
                 1.0,
             )
-        else:
+        elif self.quality_variant == "conflict_aware":
             # conflict_aware 只惩罚反向冲突；正交/同向都视为无冲突，并轻量纳入 usage。
             if not has_direction_reference:
                 conflict_direction = 0.5
@@ -601,6 +625,24 @@ class HistoryWolfExpertFilter:
                 conflict_direction = 1.0
             else:
                 conflict_direction = 1.0 + direction_cosine
+            conflict_direction = self._clip(conflict_direction, 0.0, 1.0)
+            direction_component = conflict_direction
+            usage_component = usage_conf
+            q_value = self._clip(
+                self.conflict_direction_weight * direction_component
+                + self.conflict_magnitude_weight * magnitude
+                + self.conflict_usage_weight * usage_component,
+                0.0,
+                1.0,
+            )
+        else:
+            # soft 版本给正交更新中等偏高分，同时保留正向增益与负向惩罚。
+            if not has_direction_reference:
+                conflict_direction = 0.5
+            elif direction_cosine >= 0:
+                conflict_direction = 0.75 + 0.25 * direction_cosine
+            else:
+                conflict_direction = 0.75 * (1.0 + direction_cosine)
             conflict_direction = self._clip(conflict_direction, 0.0, 1.0)
             direction_component = conflict_direction
             usage_component = usage_conf
@@ -696,6 +738,12 @@ class HistoryWolfExpertFilter:
             "mean_direction_has_reference": self._safe_mean(
                 summary_values.get("direction_has_reference", [])
             ),
+            "mean_positive_cosine_rate": self._safe_mean(
+                summary_values.get("positive_cosine", [])
+            ),
+            "mean_negative_cosine_rate": self._safe_mean(
+                summary_values.get("negative_cosine", [])
+            ),
             "mean_quality_direction_component": self._safe_mean(
                 summary_values.get("quality_direction_component", [])
             ),
@@ -741,6 +789,12 @@ class HistoryWolfExpertFilter:
                     "mean_direction": self._safe_mean(values.get("direction", [])),
                     "mean_direction_cosine": self._safe_mean(
                         values.get("direction_cosine", [])
+                    ),
+                    "mean_positive_cosine_rate": self._safe_mean(
+                        values.get("positive_cosine", [])
+                    ),
+                    "mean_negative_cosine_rate": self._safe_mean(
+                        values.get("negative_cosine", [])
                     ),
                     "mean_conflict_direction": self._safe_mean(
                         values.get("conflict_direction", [])

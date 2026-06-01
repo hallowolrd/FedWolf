@@ -84,6 +84,15 @@ model:
   # router z-loss 系数；0 表示关闭 router logits 正则对训练 loss 的影响
   router_z_loss_coef: 0.0
 
+  # Lightweight router balance loss for simple_cnn_moe_head.
+  # Default 0.0 disables it and keeps old behavior unchanged.
+  # When >0, client training adds:
+  #   router_balance_loss = num_experts * sum(avg_router_probs ** 2)
+  # This only encourages soft router probabilities to avoid expert collapse.
+  # It does not enable z-loss, capacity, drop_tokens, overflow, or Switch-style auxiliary mechanisms.
+  # Try 0.001 first; if collapse remains, try 0.003 or 0.005.
+  router_balance_loss_coef: 0.0
+
 train:
   # 联邦学习中的客户端数量
   num_clients: 10
@@ -135,10 +144,12 @@ train:
   history_wolf_quadrant_log: true  # 是否记录当前质量/历史质量四象限诊断摘要。
   history_wolf_quadrant_threshold: 0.5 # q_value 和 mu_eff 的好坏分类阈值。
   # q_value 质量分变体：
-  # - legacy: 保持 q = 0.75 * direction + 0.25 * magnitude。
-  # - conflict_aware: 只惩罚反向冲突，不惩罚正交/同向 non-IID 更新，并加入少量 usage_conf。
+  # - legacy: 旧逻辑，direction = 0.5 * (1 + cosine)，q = 0.75 * direction + 0.25 * magnitude。
+  # - conflict_aware: cosine >= 0 时 conflict_direction = 1.0，只惩罚负 cosine；较宽松，保留用于对比。
+  # - conflict_aware_soft: cosine=0 时 direction_component=0.75，正 cosine 逐渐升到 1，
+  #   负 cosine 逐渐降到 0；适合 non-IID 下“不把正交更新当坏，但也不把正交更新当满分”。
   history_wolf_quality_variant: legacy
-  # 仅在 history_wolf_quality_variant=conflict_aware 时使用；运行时会归一化。
+  # 在 conflict_aware / conflict_aware_soft 下复用；运行时会归一化。
   history_wolf_conflict_direction_weight: 0.60
   history_wolf_conflict_magnitude_weight: 0.25
   history_wolf_conflict_usage_weight: 0.15

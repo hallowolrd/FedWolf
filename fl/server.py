@@ -110,6 +110,7 @@ class Server:
             "expert_agg_method": self.args.expert_agg_method,
             "router_aux_loss_coef": getattr(self.args, "router_aux_loss_coef", 0.0),
             "router_z_loss_coef": getattr(self.args, "router_z_loss_coef", 0.0),
+            "router_balance_loss_coef": getattr(self.args, "router_balance_loss_coef", 0.0),
             "save_root": self.args.save_root,
             "run_name": self.args.run_name,
         }
@@ -308,6 +309,14 @@ class Server:
                 # 将本轮总 expert usage 转成 int list，方便日志阅读。
                 usage_list = [int(v) for v in round_expert_usage_summary.tolist()]
                 self.logger.info(f"--round_expert_usage_summary : {usage_list}\n")
+
+                usage_sum = round_expert_usage_summary.sum().item()
+                if usage_sum > 0:
+                    usage_fraction = round_expert_usage_summary / usage_sum
+                    router_usage_imbalance = self.args.num_experts * torch.sum(usage_fraction ** 2).item()
+                else:
+                    router_usage_imbalance = 0.0
+                self.logger.info(f"--router_usage_imbalance : {router_usage_imbalance:.4f}\n")
 
                 # 保存最近一轮所有客户端的 expert 统计。
                 # aggregation_by_method 中会通过 self.last_client_expert_usages 传给聚合器。
@@ -532,6 +541,8 @@ class Server:
                 "mean_direction",
                 "mean_direction_cosine",
                 "mean_direction_has_reference",
+                "mean_positive_cosine_rate",
+                "mean_negative_cosine_rate",
                 "mean_quality_direction_component",
                 "mean_quality_magnitude_component",
                 "mean_quality_usage_component",
@@ -566,6 +577,14 @@ class Server:
                 }
                 compact_summary["quadrant_mean_mu_eff"] = {
                     name: values.get("mean_mu_eff", 0.0)
+                    for name, values in quadrants.items()
+                }
+                compact_summary["quadrant_mean_positive_cosine_rate"] = {
+                    name: values.get("mean_positive_cosine_rate", 0.0)
+                    for name, values in quadrants.items()
+                }
+                compact_summary["quadrant_mean_negative_cosine_rate"] = {
+                    name: values.get("mean_negative_cosine_rate", 0.0)
                     for name, values in quadrants.items()
                 }
             if history_summary.get("use_fisher"):

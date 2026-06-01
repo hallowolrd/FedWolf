@@ -91,13 +91,15 @@ class SimpleMoEHead(nn.Module):
         selected_counts = torch.bincount(top1_indices, minlength=self.num_experts)
         expert_activations = selected_counts
         overflow_counts = torch.zeros_like(selected_counts)
-        avg_router_probs = router_probs.detach().mean(dim=0)
+        avg_router_probs = router_probs.mean(dim=0)
+        router_balance_loss = self.num_experts * torch.sum(avg_router_probs ** 2)
+        avg_router_probs_for_stats = avg_router_probs.detach()
         zero_tensor = features.new_tensor(0.0)
         layer_stats = {
             "expert_activations": expert_activations,
             "selected_counts": selected_counts,
             "overflow_counts": overflow_counts,
-            "avg_router_probs": avg_router_probs,
+            "avg_router_probs": avg_router_probs_for_stats,
             "capacity": 0,
         }
 
@@ -107,16 +109,17 @@ class SimpleMoEHead(nn.Module):
             "router_aux_loss": zero_tensor,
             "router_z_loss": zero_tensor,
             "total_router_loss": zero_tensor,
+            "router_balance_loss": router_balance_loss,
             "expert_activations": expert_activations,
             "expert_activations_summary": expert_activations,
             "selected_counts_summary": selected_counts,
             "overflow_counts_summary": overflow_counts,
-            "avg_router_probs": avg_router_probs,
+            "avg_router_probs": avg_router_probs_for_stats,
             "expert_stats_by_layer": {"moe_head": layer_stats},
             "expert_activations_by_layer": {"moe_head": expert_activations},
             "selected_counts_by_layer": {"moe_head": selected_counts},
             "overflow_counts_by_layer": {"moe_head": overflow_counts},
-            "avg_router_probs_by_layer": {"moe_head": avg_router_probs},
+            "avg_router_probs_by_layer": {"moe_head": avg_router_probs_for_stats},
             "capacity_by_layer": {"moe_head": 0},
         }
 
