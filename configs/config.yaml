@@ -134,6 +134,14 @@ train:
   history_wolf_obs_noise: 0.05     # 观测噪声尺度，使用量置信度会除以该值。
   history_wolf_quadrant_log: true  # 是否记录当前质量/历史质量四象限诊断摘要。
   history_wolf_quadrant_threshold: 0.5 # q_value 和 mu_eff 的好坏分类阈值。
+  # q_value 质量分变体：
+  # - legacy: 保持 q = 0.75 * direction + 0.25 * magnitude。
+  # - conflict_aware: 只惩罚反向冲突，不惩罚正交/同向 non-IID 更新，并加入少量 usage_conf。
+  history_wolf_quality_variant: legacy
+  # 仅在 history_wolf_quality_variant=conflict_aware 时使用；运行时会归一化。
+  history_wolf_conflict_direction_weight: 0.60
+  history_wolf_conflict_magnitude_weight: 0.25
+  history_wolf_conflict_usage_weight: 0.15
 
   # FedWoLF 专家 Fisher 证据使用的数据加载模式：
   # - deterministic: 使用确定性数据变换，不做随机增强，不打乱顺序

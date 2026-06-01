@@ -19,6 +19,9 @@ _QUADRANT_VALUE_KEYS = (
     "q",
     "mu_eff",
     "direction",
+    "direction_cosine",
+    "conflict_direction",
+    "quality_usage_component",
     "magnitude",
     "usage_conf",
     "filter_raw",
@@ -54,6 +57,30 @@ class HistoryWolfExpertFilter:
         self.p_max = 0.25
         self.direction_weight = 0.75
         self.magnitude_weight = 0.25
+        self.quality_variant = str(
+            getattr(args, "history_wolf_quality_variant", "legacy")
+        ).strip().lower()
+        if self.quality_variant not in {"legacy", "conflict_aware"}:
+            raise ValueError(
+                "history_wolf_quality_variant must be one of "
+                "['legacy', 'conflict_aware'], "
+                f"got {self.quality_variant!r}."
+            )
+        conflict_weights = [
+            max(self._as_finite_float(getattr(args, key, default), 0.0), 0.0)
+            for key, default in (
+                ("history_wolf_conflict_direction_weight", 0.60),
+                ("history_wolf_conflict_magnitude_weight", 0.25),
+                ("history_wolf_conflict_usage_weight", 0.15),
+            )
+        ]
+        conflict_weight_sum = sum(conflict_weights)
+        if conflict_weight_sum <= self.eps:
+            conflict_weights = [0.60, 0.25, 0.15]
+            conflict_weight_sum = sum(conflict_weights)
+        self.conflict_direction_weight = conflict_weights[0] / conflict_weight_sum
+        self.conflict_magnitude_weight = conflict_weights[1] / conflict_weight_sum
+        self.conflict_usage_weight = conflict_weights[2] / conflict_weight_sum
         self.filter_current_weight = 0.55
         self.filter_history_weight = 0.35
         self.filter_joint_weight = 0.10
@@ -104,6 +131,12 @@ class HistoryWolfExpertFilter:
             "usage_conf": [],
             "q": [],
             "direction": [],
+            "direction_cosine": [],
+            "direction_has_reference": [],
+            "quality_direction_component": [],
+            "quality_magnitude_component": [],
+            "quality_usage_component": [],
+            "conflict_direction": [],
             "magnitude": [],
             "mu_old": [],
             "mu_eff": [],
@@ -136,7 +169,7 @@ class HistoryWolfExpertFilter:
                     weights_by_ref[expert_ref] = weights
                     continue
 
-                # usage 只用于判断观测是否可信，并不直接进入 q_i 质量分。
+                # usage 用于判断观测是否可信；conflict_aware 下还会轻量进入 q_i。
                 usages = [
                     self._get_expert_usage(stats, layer_id, expert_id)
                     for stats in client_stats
@@ -240,23 +273,31 @@ class HistoryWolfExpertFilter:
                 for client_index in contributing_indices:
                     usage_conf = usage_conf_by_client[client_index]
                     delta_norm = delta_norm_by_client[client_index]
-                    direction = self._compute_direction_score(
-                        client_delta_by_key=delta_by_client[client_index],
-                        total_delta_by_key=total_delta_by_key,
-                        delta_norm=delta_norm,
-                        num_valid_clients=len(contributing_indices),
+                    direction_cosine, has_direction_reference = (
+                        self._compute_direction_cosine(
+                            client_delta_by_key=delta_by_client[client_index],
+                            total_delta_by_key=total_delta_by_key,
+                            delta_norm=delta_norm,
+                            num_valid_clients=len(contributing_indices),
+                        )
+                    )
+                    direction_legacy = (
+                        0.5
+                        if not has_direction_reference
+                        else 0.5 * (1.0 + direction_cosine)
                     )
                     magnitude = self._compute_magnitude_health(
                         delta_norm=delta_norm,
                         median_norm=median_norm,
                     )
-                    # 当前质量 q_i 由方向一致性和幅度健康度组合；usage 不参与 q_i。
-                    q_value = self._clip(
-                        self.direction_weight * direction
-                        + self.magnitude_weight * magnitude,
-                        0.0,
-                        1.0,
+                    q_value, quality_diag = self._compute_quality_score(
+                        direction_legacy=direction_legacy,
+                        direction_cosine=direction_cosine,
+                        has_direction_reference=has_direction_reference,
+                        magnitude=magnitude,
+                        usage_conf=usage_conf,
                     )
+                    direction = float(quality_diag["direction_component"])
 
                     # mu/P 是每个 client-layer-expert 的跨轮可靠性状态。
                     history_key = (client_index, str(layer_id), int(expert_id))
@@ -332,6 +373,22 @@ class HistoryWolfExpertFilter:
                     summary_values["usage_conf"].append(usage_conf)
                     summary_values["q"].append(q_value)
                     summary_values["direction"].append(direction)
+                    summary_values["direction_cosine"].append(direction_cosine)
+                    summary_values["direction_has_reference"].append(
+                        1.0 if has_direction_reference else 0.0
+                    )
+                    summary_values["quality_direction_component"].append(
+                        float(quality_diag["direction_component"])
+                    )
+                    summary_values["quality_magnitude_component"].append(
+                        float(quality_diag["magnitude_component"])
+                    )
+                    summary_values["quality_usage_component"].append(
+                        float(quality_diag["usage_component"])
+                    )
+                    summary_values["conflict_direction"].append(
+                        float(quality_diag["conflict_direction"])
+                    )
                     summary_values["magnitude"].append(magnitude)
                     summary_values["mu_old"].append(mu_old)
                     summary_values["mu_eff"].append(mu_eff)
@@ -359,6 +416,13 @@ class HistoryWolfExpertFilter:
                         values["q"].append(float(q_value))
                         values["mu_eff"].append(float(mu_eff))
                         values["direction"].append(float(direction))
+                        values["direction_cosine"].append(float(direction_cosine))
+                        values["conflict_direction"].append(
+                            float(quality_diag["conflict_direction"])
+                        )
+                        values["quality_usage_component"].append(
+                            float(quality_diag["usage_component"])
+                        )
                         values["magnitude"].append(float(magnitude))
                         values["usage_conf"].append(float(usage_conf))
                         values["filter_raw"].append(float(filter_raw))
@@ -474,9 +538,26 @@ class HistoryWolfExpertFilter:
         delta_norm: float,
         num_valid_clients: int,
     ) -> float:
-        # 单个贡献者或参考方向过小时，没有可靠方向信号，返回中性分。
-        if num_valid_clients < 2 or delta_norm <= self.eps:
+        cosine, has_reference = self._compute_direction_cosine(
+            client_delta_by_key=client_delta_by_key,
+            total_delta_by_key=total_delta_by_key,
+            delta_norm=delta_norm,
+            num_valid_clients=num_valid_clients,
+        )
+        if not has_reference:
             return 0.5
+        return 0.5 * (1.0 + cosine)
+
+    def _compute_direction_cosine(
+        self,
+        client_delta_by_key: dict[str, Any],
+        total_delta_by_key: dict[str, Any],
+        delta_norm: float,
+        num_valid_clients: int,
+    ) -> tuple[float, bool]:
+        # 单个贡献者或参考方向过小时，没有可靠方向信号。
+        if num_valid_clients < 2 or delta_norm <= self.eps:
+            return 0.0, False
 
         dot = 0.0
         ref_norm_sq = 0.0
@@ -487,10 +568,60 @@ class HistoryWolfExpertFilter:
 
         ref_norm = math.sqrt(max(ref_norm_sq, 0.0))
         if ref_norm <= self.eps:
-            return 0.5
+            return 0.0, False
 
         cosine = dot / (delta_norm * ref_norm + self.eps)
-        return 0.5 * (1.0 + self._clip(cosine, -1.0, 1.0))
+        return self._clip(cosine, -1.0, 1.0), True
+
+    def _compute_quality_score(
+        self,
+        *,
+        direction_legacy: float,
+        direction_cosine: float,
+        has_direction_reference: bool,
+        magnitude: float,
+        usage_conf: float,
+    ) -> tuple[float, dict[str, float | str]]:
+        if self.quality_variant == "legacy":
+            # legacy 奖励方向一致，正交 cosine=0 得 0.5；non-IID 下可能惩罚有用更新。
+            direction_component = direction_legacy
+            usage_component = 0.0
+            conflict_direction = 0.0
+            q_value = self._clip(
+                self.direction_weight * direction_component
+                + self.magnitude_weight * magnitude,
+                0.0,
+                1.0,
+            )
+        else:
+            # conflict_aware 只惩罚反向冲突；正交/同向都视为无冲突，并轻量纳入 usage。
+            if not has_direction_reference:
+                conflict_direction = 0.5
+            elif direction_cosine >= 0:
+                conflict_direction = 1.0
+            else:
+                conflict_direction = 1.0 + direction_cosine
+            conflict_direction = self._clip(conflict_direction, 0.0, 1.0)
+            direction_component = conflict_direction
+            usage_component = usage_conf
+            q_value = self._clip(
+                self.conflict_direction_weight * direction_component
+                + self.conflict_magnitude_weight * magnitude
+                + self.conflict_usage_weight * usage_component,
+                0.0,
+                1.0,
+            )
+
+        diagnostics: dict[str, float | str] = {
+            "quality_variant": self.quality_variant,
+            "direction_component": direction_component,
+            "direction_cosine": direction_cosine,
+            "direction_has_reference": 1.0 if has_direction_reference else 0.0,
+            "magnitude_component": magnitude,
+            "usage_component": usage_component,
+            "conflict_direction": conflict_direction,
+        }
+        return q_value, diagnostics
 
     def _compute_magnitude_health(self, delta_norm: float, median_norm: float) -> float:
         if median_norm <= self.eps or delta_norm <= self.eps:
@@ -555,9 +686,28 @@ class HistoryWolfExpertFilter:
             "use_fisher": bool(use_fisher),
             "valid_contrib_count": int(valid_contrib_count),
             "skipped_zero_delta_count": int(skipped_zero_delta_count),
+            "history_wolf_quality_variant": self.quality_variant,
             "mean_usage_conf": self._safe_mean(summary_values.get("usage_conf", [])),
             "mean_q": self._safe_mean(summary_values.get("q", [])),
             "mean_direction": self._safe_mean(summary_values.get("direction", [])),
+            "mean_direction_cosine": self._safe_mean(
+                summary_values.get("direction_cosine", [])
+            ),
+            "mean_direction_has_reference": self._safe_mean(
+                summary_values.get("direction_has_reference", [])
+            ),
+            "mean_quality_direction_component": self._safe_mean(
+                summary_values.get("quality_direction_component", [])
+            ),
+            "mean_quality_magnitude_component": self._safe_mean(
+                summary_values.get("quality_magnitude_component", [])
+            ),
+            "mean_quality_usage_component": self._safe_mean(
+                summary_values.get("quality_usage_component", [])
+            ),
+            "mean_conflict_direction": self._safe_mean(
+                summary_values.get("conflict_direction", [])
+            ),
             "mean_magnitude": self._safe_mean(summary_values.get("magnitude", [])),
             "mean_mu_old": self._safe_mean(summary_values.get("mu_old", [])),
             "mean_mu_eff": self._safe_mean(summary_values.get("mu_eff", [])),
@@ -589,6 +739,15 @@ class HistoryWolfExpertFilter:
                     "mean_q": self._safe_mean(values.get("q", [])),
                     "mean_mu_eff": self._safe_mean(values.get("mu_eff", [])),
                     "mean_direction": self._safe_mean(values.get("direction", [])),
+                    "mean_direction_cosine": self._safe_mean(
+                        values.get("direction_cosine", [])
+                    ),
+                    "mean_conflict_direction": self._safe_mean(
+                        values.get("conflict_direction", [])
+                    ),
+                    "mean_quality_usage_component": self._safe_mean(
+                        values.get("quality_usage_component", [])
+                    ),
                     "mean_magnitude": self._safe_mean(values.get("magnitude", [])),
                     "mean_usage_conf": self._safe_mean(values.get("usage_conf", [])),
                     "mean_filter_raw": self._safe_mean(values.get("filter_raw", [])),
