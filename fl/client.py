@@ -418,26 +418,41 @@ class Client:
             # 将平均 router 概率转成保留 4 位小数的 list，方便日志查看。
             router_prob_list = [round(float(v), 4) for v in last_avg_router_probs.detach().cpu().tolist()]
 
-            # 打印当前客户端当前 epoch 的训练指标和 expert 使用情况。
-            self.logger.info(
-                f"--client: {self.client_id} --epoch:{epoch+1}/{self.client_epochs} "
-                f"--train_loss :{train_loss:.4f} --train_acc :{train_acc:.4f} "
-                f"--router_aux_loss : {avg_aux_loss:.4f} "
-                f"--router_z_loss : {avg_z_loss:.4f} "
-                f"--expert_usage : {usage_list} --avg_router_probs : {router_prob_list}"
-            )
+            # 简单 CNN MoE 没有 router 辅助损失，普通日志只展示有效指标。
+            if self.args.model_type == "simple_cnn_moe_head":
+                self.logger.info(
+                    f"--client: {self.client_id} --epoch:{epoch+1}/{self.client_epochs} "
+                    f"--train_loss :{train_loss:.4f} --train_acc :{train_acc:.4f} "
+                    f"--expert_usage : {usage_list} --avg_router_probs : {router_prob_list}"
+                )
+            else:
+                # 其他模型保留 router loss 日志。
+                self.logger.info(
+                    f"--client: {self.client_id} --epoch:{epoch+1}/{self.client_epochs} "
+                    f"--train_loss :{train_loss:.4f} --train_acc :{train_acc:.4f} "
+                    f"--router_aux_loss : {avg_aux_loss:.4f} "
+                    f"--router_z_loss : {avg_z_loss:.4f} "
+                    f"--expert_usage : {usage_list} --avg_router_probs : {router_prob_list}"
+                )
 
             # 如果当前模型返回了按层 expert 统计，就额外打印每层 expert 的使用情况。
             if layer_usage_total:
-                layer_usage_log = {
-                    layer_id: {
-                        "expert_activations": [int(v) for v in stats["expert_activations"].detach().cpu().tolist()],
-                        "overflow_counts": [int(v) for v in stats["overflow_counts"].detach().cpu().tolist()],
-                        "capacity": int(stats["capacity"]),
+                if self.args.model_type == "simple_cnn_moe_head":
+                    layer_usage_log = {
+                        layer_id: [int(v) for v in stats["expert_activations"].detach().cpu().tolist()]
+                        for layer_id, stats in layer_usage_total.items()
                     }
-                    for layer_id, stats in layer_usage_total.items()
-                }
-                self.logger.info(f"--client: {self.client_id} --layer_expert_stats : {layer_usage_log}")
+                    self.logger.info(f"--client: {self.client_id} --layer_expert_usage : {layer_usage_log}")
+                else:
+                    layer_usage_log = {
+                        layer_id: {
+                            "expert_activations": [int(v) for v in stats["expert_activations"].detach().cpu().tolist()],
+                            "overflow_counts": [int(v) for v in stats["overflow_counts"].detach().cpu().tolist()],
+                            "capacity": int(stats["capacity"]),
+                        }
+                        for layer_id, stats in layer_usage_total.items()
+                    }
+                    self.logger.info(f"--client: {self.client_id} --layer_expert_stats : {layer_usage_log}")
 
             # 记录当前客户端当前 epoch 的训练结果，通常会写入 csv/json 日志文件。
             record_dic = {
@@ -530,8 +545,8 @@ class Client:
                     f"--client: {self.client_id} "
                     f"--expert_fisher_diagnostics_full : {fisher_diagnostics}"
                 )
-        else:
-            # 当前聚合方法不需要 Fisher evidence 时，只打印跳过信息。
+        elif bool(getattr(self.args, "fedwolf_fisher_debug", False)):
+            # 调试时打印跳过信息，普通训练日志保持精简。
             self.logger.info(
                 f"--client: {self.client_id} "
                 "--skip_expert_fisher_evidence : "

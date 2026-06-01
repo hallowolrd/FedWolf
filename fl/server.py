@@ -48,6 +48,9 @@ class Server:
         # 日志器，用于记录训练过程、聚合方式、测试结果等。
         self.logger = logger
 
+        # 每次实验启动时只打印一次关键配置，便于对照日志分析结果。
+        self.log_experiment_config()
+
         # 确保模型保存目录存在。
         os.makedirs(self.args.model_save_path, exist_ok=True)
 
@@ -85,6 +88,32 @@ class Server:
             )
         init_result_csv(self.args)
         init_server_result_csv(self.args)
+
+
+    def log_experiment_config(self):
+        """打印一次实验关键配置。"""
+
+        experiment_config = {
+            "data_name": self.args.data_name,
+            "alpha": self.args.alpha,
+            "num_clients": self.args.num_clients,
+            "server_epochs": self.args.server_epochs,
+            "client_epochs": self.args.client_epochs,
+            "model_type": self.args.model_type,
+            "num_experts": self.args.num_experts,
+            "top_k": self.args.top_k,
+            "cnn_channels": getattr(self.args, "cnn_channels", None),
+            "expert_hidden_dim": getattr(self.args, "expert_hidden_dim", None),
+            "dropout": self.args.dropout,
+            "learning_rate": self.args.learning_rate,
+            "non_expert_agg_method": self.args.non_expert_agg_method,
+            "expert_agg_method": self.args.expert_agg_method,
+            "router_aux_loss_coef": getattr(self.args, "router_aux_loss_coef", 0.0),
+            "router_z_loss_coef": getattr(self.args, "router_z_loss_coef", 0.0),
+            "save_root": self.args.save_root,
+            "run_name": self.args.run_name,
+        }
+        self.logger.info(f"--experiment_config : {experiment_config}\n")
 
 
     def init_global_model(self, save_initial=True):
@@ -290,15 +319,24 @@ class Server:
                     for stats in round_client_expert_usages
                 ]
 
-                # 按层 expert 统计日志，包括 expert 激活、overflow 和 capacity。
-                layer_stats_log = {
-                    layer_id: {
-                        "expert_activations": [int(v) for v in stats["expert_activations"].tolist()],
-                        "overflow_counts": [int(v) for v in stats["overflow_counts"].tolist()],
-                        "capacity": int(stats["capacity"]),
+                # 简单 CNN MoE 没有 overflow / capacity，日志里只展示 expert 激活。
+                if self.args.model_type == "simple_cnn_moe_head":
+                    layer_stats_log = {
+                        layer_id: {
+                            "expert_activations": [int(v) for v in stats["expert_activations"].tolist()],
+                        }
+                        for layer_id, stats in round_layer_stats.items()
                     }
-                    for layer_id, stats in round_layer_stats.items()
-                }
+                else:
+                    # 其他模型保留完整按层 expert 统计日志。
+                    layer_stats_log = {
+                        layer_id: {
+                            "expert_activations": [int(v) for v in stats["expert_activations"].tolist()],
+                            "overflow_counts": [int(v) for v in stats["overflow_counts"].tolist()],
+                            "capacity": int(stats["capacity"]),
+                        }
+                        for layer_id, stats in round_layer_stats.items()
+                    }
 
                 # 打印客户端级别和层级别的 expert 使用情况。
                 self.logger.info(f"--client_expert_usage_summary : {client_usage_list}\n")
