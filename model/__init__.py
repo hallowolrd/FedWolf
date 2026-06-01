@@ -56,6 +56,20 @@ def build_model_from_args(args):
     if dataset_config is None:
         raise ValueError(f"Unsupported dataset: {args.data_name}")
 
+    if args.model_type == "simple_cnn_moe_head":
+        from model.SimpleCNNMoEHead import SimpleCNNMoEHead
+
+        return SimpleCNNMoEHead(
+            in_channels=dataset_config["in_channels"],
+            num_classes=dataset_config["num_classes"],
+            img_size=dataset_config["img_size"],
+            num_experts=args.num_experts,
+            top_k=args.top_k,
+            cnn_channels=getattr(args, "cnn_channels", [32, 64, 128]),
+            expert_hidden_dim=getattr(args, "expert_hidden_dim", 256),
+            dropout=getattr(args, "dropout", 0.0),
+        )
+
     if args.model_type == "resnet_sparse_moe_head":
         from model.ResNetSparseMoEHead import ResNetSparseMoEHead
 

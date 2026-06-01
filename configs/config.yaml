@@ -33,6 +33,7 @@ model:
   # 模型类型：
   # resnet18_switch_transformer = ResNet-18 主干网络 + Transformer 模块
   # resnet_sparse_moe_head = ResNet-18 主干网络 + 单层 Top-K Sparse MoE 分类头
+  # simple_cnn_moe_head = 三层 CNN 主干网络 + 单层 Top-1 Sparse MoE 分类头
   model_type: resnet18_switch_transformer
 
   # 每个 Switch FFN 中的专家数量
@@ -40,6 +41,12 @@ model:
 
   # Transformer / MLP 中使用的丢弃比例
   dropout: 0.1
+
+  # SimpleCNNMoEHead 三层 CNN 的通道数
+  cnn_channels: [32, 64, 128]
+
+  # SimpleCNNMoEHead 中每个分类 expert 的隐藏层维度
+  expert_hidden_dim: 256
 
   # 优化器学习率
   learning_rate: 0.1
