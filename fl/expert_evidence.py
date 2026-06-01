@@ -55,36 +55,47 @@ def parse_expert_param_ref(name):
     """ 解析 expert 参数名。
     目标参数名格式大致为：
         blocks.{layer}.ffn.experts.{expert_id}.*
+        moe_head.experts.{expert_id}.*
     例如：
         blocks.1.ffn.experts.0.net.0.weight
+        moe_head.experts.0.fc1.weight
     返回：
         (layer_id, expert_id)
-        layer_id: str 类型，例如 "1"
+        layer_id: str 类型，例如 "1" 或 "moe_head"
         expert_id: int 类型，例如 0
     如果当前参数名不是 expert 参数，则返回 None。"""
 
-    # 按 "." 拆开参数名，方便定位 blocks 和 experts。
+    # 按 "." 拆开参数名，方便定位 experts。
     parts = name.split(".")
 
-    # 如果参数名里没有 blocks 或 experts，就不是 MoE expert 参数。
-    if "blocks" not in parts or "experts" not in parts:
+    # 如果参数名里没有 experts，就不是 MoE expert 参数。
+    if "experts" not in parts:
         return None
 
-    # 找到 blocks 和 experts 在参数名中的位置。
-    blocks_idx = parts.index("blocks")
+    # 找到 experts 在参数名中的位置。
     experts_idx = parts.index("experts")
 
-    # blocks 后面应该跟 layer id，experts 后面应该跟 expert id。
-    if blocks_idx + 1 >= len(parts) or experts_idx + 1 >= len(parts):
+    # experts 后面应该跟 expert id。
+    if experts_idx + 1 >= len(parts):
         return None
 
-    # layer id 和 expert id 必须是数字，否则说明参数名格式不符合预期。
-    if not parts[blocks_idx + 1].isdigit() or not parts[experts_idx + 1].isdigit():
+    # expert id 必须是数字，否则说明参数名格式不符合预期。
+    if not parts[experts_idx + 1].isdigit():
+        return None
+
+    if "blocks" in parts:
+        blocks_idx = parts.index("blocks")
+        if blocks_idx + 1 >= len(parts) or not parts[blocks_idx + 1].isdigit():
+            return None
+        layer_id = str(parts[blocks_idx + 1])
+    elif parts[:experts_idx] == ["moe_head"]:
+        layer_id = "moe_head"
+    else:
         return None
 
     # layer_id 用 str，便于后续作为字典 key；
     # expert_id 用 int，便于后续作为张量 / 列表下标。
-    return str(parts[blocks_idx + 1]), int(parts[experts_idx + 1])
+    return layer_id, int(parts[experts_idx + 1])
 
 
 def _collect_expert_parameter_entries(model, num_experts):
@@ -421,7 +432,10 @@ def compute_expert_fisher_evidence(
 
     # 如果一个 expert 参数都没匹配到，说明模型结构或参数命名不符合预期。
     if not expert_entries:
-        diagnostics["zero_score_reason"] = "No trainable expert parameters matched blocks.*.ffn.experts.* names."
+        diagnostics["zero_score_reason"] = (
+            "No trainable expert parameters matched blocks.*.ffn.experts.* "
+            "or moe_head.experts.* names."
+        )
         if return_diagnostics:
             return {}, {}, diagnostics
         return {}, {}
@@ -477,7 +491,11 @@ def compute_expert_fisher_evidence(
                 if block_prefix == "net.0"
             }
 
-            def make_forward_hook(module_name, layer_id, expert_id):
+            def make_forward_hook(module_name, layer_id, expert_id, expert_module, block_prefix):
+                backward_hook = make_backward_hook(
+                    module_name, layer_id, expert_id, expert_module, block_prefix
+                )
+
                 def forward_hook(module, inputs, output):
                     if not inputs or inputs[0] is None:
                         return
@@ -488,6 +506,12 @@ def compute_expert_fisher_evidence(
 
                     activation = activation.reshape(-1, activation.shape[-1])
                     activation_cache.setdefault(module_name, []).append(activation)
+
+                    # Tensor hook 避免 module full backward hook 与下游 inplace 激活冲突。
+                    if output.requires_grad:
+                        output.register_hook(
+                            lambda delta: backward_hook(module, None, (delta,))
+                        )
 
                     expert_key = (layer_id, expert_id)
                     token_count = int(activation.size(0))
@@ -583,12 +607,7 @@ def compute_expert_fisher_evidence(
             for module_name, module, layer_id, expert_id, expert_module, block_prefix in linear_entries:
                 hook_handles.append(
                     module.register_forward_hook(
-                        make_forward_hook(module_name, layer_id, expert_id)
-                    )
-                )
-                hook_handles.append(
-                    module.register_full_backward_hook(
-                        make_backward_hook(module_name, layer_id, expert_id, expert_module, block_prefix)
+                        make_forward_hook(module_name, layer_id, expert_id, expert_module, block_prefix)
                     )
                 )
 

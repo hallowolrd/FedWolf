@@ -147,7 +147,7 @@ train:
   # - per_sample_backward: 逐样本反向传播后累计专家参数的 grad^2，语义稳定但速度慢
   # - linear_hook_token_fast: 词元级快速 Fisher；一个批次只反向传播一次，速度快
   # - linear_hook_sample_fast: 按样本分组的快速 Fisher；需要模型暴露已接收样本编号
-  fedwolf_fisher_estimator: linear_hook_sample_fast
+  fedwolf_fisher_estimator: linear_hook_token_fast
 
   # FedWoLF/Fisher 证据的标量压缩方式：
   # - mean_diag: 与旧逻辑/PDF 对齐，grad_square_sum / (param_count * total_samples)
