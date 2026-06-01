@@ -6,7 +6,7 @@ data:
   data_path: ./data
 
   # 数据加载器的批大小
-  batch_size: 128
+  batch_size: 64
 
   # 狄利克雷分布参数，越小表示客户端间数据越不均匀；
   # 官方训练集会全部按这个参数划分给各客户端
@@ -49,7 +49,7 @@ model:
   expert_hidden_dim: 256
 
   # 优化器学习率
-  learning_rate: 0.1
+  learning_rate: 0.0005
 
   # 词元 / 隐藏状态的嵌入维度
   embed_dim: 128
@@ -89,10 +89,10 @@ train:
   num_clients: 10
 
   # 服务端通信轮数，也就是全局训练轮数
-  server_epochs: 50
+  server_epochs: 100
 
   # 每轮中每个客户端本地训练的轮次
-  client_epochs: 8
+  client_epochs: 2
 
   # 训练设备，例如 CPU 或 CUDA
   device: cuda
