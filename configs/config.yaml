@@ -132,6 +132,8 @@ train:
   history_wolf_c: 2.0              # WoLF 残差软阈值。值越大，降权越温和。
   history_wolf_process_noise: 0.01 # 标量 P 的过程噪声，使历史信息随时间逐渐增加不确定性。
   history_wolf_obs_noise: 0.05     # 观测噪声尺度，使用量置信度会除以该值。
+  history_wolf_quadrant_log: true  # 是否记录当前质量/历史质量四象限诊断摘要。
+  history_wolf_quadrant_threshold: 0.5 # q_value 和 mu_eff 的好坏分类阈值。
 
   # FedWoLF 专家 Fisher 证据使用的数据加载模式：
   # - deterministic: 使用确定性数据变换，不做随机增强，不打乱顺序

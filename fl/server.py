@@ -515,8 +515,70 @@ class Server:
         self.model.load_state_dict(aggregated_state)
 
         history_summary = getattr(self.aggregator, "last_history_wolf_summary", None)
-        if history_summary:
-            self.logger.info(f"--history_wolf_summary : {history_summary}\n")
+        if (
+            self.args.expert_agg_method
+            in {"history_wolf_filter", "fisher_history_wolf"}
+            and history_summary
+        ):
+            compact_keys = (
+                "num_experts",
+                "num_clients",
+                "valid_contrib_count",
+                "skipped_zero_delta_count",
+                "mean_usage_conf",
+                "mean_q",
+                "mean_mu_eff",
+                "mean_direction",
+                "mean_magnitude",
+                "mean_filter_raw",
+                "mean_final_raw",
+                "weight_ref_count",
+                "weight_all_zero_ref_count",
+                "mean_nonzero_clients_per_ref",
+                "mean_top1_share",
+                "mean_ess_ratio",
+                "mean_raw_weight_cv",
+            )
+            compact_summary = {
+                key: history_summary.get(key, 0.0)
+                for key in compact_keys
+            }
+            quadrants = history_summary.get("quadrants")
+            if quadrants is not None:
+                compact_summary["quadrant_counts"] = {
+                    name: values.get("count", 0)
+                    for name, values in quadrants.items()
+                }
+                compact_summary["quadrant_mean_final_raw"] = {
+                    name: values.get("mean_final_raw", 0.0)
+                    for name, values in quadrants.items()
+                }
+                compact_summary["quadrant_mean_q"] = {
+                    name: values.get("mean_q", 0.0)
+                    for name, values in quadrants.items()
+                }
+                compact_summary["quadrant_mean_mu_eff"] = {
+                    name: values.get("mean_mu_eff", 0.0)
+                    for name, values in quadrants.items()
+                }
+            if history_summary.get("use_fisher"):
+                compact_summary["mean_fisher_multiplier"] = history_summary.get(
+                    "mean_fisher_multiplier",
+                    0.0,
+                )
+                if quadrants is not None:
+                    compact_summary["quadrant_mean_fisher_multiplier"] = {
+                        name: values.get("mean_fisher_multiplier", 0.0)
+                        for name, values in quadrants.items()
+                    }
+
+            # 判读：quadrant_counts 过度集中，说明四象限没有真正发挥区分作用。
+            # 各象限 mean_final_raw 接近，说明分类后最终权重仍未明显拉开。
+            # mean_ess_ratio 接近 1 且 mean_raw_weight_cv 很低，说明权重接近 uniform。
+            # weight_all_zero_ref_count 很高，说明可能存在 router collapse / dead expert。
+            # current_bad_history_good 高于 current_bad_history_bad，说明历史会保留可靠客户端。
+            # current_good_history_bad 高于 current_bad_history_bad，说明当前质量会给历史差的客户端重新机会。
+            self.logger.info(f"--history_wolf_filter_summary : {compact_summary}\n")
 
         # 打印当前聚合方法和客户端样本数，方便检查实验配置。
         self.logger.info(f"--aggregation_method : {self.args.agg_method}\n")

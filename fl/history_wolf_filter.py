@@ -9,6 +9,28 @@ from typing import Any
 import torch
 
 
+_QUADRANT_NAMES = (
+    "current_good_history_good",
+    "current_good_history_bad",
+    "current_bad_history_good",
+    "current_bad_history_bad",
+)
+_QUADRANT_VALUE_KEYS = (
+    "q",
+    "mu_eff",
+    "direction",
+    "magnitude",
+    "usage_conf",
+    "filter_raw",
+    "final_raw",
+    "mu_old",
+    "mu_new",
+    "p_pred",
+    "p_new",
+    "fisher_multiplier",
+)
+
+
 class HistoryWolfExpertFilter:
     """Keep History-WoLF filter configuration and checkpointable state."""
 
@@ -19,6 +41,12 @@ class HistoryWolfExpertFilter:
         self.c = float(getattr(args, "history_wolf_c", 2.0))
         self.process_noise = float(getattr(args, "history_wolf_process_noise", 0.01))
         self.obs_noise = float(getattr(args, "history_wolf_obs_noise", 0.05))
+        self.quadrant_log = bool(getattr(args, "history_wolf_quadrant_log", True))
+        self.quadrant_threshold = self._clip(
+            float(getattr(args, "history_wolf_quadrant_threshold", 0.5)),
+            0.0,
+            1.0,
+        )
 
         self.mu_init = 0.5
         self.p_init = 0.25
@@ -78,6 +106,7 @@ class HistoryWolfExpertFilter:
             "direction": [],
             "magnitude": [],
             "mu_old": [],
+            "mu_eff": [],
             "mu_new": [],
             "p_pred": [],
             "p_new": [],
@@ -86,6 +115,14 @@ class HistoryWolfExpertFilter:
             "final_raw": [],
             "fisher_multiplier": [],
         }
+        quadrant_values = (
+            {
+                quadrant: {key: [] for key in _QUADRANT_VALUE_KEYS}
+                for quadrant in _QUADRANT_NAMES
+            }
+            if self.quadrant_log
+            else None
+        )
         valid_contrib_count = 0
         skipped_zero_delta_count = 0
         fisher_all_zero_expert_count = 0
@@ -297,6 +334,7 @@ class HistoryWolfExpertFilter:
                     summary_values["direction"].append(direction)
                     summary_values["magnitude"].append(magnitude)
                     summary_values["mu_old"].append(mu_old)
+                    summary_values["mu_eff"].append(mu_eff)
                     summary_values["mu_new"].append(mu_new)
                     summary_values["p_pred"].append(p_pred)
                     summary_values["p_new"].append(p_new)
@@ -305,9 +343,36 @@ class HistoryWolfExpertFilter:
                     summary_values["final_raw"].append(final_raw)
                     if use_fisher:
                         summary_values["fisher_multiplier"].append(fisher_multiplier)
+                    if quadrant_values is not None:
+                        current_good = q_value >= self.quadrant_threshold
+                        history_good = mu_eff >= self.quadrant_threshold
+                        if current_good and history_good:
+                            quadrant = "current_good_history_good"
+                        elif current_good:
+                            quadrant = "current_good_history_bad"
+                        elif history_good:
+                            quadrant = "current_bad_history_good"
+                        else:
+                            quadrant = "current_bad_history_bad"
+
+                        values = quadrant_values[quadrant]
+                        values["q"].append(float(q_value))
+                        values["mu_eff"].append(float(mu_eff))
+                        values["direction"].append(float(direction))
+                        values["magnitude"].append(float(magnitude))
+                        values["usage_conf"].append(float(usage_conf))
+                        values["filter_raw"].append(float(filter_raw))
+                        values["final_raw"].append(float(final_raw))
+                        values["mu_old"].append(float(mu_old))
+                        values["mu_new"].append(float(mu_new))
+                        values["p_pred"].append(float(p_pred))
+                        values["p_new"].append(float(p_new))
+                        if use_fisher:
+                            values["fisher_multiplier"].append(float(fisher_multiplier))
 
                 weights_by_ref[expert_ref] = weights
 
+        weight_dispersion_summary = self._summarize_weight_dispersion(weights_by_ref)
         self._update_summary(
             num_experts=len(expert_keys_by_ref),
             num_clients=num_clients,
@@ -316,6 +381,8 @@ class HistoryWolfExpertFilter:
             summary_values=summary_values,
             fisher_all_zero_expert_count=fisher_all_zero_expert_count,
             skipped_zero_delta_count=skipped_zero_delta_count,
+            quadrant_values=quadrant_values,
+            weight_dispersion_summary=weight_dispersion_summary,
         )
         return weights_by_ref
 
@@ -477,6 +544,8 @@ class HistoryWolfExpertFilter:
         summary_values: dict[str, list[float]] | None = None,
         fisher_all_zero_expert_count: int = 0,
         skipped_zero_delta_count: int = 0,
+        quadrant_values: dict[str, dict[str, list[float]]] | None = None,
+        weight_dispersion_summary: dict[str, float | int] | None = None,
     ) -> None:
         # summary 只保存 Python 标量，便于 server 日志打印和 checkpoint 外使用。
         summary_values = summary_values or {}
@@ -491,6 +560,7 @@ class HistoryWolfExpertFilter:
             "mean_direction": self._safe_mean(summary_values.get("direction", [])),
             "mean_magnitude": self._safe_mean(summary_values.get("magnitude", [])),
             "mean_mu_old": self._safe_mean(summary_values.get("mu_old", [])),
+            "mean_mu_eff": self._safe_mean(summary_values.get("mu_eff", [])),
             "mean_mu_new": self._safe_mean(summary_values.get("mu_new", [])),
             "mean_p_pred": self._safe_mean(summary_values.get("p_pred", [])),
             "mean_p_new": self._safe_mean(summary_values.get("p_new", [])),
@@ -498,6 +568,9 @@ class HistoryWolfExpertFilter:
             "mean_filter_raw": self._safe_mean(summary_values.get("filter_raw", [])),
             "mean_final_raw": self._safe_mean(summary_values.get("final_raw", [])),
         }
+        self.last_summary.update(
+            weight_dispersion_summary or self._summarize_weight_dispersion({})
+        )
         if use_fisher:
             self.last_summary.update(
                 {
@@ -507,6 +580,73 @@ class HistoryWolfExpertFilter:
                     "fisher_all_zero_expert_count": int(fisher_all_zero_expert_count),
                 }
             )
+        if self.quadrant_log:
+            quadrants = {}
+            for quadrant in _QUADRANT_NAMES:
+                values = (quadrant_values or {}).get(quadrant, {})
+                quadrant_summary = {
+                    "count": int(len(values.get("q", []))),
+                    "mean_q": self._safe_mean(values.get("q", [])),
+                    "mean_mu_eff": self._safe_mean(values.get("mu_eff", [])),
+                    "mean_direction": self._safe_mean(values.get("direction", [])),
+                    "mean_magnitude": self._safe_mean(values.get("magnitude", [])),
+                    "mean_usage_conf": self._safe_mean(values.get("usage_conf", [])),
+                    "mean_filter_raw": self._safe_mean(values.get("filter_raw", [])),
+                    "mean_final_raw": self._safe_mean(values.get("final_raw", [])),
+                    "mean_mu_old": self._safe_mean(values.get("mu_old", [])),
+                    "mean_mu_new": self._safe_mean(values.get("mu_new", [])),
+                    "mean_p_pred": self._safe_mean(values.get("p_pred", [])),
+                    "mean_p_new": self._safe_mean(values.get("p_new", [])),
+                }
+                if use_fisher:
+                    quadrant_summary["mean_fisher_multiplier"] = self._safe_mean(
+                        values.get("fisher_multiplier", [])
+                    )
+                quadrants[quadrant] = quadrant_summary
+            self.last_summary["quadrants"] = quadrants
+
+    def _summarize_weight_dispersion(
+        self,
+        weights_by_ref: dict[tuple[str, int], list[float]],
+    ) -> dict[str, float | int]:
+        # 每个 expert_ref 只用正 raw weight 诊断；全零 ref 单独计数，不混入均值。
+        nonzero_client_counts = []
+        top1_shares = []
+        ess_ratios = []
+        raw_weight_cvs = []
+        all_zero_ref_count = 0
+
+        for weights in weights_by_ref.values():
+            positive_weights = [
+                float(weight)
+                for weight in weights
+                if self._is_finite(weight) and float(weight) > 0
+            ]
+            weight_sum = sum(positive_weights)
+            if weight_sum <= 0:
+                all_zero_ref_count += 1
+                continue
+
+            probabilities = [weight / weight_sum for weight in positive_weights]
+            nonzero_client_count = len(positive_weights)
+            ess = 1.0 / sum(probability * probability for probability in probabilities)
+            mean_raw_weight = weight_sum / nonzero_client_count
+
+            nonzero_client_counts.append(float(nonzero_client_count))
+            top1_shares.append(float(max(probabilities)))
+            ess_ratios.append(float(ess / nonzero_client_count))
+            raw_weight_cvs.append(
+                float(statistics.pstdev(positive_weights) / mean_raw_weight)
+            )
+
+        return {
+            "weight_ref_count": int(len(weights_by_ref)),
+            "weight_all_zero_ref_count": int(all_zero_ref_count),
+            "mean_nonzero_clients_per_ref": self._safe_mean(nonzero_client_counts),
+            "mean_top1_share": self._safe_mean(top1_shares),
+            "mean_ess_ratio": self._safe_mean(ess_ratios),
+            "mean_raw_weight_cv": self._safe_mean(raw_weight_cvs),
+        }
 
     def _safe_mean(self, values: list[float]) -> float:
         finite_values = [float(value) for value in values if self._is_finite(value)]
