@@ -179,12 +179,18 @@ class Client:
             meta=self.partition_meta,
         )
 
-        # 构造 Fisher evidence 估计使用的 loader。
-        self.evidence_loader = build_client_evidence_loader(
-            args=self.args,
-            client_id=self.client_id,
-            meta=self.partition_meta,
-        )
+        # 只有 Fisher 聚合且使用确定性 evidence 数据时才构造额外 loader。
+        # 其他聚合方法不会读取它，train_loader 模式也会直接复用训练 loader。
+        if (
+            self.should_compute_fisher_evidence()
+            and getattr(self.args, "fedwolf_evidence_loader_mode", "deterministic")
+            == "deterministic"
+        ):
+            self.evidence_loader = build_client_evidence_loader(
+                args=self.args,
+                client_id=self.client_id,
+                meta=self.partition_meta,
+            )
 
 
     def renew_model(self, server_state_dict=None):
@@ -322,23 +328,11 @@ class Client:
         for epoch in range(self.client_epochs):
             self.model.train()
 
-            # 当前 epoch 的累计损失。
-            running_loss = 0.0
-
-            # 当前 epoch 的分类损失累计值。
-            running_ce_loss = 0.0
-
-            # 当前 epoch 的 lightweight router balance loss 累计值。
-            running_router_balance_loss = 0.0
-
-            # 当前 epoch 的 router auxiliary loss 累计值。
-            running_aux_loss = 0.0
-
-            # 当前 epoch 的 router z-loss 累计值。
-            running_z_loss = 0.0
+            # 纯日志指标留在 GPU 累计，避免每个 batch 调用 .item() 强制同步。
+            epoch_metric_sums = torch.zeros(5, dtype=torch.float64, device=self.device)
 
             # 当前 epoch 的正确预测数量。
-            running_corrects = 0
+            running_corrects = torch.zeros((), dtype=torch.long, device=self.device)
 
             # 当前 epoch 实际处理的样本数。
             total_samples = 0
@@ -354,7 +348,8 @@ class Client:
 
             for inputs, labels in self.train_loader:
                 # 把输入和标签移动到当前训练设备。
-                inputs, labels = inputs.to(self.device), labels.to(self.device)
+                inputs = inputs.to(self.device, non_blocking=True)
+                labels = labels.to(self.device, non_blocking=True)
 
                 # 清空上一轮 batch 的梯度。
                 self.optimizer.zero_grad()
@@ -387,12 +382,16 @@ class Client:
 
                 batch_size = inputs.size(0)
 
-                # loss.item() 是 batch 平均 loss，这里乘 batch_size 后累加，方便后面算 epoch 平均。
-                running_loss += loss.item() * batch_size
-                running_ce_loss += ce_loss.item() * batch_size
-                running_router_balance_loss += router_balance_loss.item() * batch_size
-                running_aux_loss += router_aux_loss.item() * batch_size
-                running_z_loss += router_z_loss.item() * batch_size
+                # batch 平均 loss 乘 batch_size 后累计，方便后面算 epoch 平均。
+                epoch_metric_sums += torch.stack(
+                    (
+                        loss.detach(),
+                        ce_loss.detach(),
+                        router_balance_loss.detach(),
+                        router_aux_loss.detach(),
+                        router_z_loss.detach(),
+                    )
+                ).to(dtype=torch.float64) * batch_size
                 total_samples += batch_size
 
                 # 计算当前 batch 的预测类别。
@@ -410,6 +409,21 @@ class Client:
                 # 按 batch_size 加权累计 router 概率，用于计算样本级平均。
                 router_prob_sum += self.get_avg_router_probs(result) * batch_size
 
+            # epoch 结束后一次性取回日志指标，训练计算全程不需要等待 CPU。
+            (
+                running_loss,
+                running_ce_loss,
+                running_router_balance_loss,
+                running_aux_loss,
+                running_z_loss,
+                running_correct_count,
+            ) = torch.cat(
+                (
+                    epoch_metric_sums,
+                    running_corrects.reshape(1).to(dtype=torch.float64),
+                )
+            ).detach().cpu().tolist()
+
             # 当前 epoch 平均训练损失。
             train_loss = running_loss / len(self.train_loader.dataset)
 
@@ -420,7 +434,7 @@ class Client:
             avg_router_balance_loss = running_router_balance_loss / max(total_samples, 1)
 
             # 当前 epoch 训练准确率。
-            train_acc = running_corrects.double() / len(self.train_loader.dataset)
+            train_acc = running_correct_count / len(self.train_loader.dataset)
 
             # 当前 epoch 平均 router aux loss。
             avg_aux_loss = running_aux_loss / max(total_samples, 1)
@@ -495,7 +509,7 @@ class Client:
                 'client_epoch': epoch+1,
                 'client_id': self.client_id,
                 "train_loss": train_loss,
-                "train_acc": train_acc.item(),
+                "train_acc": train_acc,
                 "ce_loss": avg_ce_loss,
                 "router_balance_loss": avg_router_balance_loss,
                 "router_balance_loss_coef": balance_coef,

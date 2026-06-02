@@ -442,7 +442,7 @@ def compute_expert_fisher_evidence(
 
     # score_sums 保存每层每个 expert 的逐样本梯度平方和累计值。
     score_sums = {
-        layer_id: torch.zeros(num_experts, dtype=torch.float64)
+        layer_id: torch.zeros(num_experts, dtype=torch.float64, device=device)
         for layer_id in expert_entries
     }
 
@@ -552,10 +552,10 @@ def compute_expert_fisher_evidence(
                                 delta.pow(2),
                                 activation.pow(2),
                             )
-                            grad_square_sum = float(weight_grad_square_sum.detach().cpu())
+                            grad_square_sum = weight_grad_square_sum.to(dtype=torch.float64)
 
                             if module.bias is not None:
-                                grad_square_sum += float(delta.pow(2).sum().detach().cpu())
+                                grad_square_sum += delta.pow(2).sum().to(dtype=torch.float64)
 
                             score_sums[layer_id][expert_id] += grad_square_sum
                             return
@@ -574,17 +574,17 @@ def compute_expert_fisher_evidence(
                                 f"{module_name}, got {sample_ids.numel()} and {delta.size(0)}."
                             )
 
-                        grad_square_sum = 0.0
+                        grad_square_sum = score_sums[layer_id].new_zeros(())
                         unique_sample_ids = torch.unique(sample_ids, sorted=False)
                         for sample_id in unique_sample_ids:
                             sample_mask = sample_ids == sample_id
                             delta_s = delta[sample_mask]
                             activation_s = activation[sample_mask]
                             sample_grad_w = torch.einsum("to,ti->oi", delta_s, activation_s)
-                            grad_square_sum += float(sample_grad_w.pow(2).sum().detach().cpu())
+                            grad_square_sum += sample_grad_w.pow(2).sum().to(dtype=torch.float64)
                             if module.bias is not None:
                                 sample_grad_b = delta_s.sum(dim=0)
-                                grad_square_sum += float(sample_grad_b.pow(2).sum().detach().cpu())
+                                grad_square_sum += sample_grad_b.pow(2).sum().to(dtype=torch.float64)
 
                         score_sums[layer_id][expert_id] += grad_square_sum
 
@@ -613,8 +613,8 @@ def compute_expert_fisher_evidence(
 
         for inputs, labels in data_loader:
             # 将数据移动到指定设备。
-            inputs = inputs.to(device)
-            labels = labels.to(device)
+            inputs = inputs.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
             # 清空旧梯度，避免和之前训练或上一个 batch 的梯度混在一起。
             model.zero_grad(set_to_none=True)
@@ -655,15 +655,15 @@ def compute_expert_fisher_evidence(
                     # 遍历每层每个 expert，累计该 expert 参数的梯度平方和。
                     for layer_id, experts in expert_entries.items():
                         for expert_id, entries in experts.items():
-                            grad_square_sum = 0.0
+                            grad_square_sum = score_sums[layer_id].new_zeros(())
                             has_grad_param_count = 0
                             none_grad_param_count = 0
 
                             # 当前 expert 可能包含多个参数张量，例如 Linear weight / bias。
                             for _, param in entries:
                                 if param.grad is not None:
-                                    # 累加当前参数张量的 grad^2 sum。
-                                    grad_square_sum += float(param.grad.detach().pow(2).sum().cpu())
+                                    # 累加当前参数张量的 grad^2 sum，整段 evidence 结束后再拷回 CPU。
+                                    grad_square_sum += param.grad.detach().pow(2).sum().to(dtype=torch.float64)
                                     has_grad_param_count += 1
                                 else:
                                     # 记录没有梯度的参数数量，目前主要用于调试时理解代码。
@@ -673,8 +673,8 @@ def compute_expert_fisher_evidence(
                             if has_grad_param_count > 0:
                                 samples_with_grad[layer_id][expert_id] += 1
 
-                            # 累加当前样本对该 expert 的梯度平方和。
-                            score_sums[layer_id][expert_id] += grad_square_sum
+                                # 累加当前样本对该 expert 的梯度平方和。
+                                score_sums[layer_id][expert_id] += grad_square_sum
 
                 # 只在前 debug_batches 个 batch 中记录简要调试信息。
                 if num_batches <= debug_batches:
@@ -723,6 +723,12 @@ def compute_expert_fisher_evidence(
             model.train()
         else:
             model.eval()
+
+    # Fisher 梯度平方和统一回到 CPU，后续归一化与原逻辑一致。
+    score_sums = {
+        layer_id: scores.detach().cpu()
+        for layer_id, scores in score_sums.items()
+    }
 
     # 写入总样本数和 batch 数。
     diagnostics["total_samples"] = int(total_samples)

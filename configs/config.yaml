@@ -91,7 +91,7 @@ model:
   # This only encourages soft router probabilities to avoid expert collapse.
   # It does not enable z-loss, capacity, drop_tokens, overflow, or Switch-style auxiliary mechanisms.
   # Try 0.001 first; if collapse remains, try 0.003 or 0.005.
-  router_balance_loss_coef: 0.0
+  router_balance_loss_coef: 0.003
 
 train:
   # 联邦学习中的客户端数量

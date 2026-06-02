@@ -366,9 +366,6 @@ class Server:
                 # checkpoint 记录已经完整完成的 server round。
                 self.save_training_checkpoint(completed_round=c_T + 1)
 
-                # 清理 CUDA 缓存，降低多轮训练中的显存占用波动。
-                torch.cuda.empty_cache()
-
         # 所有 server round 结束后，再做一次最终测试。
         self.evaluate_final_on_global_test()
         self.save_training_checkpoint(
@@ -386,14 +383,15 @@ class Server:
         self.model.to(self.device)
         self.model.eval()
 
-        running_loss = 0.0
-        running_corrects = 0
+        # 评估统计留在 GPU 累计，循环结束后统一拷回 CPU。
+        eval_metric_sums = torch.zeros(2, dtype=torch.float64, device=self.device)
 
         # 评估阶段不需要反向传播，因此关闭梯度计算。
         with torch.no_grad():
             for inputs, labels in data_loader:
                 # 将输入和标签移动到评估设备。
-                inputs, labels = inputs.to(self.device), labels.to(self.device)
+                inputs = inputs.to(self.device, non_blocking=True)
+                labels = labels.to(self.device, non_blocking=True)
 
                 # 前向推理，兼容字典结果和直接返回的 logits。
                 result = self.model(inputs)
@@ -402,23 +400,26 @@ class Server:
                 # 计算当前 batch 的分类损失。
                 loss = self.criterion(outputs, labels)
 
-                # 累加总损失，乘 batch size 是为了后面计算样本级平均 loss。
-                running_loss += loss.item() * inputs.size(0)
-
                 # 取 logits 最大值对应类别作为预测类别。
                 _, preds = torch.max(outputs, 1)
 
-                # 累加预测正确的样本数。
-                running_corrects += torch.sum(preds == labels.data)
+                # 累加总损失和正确样本数，不在 batch 循环内同步 GPU。
+                eval_metric_sums += torch.stack(
+                    (
+                        loss.detach() * inputs.size(0),
+                        torch.sum(preds == labels.data),
+                    )
+                ).to(dtype=torch.float64)
 
         # 计算整个评估集上的平均 loss 和准确率。
+        running_loss, running_corrects = eval_metric_sums.detach().cpu().tolist()
         eval_loss = running_loss / len(data_loader.dataset)
-        eval_acc = running_corrects.double() / len(data_loader.dataset)
+        eval_acc = running_corrects / len(data_loader.dataset)
 
         # 评估结束后将模型移回 CPU，减少显存占用。
         self.model.to("cpu")
 
-        return eval_loss, eval_acc.item()
+        return eval_loss, eval_acc
 
     def evaluate_round_on_global_test(self, round_id):
         """每轮聚合后在 global_test 上评估一次，仅用于监控训练曲线。"""

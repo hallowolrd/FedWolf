@@ -145,47 +145,41 @@ class TokenSwitchFFN(nn.Module):
             minlength=self.num_experts,
         ).to(x.device)
 
-        # expert_activations 记录每个 expert 实际处理的 token 数。
-        expert_activations = torch.zeros(self.num_experts, device=x.device, dtype=torch.long)
+        # 稳定排序后，同一 expert 内的 token 顺序仍与原先 nonzero 结果一致。
+        sorted_positions = torch.argsort(flat_indices, stable=True)
+        selected_count_list = selected_counts.detach().cpu().tolist()
 
-        # overflow_counts 记录每个 expert 超出 capacity 的 token 数。
-        overflow_counts = torch.zeros(self.num_experts, device=x.device, dtype=torch.long)
+        # 这两个统计可以直接由 selected_counts 在 GPU 上得到。
+        expert_activations = selected_counts.clone()
+        overflow_counts = torch.clamp(selected_counts - capacity, min=0)
 
         # 逐个 expert 处理分配给自己的 token。
+        start = 0
         for expert_id, expert in enumerate(self.experts):
             # 清理上一轮 forward 临时挂载的 sample id，避免 stale state。
             if hasattr(expert, "_fedwolf_accepted_sample_ids"):
                 delattr(expert, "_fedwolf_accepted_sample_ids")
 
-            # 找到当前 expert 被分配到的 token 位置。
-            token_positions = torch.nonzero(flat_indices == expert_id, as_tuple=False).flatten()
+            token_count = selected_count_list[expert_id]
+            end = start + token_count
+            accepted_positions = sorted_positions[start:end]
+            start = end
 
             # 当前 expert 没有 token，则跳过。
-            if token_positions.numel() == 0:
+            if token_count == 0:
                 continue
 
-            # 计算当前 expert 超出容量的 token 数。
-            overflow_count = max(token_positions.numel() - capacity, 0)
-            overflow_counts[expert_id] = overflow_count
-
-            # 不做硬容量截断：当前 expert 处理 router 分配给它的全部 token。
-            accepted_positions = token_positions
-
-            # 记录当前 expert 实际处理的 token 数。
-            expert_activations[expert_id] = accepted_positions.numel()
-
             # 当前 expert 对分配给它的 token 做 FFN 计算。
-            if accepted_positions.numel() > 0:
-                expert._fedwolf_accepted_sample_ids = (accepted_positions // num_tokens).detach()
-                expert_output = expert(flat_x[accepted_positions])
+            expert._fedwolf_accepted_sample_ids = (accepted_positions // num_tokens).detach()
+            expert_output = expert(flat_x[accepted_positions])
 
-                # Straight-through hard gate:
-                # forward: hard_gate == 1, so selected expert output is not scaled down.
-                # backward: d(hard_gate)/d(top1_prob) == 1, so router still receives task gradients.
-                gate = flat_top1_probs[accepted_positions].unsqueeze(-1)
-                hard_gate = gate + (1.0 - gate).detach()
+            # Straight-through hard gate:
+            # forward: hard_gate == 1, so selected expert output is not scaled down.
+            # backward: d(hard_gate)/d(top1_prob) == 1, so router still receives task gradients.
+            gate = flat_top1_probs[accepted_positions].unsqueeze(-1)
+            hard_gate = gate + (1.0 - gate).detach()
 
-                flat_output[accepted_positions] = expert_output * hard_gate
+            flat_output[accepted_positions] = expert_output * hard_gate
 
         # 恢复成原始 token 形状。
         output = flat_output.reshape(batch_size, num_tokens, embed_dim)

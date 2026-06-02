@@ -79,16 +79,16 @@ class SimpleMoEHead(nn.Module):
         top1_probs, top1_indices = router_probs.max(dim=-1)
 
         logits = features.new_zeros((features.size(0), self.num_classes))
-        for expert_id, expert in enumerate(self.experts):
-            sample_mask = top1_indices == expert_id
-            if not sample_mask.any():
-                continue
+        selected_counts = torch.bincount(top1_indices, minlength=self.num_experts)
 
+        # 一次性取回活跃 expert，避免逐 expert 的 .any() 触发多次 GPU 同步。
+        active_expert_ids = torch.nonzero(selected_counts, as_tuple=False).flatten().tolist()
+        for expert_id in active_expert_ids:
+            expert = self.experts[expert_id]
+            sample_mask = top1_indices == expert_id
             selected_prob = top1_probs[sample_mask]
             hard_gate = selected_prob + (1.0 - selected_prob).detach()
             logits[sample_mask] = expert(features[sample_mask]) * hard_gate.unsqueeze(-1)
-
-        selected_counts = torch.bincount(top1_indices, minlength=self.num_experts)
         expert_activations = selected_counts
         overflow_counts = torch.zeros_like(selected_counts)
         avg_router_probs = router_probs.mean(dim=0)

@@ -127,11 +127,15 @@ class MoELayer(nn.Module):
         weights, topk_indices = self.gating(x)
         out = x.new_zeros((x.size(0), self.out_dim))
 
-        for expert_id, expert in enumerate(self.experts):
+        # 一次性取回活跃 expert，避免逐 expert 的 .any() 触发多次 GPU 同步。
+        selected_counts = torch.bincount(
+            topk_indices.reshape(-1),
+            minlength=len(self.experts),
+        )
+        active_expert_ids = torch.nonzero(selected_counts, as_tuple=False).flatten().tolist()
+        for expert_id in active_expert_ids:
+            expert = self.experts[expert_id]
             token_mask = (topk_indices == expert_id).any(dim=-1)
-            if not token_mask.any():
-                continue
-
             expert_out = expert(x[token_mask])
             selected_weights = weights[token_mask, expert_id]
             out[token_mask] += expert_out * selected_weights.unsqueeze(-1)
