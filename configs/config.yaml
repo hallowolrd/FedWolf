@@ -5,8 +5,11 @@ data:
   # 原始 CIFAR 数据保存位置；data.data 会在这里读取或下载官方数据。
   data_path: ./data
 
-  # 客户端本地训练与全局测试共用的 batch size。
+  # 客户端本地训练使用的 batch size。
   batch_size: 64
+
+  # 全局测试 DataLoader 使用的 batch size，对齐原始 moefedavg.py。
+  eval_batch_size: 256
 
   # Dirichlet non-IID 划分参数；值越小，客户端类别分布越不均匀。
   alpha: 0.1

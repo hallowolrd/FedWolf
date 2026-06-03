@@ -12,7 +12,7 @@ import yaml
 
 _CONFIG_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _CONFIG_DIR.parent
-DEFAULT_CONFIG_PATH = "configs/moefedavg_baseline/config.yaml"
+DEFAULT_CONFIG_PATH = "configs/config.yaml"
 _REQUIRED_SECTIONS = ("data", "model", "train")
 _REQUIRED_CONFIG_KEYS = (
     "data_name",
@@ -51,6 +51,7 @@ _REQUIRED_CONFIG_KEYS = (
 )
 
 _DEFAULTS = {
+    "eval_batch_size": None,
     "partition_meta_name": "partition_meta.pt",
     "partition_stats_name": "partition_stats.json",
     "resume": False,
@@ -167,10 +168,12 @@ def _normalize_aggregation_config(merged_config: dict) -> None:
     merged_config["expert_agg_method"] = expert_method
     if aggregation_mode == "whole_model_uniform_avg":
         merged_config["agg_method"] = "whole_model_uniform_avg"
-    else:
+    elif aggregation_mode == "split_expert":
         merged_config["agg_method"] = (
             f"split_expert_nonexpert_{non_expert_method}_expert_{expert_method}"
         )
+    else:
+        raise ValueError(f"Unsupported aggregation_mode: {aggregation_mode}")
 
 
 def _sanitize_run_name(run_name: object) -> str:

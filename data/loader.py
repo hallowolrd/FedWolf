@@ -416,10 +416,15 @@ def build_global_eval_loader(args, split, meta=None):
     # 构造全局测试数据集。
     dataset = build_index_dataset(args=args, split=split, meta=meta)
 
+    eval_batch_size = getattr(args, "eval_batch_size", None)
+    if eval_batch_size is None:
+        eval_batch_size = args.batch_size
+    eval_batch_size = int(eval_batch_size)
+
     # 测试 DataLoader 不打乱样本顺序。
     return DataLoader(
         dataset,
-        batch_size=args.batch_size,
+        batch_size=eval_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,

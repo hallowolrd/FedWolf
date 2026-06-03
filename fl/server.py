@@ -67,6 +67,7 @@ class Server:
             "server_epochs",
             "client_epochs",
             "batch_size",
+            "eval_batch_size",
         )
         model_keys = (
             "model_type",
@@ -331,11 +332,15 @@ class Server:
                 "[Aggregator] whole_model_uniform_avg active: "
                 "averaging full state_dict uniformly\n"
             )
-        else:
+        elif self.args.aggregation_mode == "split_expert":
             self.logger.info(
                 "[Aggregator] split_expert active: "
                 f"non_expert_agg_method={self.args.non_expert_agg_method}, "
                 f"expert_agg_method={self.args.expert_agg_method}\n"
+            )
+        else:
+            raise ValueError(
+                f"Unsupported aggregation_mode: {self.args.aggregation_mode}"
             )
 
         aggregated_state = self.aggregator.aggregate(
