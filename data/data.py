@@ -42,6 +42,9 @@ class CIFARPartitionBuilder:
         # alpha 越小，客户端之间的数据越 non-IID；alpha 越大，类别分布越接近均匀。
         self.alpha = self.args.alpha
 
+        # 数据划分实现。default 保持旧逻辑，moefedavg 复现单文件 baseline。
+        self.partition_impl = str(getattr(self.args, "partition_impl", "default")).strip().lower()
+
         # 先加载 torchvision 里的原始训练集和测试集。
         self.train_dataset,self.test_dataset,self.num_classes = self.load_dataset()
 
@@ -92,6 +95,7 @@ class CIFARPartitionBuilder:
             "num_clients": self.num_clients,
             "alpha": self.alpha,
             "seed": self.seed,
+            "partition_impl": self.partition_impl,
             "index_space": {
                 "client_train": "official_train",
                 "global_test": "official_test",
@@ -125,8 +129,14 @@ class CIFARPartitionBuilder:
         if self.alpha <= 0:
             raise ValueError("alpha must be positive")
 
+        if self.partition_impl not in {"default", "moefedavg"}:
+            raise ValueError("partition_impl must be either 'default' or 'moefedavg'")
+
     def dirichlet_client_split(self, pool_indices):
         """ 把官方训练集按 Dirichlet 分布切给多个客户端，构造 non-IID 的联邦训练数据。"""
+
+        if self.partition_impl == "moefedavg":
+            return self.moefedavg_dirichlet_client_split(pool_indices)
 
         # 将输入索引转成 NumPy 数组，方便后面按类别筛选。
         pool_indices = np.array(pool_indices)
@@ -171,6 +181,31 @@ class CIFARPartitionBuilder:
 
         return client_indices
 
+    def moefedavg_dirichlet_client_split(self, pool_indices):
+        """复现 moefedavg.py 的 per-class dirichlet + multinomial 划分。"""
+
+        pool_indices = np.array(pool_indices)
+        pool_targets = self.train_targets[pool_indices]
+        client_indices = {client_id: [] for client_id in range(1, self.num_clients + 1)}
+
+        for class_id in range(self.num_classes):
+            class_idcs = pool_indices[np.where(pool_targets == class_id)[0]].copy()
+            self.rng.shuffle(class_idcs)
+
+            proportions = self.rng.dirichlet(np.full(self.num_clients, self.alpha))
+            counts = self.rng.multinomial(len(class_idcs), proportions)
+
+            offset = 0
+            for client_id, count in enumerate(counts, start=1):
+                next_offset = offset + int(count)
+                client_indices[client_id].extend(class_idcs[offset:next_offset].tolist())
+                offset = next_offset
+
+        for idcs in client_indices.values():
+            self.rng.shuffle(idcs)
+
+        return client_indices
+
     def build_stats(self, meta):
         """ 根据 meta 中的划分结果，生成统计信息 stats。
         stats 主要用于：
@@ -195,6 +230,7 @@ class CIFARPartitionBuilder:
             "num_clients": self.num_clients,
             "alpha": self.alpha,
             "seed": self.seed,
+            "partition_impl": self.partition_impl,
             "sizes": {
                 # 官方训练集总样本数。
                 "official_train": len(self.train_dataset),

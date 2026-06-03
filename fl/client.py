@@ -65,11 +65,23 @@ class Client:
         self.client_epochs = self.args.client_epochs
 
         # 分类任务常用交叉熵损失。
-        self.criterion = nn.CrossEntropyLoss()
+        self.criterion = nn.CrossEntropyLoss(
+            label_smoothing=float(getattr(self.args, "label_smooth", 0.0))
+        )
 
-        # 客户端本地优化器。
-        # 当前使用 Adam，学习率来自配置 args.learning_rate。
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+        # 客户端本地优化器。默认保持旧 Adam 行为；strict baseline 显式使用 SGD。
+        optimizer_name = str(getattr(self.args, "optimizer", "adam")).strip().lower()
+        if optimizer_name == "sgd":
+            self.optimizer = optim.SGD(
+                self.model.parameters(),
+                lr=self.args.learning_rate,
+                momentum=float(getattr(self.args, "momentum", 0.0)),
+                weight_decay=float(getattr(self.args, "weight_decay", 0.0)),
+            )
+        elif optimizer_name == "adam":
+            self.optimizer = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+        else:
+            raise ValueError(f"Unsupported optimizer: {optimizer_name}")
 
         self.batch_size = self.args.batch_size
 
@@ -376,6 +388,10 @@ class Client:
 
                 # 反向传播。
                 loss.backward()
+
+                grad_clip_norm = float(getattr(self.args, "grad_clip_norm", 0.0))
+                if grad_clip_norm > 0.0:
+                    nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip_norm)
 
                 # 更新本地模型参数。
                 self.optimizer.step()

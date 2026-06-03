@@ -15,7 +15,7 @@ EXPECTED_PROTOCOL = "client_train_global_test_index_partition"
 EXPECTED_VERSION = 3
 
 
-def get_cifar_stats(data_name):
+def get_cifar_stats(data_name, stats_impl=None):
     """根据数据集名字，返回：
     1. 数据集类 CIFAR10 或 CIFAR100
     2. 归一化均值 mean
@@ -38,6 +38,15 @@ def get_cifar_stats(data_name):
         ),
     }
 
+    # 严格 baseline 复用 moefedavg.py 的 CIFAR10 normalize std。
+    if str(stats_impl).strip().lower() == "moefedavg" and data_name == "cifar10":
+        data_dict["cifar10"] = (
+            CIFAR10,
+            (0.4914, 0.4822, 0.4465),
+            (0.2023, 0.1994, 0.2010),
+            10,
+        )
+
     # 如果配置的数据集名称不支持，直接报错。
     if data_name not in data_dict:
         raise ValueError(f"Unsupported dataset: {data_name}")
@@ -45,13 +54,13 @@ def get_cifar_stats(data_name):
     return data_dict[data_name]
 
 
-def build_transforms(data_name):
+def build_transforms(data_name, transform_impl=None):
     """构造图像预处理流程：
     - client_train:使用数据增强
     - eval(global_test)：使用确定性预处理，不做增强"""
 
     # 读取当前数据集对应的归一化均值、标准差。
-    _, mean, std, _ = get_cifar_stats(data_name)
+    _, mean, std, _ = get_cifar_stats(data_name, stats_impl=transform_impl)
 
     # 训练阶段 transform：
     # 随机裁剪 + 随机水平翻转 + 转 Tensor + 归一化。
@@ -113,6 +122,8 @@ def validate_partition_meta(meta, args):
         ("seed", meta.get("seed"), args.seed, "int"),
         ("data_path", meta.get("data_path"), args.data_path, "path"),
     ]
+    if hasattr(args, "partition_impl"):
+        checks.append(("partition_impl", meta.get("partition_impl"), args.partition_impl, "str"))
 
     # 任意一个字段不匹配，就说明当前配置和已有 partition_meta.pt 不一致。
     for field, actual, expected, value_type in checks:
@@ -307,7 +318,10 @@ def build_index_dataset(args, split, client_id=None, meta=None):
     meta = meta or load_partition_meta(args)
 
     # 构造训练 transform 和评估 transform。
-    train_transform, eval_transform = build_transforms(args.data_name)
+    train_transform, eval_transform = build_transforms(
+        args.data_name,
+        transform_impl=getattr(args, "partition_impl", None),
+    )
 
     # 取出 meta 中保存的划分索引。
     splits = meta["splits"]
@@ -364,7 +378,10 @@ def build_client_evidence_loader(args, client_id, meta=None):
     meta = meta or load_partition_meta(args)
 
     # Fisher evidence 使用 eval_transform，不使用随机增强，保证估计更稳定。
-    _, eval_transform = build_transforms(args.data_name)
+    _, eval_transform = build_transforms(
+        args.data_name,
+        transform_impl=getattr(args, "partition_impl", None),
+    )
 
     # evidence 数据仍然来自该客户端自己的训练样本。
     indices = meta["splits"]["client_train_indices"][str(client_id)]

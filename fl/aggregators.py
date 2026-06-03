@@ -365,7 +365,47 @@ class SplitAggregator(Aggregator):
         return value
 
 
+class WholeModelUniformAggregator(Aggregator):
+    # 严格复现 moefedavg.py 的 whole-model uniform FedAvg。
+    # 不区分 expert / non-expert，也不使用样本数、usage、Fisher 或 History-WoLF 权重。
+    def aggregate(self, client_updates, client_weights=None, global_model=None, **kwargs):
+        if len(client_updates) == 0:
+            raise ValueError("WholeModelUniformAggregator requires at least one client update")
+
+        num_clients = len(client_updates)
+        reference_state = (
+            global_model.state_dict()
+            if global_model is not None
+            else client_updates[0]
+        )
+
+        aggregated_state = collections.OrderedDict()
+        for key, reference_value in reference_state.items():
+            avg_value = torch.zeros_like(
+                reference_value.detach().cpu(),
+                dtype=torch.float32,
+                device="cpu",
+            )
+
+            for state in client_updates:
+                avg_value += state[key].detach().cpu().float() / num_clients
+
+            aggregated_state[key] = avg_value.to(dtype=reference_value.dtype)
+
+        return aggregated_state
+
+    def state_dict(self):
+        return {}
+
+    def load_state_dict(self, state):
+        return
+
+
 def build_aggregator(args):
+    aggregation_mode = str(getattr(args, "aggregation_mode", "split")).strip().lower()
+    if aggregation_mode == "whole_model_uniform_avg":
+        return WholeModelUniformAggregator()
+
     # 根据 non_expert_agg_method 和 expert_agg_method 构造拆分聚合器。
     # 旧 agg_method 会在配置加载阶段映射到这两个字段；这里也保留兜底兼容。
     return SplitAggregator(args)

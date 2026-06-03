@@ -95,7 +95,10 @@ class Server:
 
         experiment_config = {
             "data_name": self.args.data_name,
+            "batch_size": self.args.batch_size,
             "alpha": self.args.alpha,
+            "seed": self.args.seed,
+            "partition_impl": getattr(self.args, "partition_impl", "default"),
             "num_clients": self.args.num_clients,
             "server_epochs": self.args.server_epochs,
             "client_epochs": self.args.client_epochs,
@@ -106,6 +109,12 @@ class Server:
             "expert_hidden_dim": getattr(self.args, "expert_hidden_dim", None),
             "dropout": self.args.dropout,
             "learning_rate": self.args.learning_rate,
+            "optimizer": getattr(self.args, "optimizer", "adam"),
+            "momentum": getattr(self.args, "momentum", 0.0),
+            "weight_decay": getattr(self.args, "weight_decay", 0.0),
+            "grad_clip_norm": getattr(self.args, "grad_clip_norm", 0.0),
+            "label_smooth": getattr(self.args, "label_smooth", 0.0),
+            "aggregation_mode": getattr(self.args, "aggregation_mode", "split"),
             "non_expert_agg_method": self.args.non_expert_agg_method,
             "expert_agg_method": self.args.expert_agg_method,
             "router_aux_loss_coef": getattr(self.args, "router_aux_loss_coef", 0.0),
@@ -608,6 +617,7 @@ class Server:
             self.logger.info(f"--history_wolf_filter_summary : {compact_summary}\n")
 
         # 打印当前聚合方法和客户端样本数，方便检查实验配置。
+        self.logger.info(f"--aggregation_mode : {getattr(self.args, 'aggregation_mode', 'split')}\n")
         self.logger.info(f"--aggregation_method : {self.args.agg_method}\n")
         self.logger.info(f"--non_expert_agg_method : {self.args.non_expert_agg_method}\n")
         self.logger.info(f"--expert_agg_method : {self.args.expert_agg_method}\n")

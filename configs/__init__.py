@@ -81,6 +81,14 @@ _SPLIT_AGG_METHOD_NAME_MAP = {
     value: key
     for key, value in _LEGACY_AGG_METHOD_MAP.items()
 }
+_AGGREGATION_MODE_ALIASES = {
+    "split": "split",
+    "split_aggregation": "split",
+    "split_avg": "split",
+    "whole_model_uniform_avg": "whole_model_uniform_avg",
+    "whole_model_uniform_fedavg": "whole_model_uniform_avg",
+    "uniform_fedavg": "whole_model_uniform_avg",
+}
 
 
 def _resolve_config_path(path_str: str) -> Path:
@@ -167,7 +175,16 @@ def _derive_agg_method_name(non_expert_method: str, expert_method: str) -> str:
 
 
 def _normalize_aggregation_config(merged_config: dict) -> None:
-    """Normalize split aggregation config while keeping legacy agg_method usable."""
+    """Normalize aggregation config while keeping legacy split settings usable."""
+
+    raw_mode = merged_config.get("aggregation_mode", "split")
+    aggregation_mode = str(raw_mode).strip().lower()
+    if aggregation_mode not in _AGGREGATION_MODE_ALIASES:
+        valid_values = sorted(_AGGREGATION_MODE_ALIASES)
+        raise ValueError(
+            f"`aggregation_mode` must be one of {valid_values}, got {raw_mode!r}."
+        )
+    aggregation_mode = _AGGREGATION_MODE_ALIASES[aggregation_mode]
 
     has_non_expert = "non_expert_agg_method" in merged_config
     has_expert = "expert_agg_method" in merged_config
@@ -201,15 +218,21 @@ def _normalize_aggregation_config(merged_config: dict) -> None:
         non_expert_method, expert_method = _split_legacy_agg_method(
             merged_config["agg_method"]
         )
+    elif aggregation_mode == "whole_model_uniform_avg":
+        non_expert_method, expert_method = "equal_avg", "equal_avg"
     else:
         raise ValueError(
             "Missing aggregation config. Set `non_expert_agg_method` and "
             "`expert_agg_method` in the train section."
         )
 
+    merged_config["aggregation_mode"] = aggregation_mode
     merged_config["non_expert_agg_method"] = non_expert_method
     merged_config["expert_agg_method"] = expert_method
-    merged_config["agg_method"] = _derive_agg_method_name(non_expert_method, expert_method)
+    if aggregation_mode == "whole_model_uniform_avg":
+        merged_config["agg_method"] = "whole_model_uniform_avg"
+    else:
+        merged_config["agg_method"] = _derive_agg_method_name(non_expert_method, expert_method)
 
 
 def _sanitize_run_name(run_name: object) -> str:

@@ -14,6 +14,8 @@
 configs/*
 !configs/__init__.py
 !configs/config.yaml
+!configs/moefedavg_baseline/
+!configs/moefedavg_baseline/config.yaml
 
 # data：保留当前目录下所有 .py 文件
 !data/
