@@ -110,7 +110,7 @@ class TopKGating(nn.Module):
 
         weights = torch.zeros_like(probs)
         weights.scatter_(1, topk_indices, topk_values)
-        return weights.to(x.dtype), topk_indices
+        return weights.to(x.dtype), topk_indices, probs
 
 
 class MoELayer(nn.Module):
@@ -122,16 +122,22 @@ class MoELayer(nn.Module):
             for _ in range(num_experts)
         ])
         self.out_dim = out_dim
+        self.num_experts = num_experts
+        self.last_expert_usage = None
+        self.last_avg_router_probs = None
 
     def forward(self, x):
-        weights, topk_indices = self.gating(x)
+        weights, topk_indices, router_probs = self.gating(x)
         out = x.new_zeros((x.size(0), self.out_dim))
 
-        # 一次性取回活跃 expert，避免逐 expert 的 .any() 触发多次 GPU 同步。
         selected_counts = torch.bincount(
             topk_indices.reshape(-1),
-            minlength=len(self.experts),
+            minlength=self.num_experts,
         )
+        with torch.no_grad():
+            self.last_expert_usage = selected_counts.detach()
+            self.last_avg_router_probs = router_probs.detach().mean(dim=0)
+
         active_expert_ids = torch.nonzero(selected_counts, as_tuple=False).flatten().tolist()
         for expert_id in active_expert_ids:
             expert = self.experts[expert_id]
@@ -141,6 +147,18 @@ class MoELayer(nn.Module):
             out[token_mask] += expert_out * selected_weights.unsqueeze(-1)
 
         return out
+
+    def get_moe_stats(self):
+        if self.last_expert_usage is None or self.last_avg_router_probs is None:
+            return None
+
+        usage = self.last_expert_usage.detach()
+        avg_probs = self.last_avg_router_probs.detach()
+        return {
+            "expert_activations": usage,
+            "selected_counts": usage,
+            "avg_router_probs": avg_probs,
+        }
 
 
 class ResNetSparseMoEHead(nn.Module):
@@ -165,3 +183,16 @@ class ResNetSparseMoEHead(nn.Module):
     def forward(self, x):
         features = self.backbone(x)
         return self.moe_head(features)
+
+    def get_moe_stats(self):
+        stats = self.moe_head.get_moe_stats()
+        if stats is None:
+            return None
+
+        return {
+            "expert_activations": stats["expert_activations"],
+            "avg_router_probs": stats["avg_router_probs"],
+            "expert_stats_by_layer": {
+                "moe_head": stats,
+            },
+        }

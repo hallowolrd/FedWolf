@@ -9,9 +9,10 @@ from types import SimpleNamespace
 
 import yaml
 
+
 _CONFIG_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _CONFIG_DIR.parent
-DEFAULT_CONFIG_PATH = "configs/config.yaml"
+DEFAULT_CONFIG_PATH = "configs/moefedavg_baseline/config.yaml"
 _REQUIRED_SECTIONS = ("data", "model", "train")
 _REQUIRED_CONFIG_KEYS = (
     "data_name",
@@ -19,75 +20,64 @@ _REQUIRED_CONFIG_KEYS = (
     "batch_size",
     "alpha",
     "seed",
-    "partition_meta_name",
-    "partition_stats_name",
     "num_workers",
     "pin_memory",
+    "partition_impl",
+    "model_type",
+    "num_experts",
+    "top_k",
+    "learning_rate",
+    "dropout",
+    "router_aux_loss_coef",
+    "router_z_loss_coef",
+    "router_balance_loss_coef",
     "num_clients",
     "server_epochs",
     "client_epochs",
     "device",
+    "save_root",
     "run_name",
-    "model_type",
-    "num_experts",
-    "dropout",
-    "learning_rate",
-    "embed_dim",
-    "num_heads",
-    "mlp_ratio",
-    "depth",
-    "moe_layers",
-    "top_k",
-    "token_grid_size",
-    "use_cls_token",
+    "allow_overwrite",
+    "save_client_models",
+    "aggregation_mode",
+    "non_expert_agg_method",
+    "expert_agg_method",
+    "optimizer",
+    "momentum",
+    "weight_decay",
+    "grad_clip_norm",
+    "label_smooth",
+    "fedwolf_eps",
 )
-_DEFAULT_SAVE_ROOT = "save"
-_DEFAULT_ALLOW_OVERWRITE = False
-_DEFAULT_RESUME = False
-_NON_EXPERT_AGG_ALIASES = {
-    "equal_avg": "equal_avg",
-    "direct_avg": "equal_avg",
-    "fedavg": "sample_weighted_avg",
-    "sample_weighted": "sample_weighted_avg",
-    "sample_weighted_avg": "sample_weighted_avg",
+
+_DEFAULTS = {
+    "partition_meta_name": "partition_meta.pt",
+    "partition_stats_name": "partition_stats.json",
+    "resume": False,
+    "fedwolf_evidence_loader_mode": "deterministic",
+    "fedwolf_evidence_model_mode": "eval",
+    "fedwolf_fisher_estimator": "linear_hook_token_fast",
+    "fedwolf_fisher_score_mode": "trace_per_active_sample",
+    "fedwolf_fisher_debug_batches": 0,
+    "fedwolf_fisher_debug": False,
+    "history_wolf_min_usage": 1,
+    "history_wolf_score_momentum": 0.5,
 }
-_EXPERT_AGG_ALIASES = {
-    "equal_avg": "equal_avg",
-    "direct_avg": "equal_avg",
-    "fedavg": "sample_weighted_avg",
-    "sample_weighted": "sample_weighted_avg",
-    "sample_weighted_avg": "sample_weighted_avg",
-    "expert_usage": "expert_usage",
-    "token_usage": "expert_usage",
-    "expert_fedavg": "expert_usage",
-    "fisher": "fisher_raw_score",
-    "fisher_raw_score": "fisher_raw_score",
-    "fedwolf_fisher_only": "fisher_raw_score",
-    "history_wolf_filter": "history_wolf_filter",
-    "fedwolf_history_wolf": "history_wolf_filter",
-    "fisher_history_wolf": "fisher_history_wolf",
-    "fedwolf_fisher_history_wolf": "fisher_history_wolf",
+
+_NON_EXPERT_AGG_METHODS = {
+    "equal_avg",
+    "sample_weighted_avg",
 }
-_LEGACY_AGG_METHOD_MAP = {
-    "fedavg": ("sample_weighted_avg", "sample_weighted_avg"),
-    "equal_avg": ("equal_avg", "equal_avg"),
-    "expert_fedavg": ("sample_weighted_avg", "expert_usage"),
-    "expert_equal_avg": ("sample_weighted_avg", "equal_avg"),
-    "fedwolf_fisher_only": ("sample_weighted_avg", "fisher_raw_score"),
-    "fedwolf_history_wolf": ("sample_weighted_avg", "history_wolf_filter"),
-    "fedwolf_fisher_history_wolf": ("sample_weighted_avg", "fisher_history_wolf"),
-}
-_SPLIT_AGG_METHOD_NAME_MAP = {
-    value: key
-    for key, value in _LEGACY_AGG_METHOD_MAP.items()
+_EXPERT_AGG_METHODS = {
+    "equal_avg",
+    "sample_weighted_avg",
+    "fisher_raw_score",
+    "history_wolf_filter",
 }
 _AGGREGATION_MODE_ALIASES = {
-    "split": "split",
-    "split_aggregation": "split",
-    "split_avg": "split",
     "whole_model_uniform_avg": "whole_model_uniform_avg",
-    "whole_model_uniform_fedavg": "whole_model_uniform_avg",
-    "uniform_fedavg": "whole_model_uniform_avg",
+    "split_expert": "split_expert",
+    "split": "split_expert",
 }
 
 
@@ -99,8 +89,6 @@ def _resolve_config_path(path_str: str) -> Path:
 
 
 def _load_yaml_mapping(config_path: str | Path) -> dict:
-    """Load one YAML file and require a top-level mapping."""
-
     config_path = _resolve_config_path(str(config_path))
     if not config_path.exists():
         raise FileNotFoundError(f"Missing config file: {config_path}")
@@ -115,10 +103,8 @@ def _load_yaml_mapping(config_path: str | Path) -> dict:
 
     if data is None:
         return {}
-
     if not isinstance(data, dict):
         raise ValueError(f"Config file must contain a top-level mapping: {config_path}")
-
     return data
 
 
@@ -136,7 +122,7 @@ def _raise_if_duplicate_keys(named_configs: list[tuple[str, dict]]) -> None:
         raise ValueError(
             "Duplicate config keys found across data/model/train sections. "
             + "; ".join(duplicate_details)
-            + ". Please keep keys unique across the sections before flattening."
+            + ". Please keep keys unique across sections before flattening."
         )
 
 
@@ -149,35 +135,8 @@ def _raise_if_missing_required_keys(merged_config: dict) -> None:
         )
 
 
-def _normalize_agg_choice(value: object, aliases: dict[str, str], field_name: str) -> str:
-    normalized = str(value).strip().lower()
-    if normalized in aliases:
-        return aliases[normalized]
-
-    valid_values = sorted(set(aliases))
-    raise ValueError(f"`{field_name}` must be one of {valid_values}, got {value!r}.")
-
-
-def _split_legacy_agg_method(agg_method: object) -> tuple[str, str]:
-    normalized = str(agg_method).strip().lower()
-    if normalized in _LEGACY_AGG_METHOD_MAP:
-        return _LEGACY_AGG_METHOD_MAP[normalized]
-
-    valid_values = sorted(_LEGACY_AGG_METHOD_MAP)
-    raise ValueError(f"`agg_method` must be one of {valid_values}, got {agg_method!r}.")
-
-
-def _derive_agg_method_name(non_expert_method: str, expert_method: str) -> str:
-    return _SPLIT_AGG_METHOD_NAME_MAP.get(
-        (non_expert_method, expert_method),
-        f"nonexpert_{non_expert_method}_expert_{expert_method}",
-    )
-
-
 def _normalize_aggregation_config(merged_config: dict) -> None:
-    """Normalize aggregation config while keeping legacy split settings usable."""
-
-    raw_mode = merged_config.get("aggregation_mode", "split")
+    raw_mode = merged_config.get("aggregation_mode")
     aggregation_mode = str(raw_mode).strip().lower()
     if aggregation_mode not in _AGGREGATION_MODE_ALIASES:
         valid_values = sorted(_AGGREGATION_MODE_ALIASES)
@@ -186,44 +145,21 @@ def _normalize_aggregation_config(merged_config: dict) -> None:
         )
     aggregation_mode = _AGGREGATION_MODE_ALIASES[aggregation_mode]
 
-    has_non_expert = "non_expert_agg_method" in merged_config
-    has_expert = "expert_agg_method" in merged_config
+    non_expert_method = str(merged_config.get("non_expert_agg_method", "")).strip().lower()
+    expert_method = str(merged_config.get("expert_agg_method", "")).strip().lower()
 
-    if has_non_expert or has_expert:
-        if not has_non_expert or not has_expert:
-            raise ValueError(
-                "`non_expert_agg_method` and `expert_agg_method` must be set together."
-            )
-
-        non_expert_method = _normalize_agg_choice(
-            merged_config["non_expert_agg_method"],
-            _NON_EXPERT_AGG_ALIASES,
-            "non_expert_agg_method",
-        )
-        expert_method = _normalize_agg_choice(
-            merged_config["expert_agg_method"],
-            _EXPERT_AGG_ALIASES,
-            "expert_agg_method",
-        )
-
-        if "agg_method" in merged_config:
-            legacy_pair = _split_legacy_agg_method(merged_config["agg_method"])
-            if legacy_pair != (non_expert_method, expert_method):
-                raise ValueError(
-                    "`agg_method` conflicts with `non_expert_agg_method` and "
-                    "`expert_agg_method`. Remove `agg_method` or make the settings match."
-                )
-
-    elif "agg_method" in merged_config:
-        non_expert_method, expert_method = _split_legacy_agg_method(
-            merged_config["agg_method"]
-        )
-    elif aggregation_mode == "whole_model_uniform_avg":
-        non_expert_method, expert_method = "equal_avg", "equal_avg"
-    else:
+    if non_expert_method not in _NON_EXPERT_AGG_METHODS:
+        valid_values = sorted(_NON_EXPERT_AGG_METHODS)
         raise ValueError(
-            "Missing aggregation config. Set `non_expert_agg_method` and "
-            "`expert_agg_method` in the train section."
+            f"`non_expert_agg_method` must be one of {valid_values}, "
+            f"got {merged_config.get('non_expert_agg_method')!r}."
+        )
+
+    if expert_method not in _EXPERT_AGG_METHODS:
+        valid_values = sorted(_EXPERT_AGG_METHODS)
+        raise ValueError(
+            f"`expert_agg_method` must be one of {valid_values}, "
+            f"got {merged_config.get('expert_agg_method')!r}."
         )
 
     merged_config["aggregation_mode"] = aggregation_mode
@@ -232,7 +168,9 @@ def _normalize_aggregation_config(merged_config: dict) -> None:
     if aggregation_mode == "whole_model_uniform_avg":
         merged_config["agg_method"] = "whole_model_uniform_avg"
     else:
-        merged_config["agg_method"] = _derive_agg_method_name(non_expert_method, expert_method)
+        merged_config["agg_method"] = (
+            f"split_expert_nonexpert_{non_expert_method}_expert_{expert_method}"
+        )
 
 
 def _sanitize_run_name(run_name: object) -> str:
@@ -261,23 +199,23 @@ def _coerce_bool(value: object, field_name: str) -> bool:
 
 
 def _derive_output_paths(merged_config: dict) -> None:
-    """Derive all experiment outputs from save_root/run_name."""
-
     run_name = _sanitize_run_name(merged_config["run_name"])
-    save_root = str(merged_config.get("save_root", _DEFAULT_SAVE_ROOT)).strip() or _DEFAULT_SAVE_ROOT
+    save_root = str(merged_config["save_root"]).strip() or "save"
     allow_overwrite = _coerce_bool(
-        merged_config.get("allow_overwrite", _DEFAULT_ALLOW_OVERWRITE),
+        merged_config["allow_overwrite"],
         "allow_overwrite",
     )
-    resume = _coerce_bool(
-        merged_config.get("resume", _DEFAULT_RESUME),
-        "resume",
+    save_client_models = _coerce_bool(
+        merged_config["save_client_models"],
+        "save_client_models",
     )
+    resume = _coerce_bool(merged_config.get("resume", False), "resume")
     run_root = Path(save_root) / run_name
 
     merged_config["save_root"] = save_root
     merged_config["run_name"] = run_name
     merged_config["allow_overwrite"] = allow_overwrite
+    merged_config["save_client_models"] = save_client_models
     merged_config["resume"] = resume
     merged_config["data_save_path"] = str(run_root / "data")
     merged_config["model_save_path"] = str(run_root / "model")
@@ -289,8 +227,6 @@ def _is_nonempty_dir(path: Path) -> bool:
 
 
 def validate_output_paths(args: SimpleNamespace, stage: str) -> None:
-    """Fail fast before a stage writes into non-empty experiment outputs."""
-
     if args.allow_overwrite:
         return
 
@@ -313,8 +249,6 @@ def validate_output_paths(args: SimpleNamespace, stage: str) -> None:
 
 
 def add_config_path_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    """Add the single experiment config path used by the entrypoints."""
-
     parser.add_argument(
         "--config",
         type=str,
@@ -328,8 +262,6 @@ def add_config_path_arguments(parser: argparse.ArgumentParser) -> argparse.Argum
 
 
 def load_args(config_path: str):
-    """Load one nested config.yaml and return a flat args-like namespace."""
-
     try:
         resolved_path = _resolve_config_path(config_path)
         config = _load_yaml_mapping(resolved_path)
@@ -360,12 +292,12 @@ def load_args(config_path: str):
 
     _raise_if_duplicate_keys(section_items)
 
-    merged_config = {}
+    merged_config = dict(_DEFAULTS)
     for _, section_config in section_items:
         merged_config.update(section_config)
 
-    _normalize_aggregation_config(merged_config)
     _raise_if_missing_required_keys(merged_config)
+    _normalize_aggregation_config(merged_config)
     _derive_output_paths(merged_config)
 
     return SimpleNamespace(**merged_config)
